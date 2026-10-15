@@ -19,7 +19,11 @@ SMOKE_REPLIES = [
 
 
 def _serve(app, host: str, port: int):
+    import logging
+
     import uvicorn
+    # uvicorn configures only its own loggers; without this, hosted_env INFO lines (capacity plans) are dropped
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     uvicorn.run(app, host=host, port=port, log_level='info')
 
 
