@@ -33,8 +33,8 @@ def _envs(cfg: dict, base: Path, keys=('tasks',)) -> dict:
 
 
 def build_gateway_app(path: str):
+    from .coordinator.store import Limits, Store
     from .gateway.app import Roster, create_gateway_app
-    from .gateway.store import Limits, Store
     cfg, base = _load(path)
     key = load_key_file(_abs(base, cfg['key_file']))
     envs = {e: make_env(e, c) for e, c in _envs(cfg, base).items()}
@@ -44,10 +44,10 @@ def build_gateway_app(path: str):
 
 
 def build_worker(path: str):
+    from .executor.core import EnvRuntime, Worker
+    from .executor.gateway_client import WorkerGatewayClient
+    from .providers.sandbox import ImageCache
     from .render import make_renderer
-    from .sandbox import ImageCache
-    from .worker.core import EnvRuntime, Worker
-    from .worker.gateway_client import WorkerGatewayClient
     cfg, base = _load(path)
     key = load_key_file(_abs(base, cfg['key_file']))
     runtimes = {}
@@ -72,5 +72,5 @@ def build_worker(path: str):
 
 
 def build_worker_app(path: str):
-    from .worker.app import create_worker_app
+    from .executor.app import create_worker_app
     return create_worker_app(build_worker(path))

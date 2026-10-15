@@ -15,8 +15,10 @@ In tool environments like SWE, about half of a trajectory is tool output rather 
 |---|---|---|
 | `hosted_env.receipt` | Trajectory hash, receipt issuance, `verify_receipt`, `loss_mask` | PyNaCl only; can be copied upstream as is |
 | `hosted_env.verify` | `verify_group`: a group's 8 receipts + the "at least one pass and one fail" gate | Same as above |
-| `hosted_env.gateway` | Hotkey signature verification, quota, task assignment, global budget / fair share, session tokens, worker registration | FastAPI + SQLite |
-| `hosted_env.worker` | Starts containers, renders task prompt / tool output tokens, executes, grades, signs receipts; long poll, idempotent retries | FastAPI + Docker |
+| `hosted_env.gateway` | Public HTTP edge: hotkey signature verification, replay protection, roster checks, routing | FastAPI |
+| `hosted_env.coordinator` | Quota, task assignment, global budget / fair share, sessions, session tokens, worker registration | SQLite |
+| `hosted_env.executor` | Formerly the worker: renders task prompt / tool output tokens, executes, grades, signs receipts; long poll, idempotent retries | FastAPI |
+| `hosted_env.providers.sandbox` | One container per rollout: `DockerSandbox` + image cache, `LocalSandbox` (tests); `k8s` planned | Docker |
 | `hosted_env.envs` | Environment interface: `docker_task` (image + task prompt + grading command), `mimo_swe` (Xiaomi MiMo SWE tasks) | |
 | `hosted_env.client` | Reference miner: opens a task, runs the group concurrently, writes the attachment into the group object; pluggable sampler | httpx |
 

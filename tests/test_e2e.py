@@ -15,15 +15,15 @@ from nacl.signing import SigningKey
 from hosted_env.cli import SMOKE_REPLIES
 from hosted_env.client import ApiError, GatewayClient, ScriptedSampler, run_task
 from hosted_env.common import key_id
+from hosted_env.coordinator.store import Limits, Store
 from hosted_env.envs import SweEnv
+from hosted_env.executor.app import create_worker_app
+from hosted_env.executor.core import EnvRuntime, Worker
+from hosted_env.executor.gateway_client import WorkerGatewayClient
 from hosted_env.gateway.app import Roster, create_gateway_app
-from hosted_env.gateway.store import Limits, Store
 from hosted_env.receipt import ReceiptError
 from hosted_env.render import CharRenderer
 from hosted_env.verify import verify_group
-from hosted_env.worker.app import create_worker_app
-from hosted_env.worker.core import EnvRuntime, Worker
-from hosted_env.worker.gateway_client import WorkerGatewayClient
 
 uvicorn = pytest.importorskip('uvicorn')
 EPOCH = 'e000001'

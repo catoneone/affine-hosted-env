@@ -1,15 +1,15 @@
-"""worker/core.py: rollout state machine, idempotent resends, validation, ways a rollout ends, receipts. In-process gateway (calls Store directly)."""
+"""executor/core.py: rollout state machine, idempotent resends, validation, ways a rollout ends, receipts. In-process gateway (calls Store directly)."""
 import pytest
 from conftest import FIX, make_swe_tasks
 from nacl.signing import SigningKey
 
 from hosted_env.common import key_id
+from hosted_env.coordinator.store import Limits, Store
 from hosted_env.envs import GradeError, SweEnv
-from hosted_env.gateway.store import Limits, Store
+from hosted_env.executor.core import EnvRuntime, Worker, WorkerError
+from hosted_env.providers.sandbox import SandboxError
 from hosted_env.receipt import ReceiptError, verify_receipt
 from hosted_env.render import CharRenderer
-from hosted_env.sandbox import SandboxError
-from hosted_env.worker.core import EnvRuntime, Worker, WorkerError
 
 EPOCH = 'e000001'
 

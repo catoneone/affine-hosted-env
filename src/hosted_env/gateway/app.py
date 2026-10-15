@@ -28,7 +28,7 @@ from starlette.concurrency import run_in_threadpool
 
 from ..auth import MINER_DOMAIN, WORKER_DOMAIN, AuthError, RequestVerifier
 from ..common import key_id, verify_key_from_hex
-from .store import CapacityError, QuotaError, Store
+from ..coordinator.store import CapacityError, QuotaError, Store
 
 
 class Roster:

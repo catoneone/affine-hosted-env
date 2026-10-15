@@ -8,7 +8,7 @@ from conftest import make_swe_tasks
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, truncate_middle
 from hosted_env.envs.swe import future_commits, patch_touched_files, reset_test_files_cmd
-from hosted_env.sandbox import LocalSandbox
+from hosted_env.providers.sandbox import LocalSandbox
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
 
 
