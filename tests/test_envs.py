@@ -129,3 +129,19 @@ def test_git_leak_error_mode(tmp_path, leak):
     with pytest.raises(SetupError):
         s.setup()
     s.close()
+
+
+def test_local_sandbox_map_root_under_tmp(tmp_path):
+    """Regression (Linux CI): the sandbox root itself lives under /tmp/, so the mapping must not re-map it."""
+    base = tmp_path / 'tmp' / 'x'
+    base.mkdir(parents=True)
+    sb = LocalSandbox('', '/w', base_dir=str(base))
+    real_root = sb.root
+    sb.root = '/tmp/pytest-0/hosted-env-local-abc'          # what tempfile returns on a Linux runner
+    home = sb.root + '/.home/'
+    assert sb._map('/w/a.py') == sb.root + '/a.py'
+    assert sb._map('cat /tmp/x && cd /w') == f'cat {home}x && cd {sb.root}'
+    assert sb._map('"/tmp/y" :/tmp/z') == f'"{home}y" :{home}z'
+    assert sb._map('/var/tmp/k $HOME/tmp/q') == '/var/tmp/k $HOME/tmp/q'
+    sb.root = real_root
+    sb.cleanup()
