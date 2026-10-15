@@ -35,12 +35,14 @@ def _envs(cfg: dict, base: Path, keys=('tasks',)) -> dict:
 def build_gateway_app(path: str):
     from .coordinator.store import Limits, Store
     from .gateway.app import Roster, create_gateway_app
+    from .gateway.ratelimit import RateLimiter, RateLimits
     cfg, base = _load(path)
     key = load_key_file(_abs(base, cfg['key_file']))
     envs = {e: make_env(e, c) for e, c in _envs(cfg, base).items()}
     store = Store(_abs(base, cfg.get('db', 'gateway.db')), envs, key, Limits(**(cfg.get('limits') or {})))
     workers = {w: verify_key_from_hex(h) for w, h in (cfg.get('workers') or {}).items()}
-    return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), workers, key.verify_key)
+    limiter = RateLimiter(RateLimits.from_config(cfg.get('rate_limits')))
+    return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), workers, key.verify_key, limiter=limiter)
 
 
 def build_worker(path: str):

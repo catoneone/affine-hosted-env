@@ -41,19 +41,41 @@ def _raise(r: httpx.Response):
     raise ApiError(r.status_code, d.get('error', ''), d.get('detail', ''), float(ra) if ra else None)
 
 
+def _rate_limited(r: httpx.Response) -> bool:
+    if r.status_code != 429:
+        return False
+    try:
+        return r.json().get('error') == 'rate_limited'
+    except ValueError:
+        return False
+
+
+def _retry_after(r: httpx.Response, cap: float = 30.0) -> float:
+    try:
+        return min(max(float(r.headers.get('retry-after', 1)), 0.0), cap)
+    except ValueError:
+        return 1.0
+
+
 class GatewayClient:
     def __init__(self, base_url: str, hotkey: str, key: SigningKey, *, timeout: float = 30.0,
                  http: httpx.Client | None = None):
         self.hotkey, self.key = hotkey, key
         self.http = http or httpx.Client(base_url=base_url.rstrip('/'), timeout=timeout)
 
-    def _post(self, path: str, payload: dict) -> dict:
+    def _post(self, path: str, payload: dict, rate_retries: int = 3) -> dict:
+        """Signs and sends one request. On 429 rate_limited, waits per Retry-After and resends with a fresh
+        signature (request ids are single use)."""
         body = json.dumps(payload, separators=(',', ':')).encode()
-        h = sign_request(self.key, 'POST', path, self.hotkey, body, domain=MINER_DOMAIN)
-        r = self.http.post(path, content=body, headers={**h, 'Content-Type': 'application/json'})
-        if r.status_code != 200:
-            _raise(r)
-        return r.json()
+        for attempt in range(rate_retries + 1):
+            h = sign_request(self.key, 'POST', path, self.hotkey, body, domain=MINER_DOMAIN)
+            r = self.http.post(path, content=body, headers={**h, 'Content-Type': 'application/json'})
+            if r.status_code == 200:
+                return r.json()
+            if not _rate_limited(r) or attempt == rate_retries:
+                _raise(r)
+            time.sleep(_retry_after(r))
+        raise AssertionError('unreachable')
 
     def info(self) -> dict:
         r = self.http.get('/v1/info')
@@ -101,6 +123,9 @@ class WorkerClient:
             if r.status_code >= 500 and r.status_code != 503 and errors < self.max_retries:
                 errors += 1
                 time.sleep(min(2 ** errors, 30))
+                continue
+            if _rate_limited(r):
+                time.sleep(_retry_after(r))        # same seq and tokens: the executor does not run it twice
                 continue
             if r.status_code != 200:
                 _raise(r)

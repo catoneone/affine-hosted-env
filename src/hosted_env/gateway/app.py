@@ -29,6 +29,7 @@ from starlette.concurrency import run_in_threadpool
 from ..auth import MINER_DOMAIN, WORKER_DOMAIN, AuthError, RequestVerifier
 from ..common import key_id, verify_key_from_hex
 from ..coordinator.store import CapacityError, QuotaError, Store
+from .ratelimit import RateLimiter, RateLimitError
 
 
 class Roster:
@@ -59,9 +60,10 @@ def _err(status: int, code: str, detail: str = '', headers: dict | None = None) 
 
 
 def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, VerifyKey], gateway_pub: VerifyKey,
-                       reap_interval: float = 10.0) -> FastAPI:
+                       reap_interval: float = 10.0, limiter: RateLimiter | None = None) -> FastAPI:
     miner_auth = RequestVerifier(MINER_DOMAIN, roster.key, store.remember_reqid)
     worker_auth = RequestVerifier(WORKER_DOMAIN, worker_keys.get, store.remember_reqid)
+    limiter = limiter or RateLimiter()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -76,9 +78,24 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
 
     app = FastAPI(title='hosted-env gateway', lifespan=lifespan)
 
+    def _limited(e: RateLimitError) -> JSONResponse:
+        return _err(429, e.code, e.detail, {'Retry-After': str(e.retry_after)})
+
+    @app.middleware('http')
+    async def _rate_limit_public(request: Request, call_next):
+        # Internal worker routes are authenticated by worker keys and not exposed to miners.
+        if not request.url.path.startswith('/v1/internal/'):
+            try:
+                limiter.before_auth(request.client.host if request.client else '')
+            except RateLimitError as e:
+                return _limited(e)
+        return await call_next(request)
+
     async def authed(request: Request, verifier: RequestVerifier) -> tuple[str, dict]:
         body = await request.body()
         ident = await run_in_threadpool(verifier.verify, request.method, request.url.path, request.headers, body)
+        if verifier is miner_auth:
+            limiter.control(ident)
         try:
             data = json.loads(body or b'{}')
         except ValueError:
@@ -92,6 +109,10 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
         if epoch != roster.current_epoch():
             raise QuotaError('wrong_epoch', f'current epoch is {roster.current_epoch()}', status=409)
         return epoch
+
+    @app.exception_handler(RateLimitError)
+    async def _rate_limit_error(request, e: RateLimitError):
+        return _limited(e)
 
     @app.exception_handler(AuthError)
     async def _auth_error(request, e: AuthError):
