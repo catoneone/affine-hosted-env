@@ -32,24 +32,29 @@ def _envs(cfg: dict, base: Path, keys=('tasks',)) -> dict:
     return out
 
 
+def _store(cfg: dict, base: Path, key):
+    from .coordinator.store import Limits, Store
+    envs = {e: make_env(e, c) for e, c in _envs(cfg, base).items()}
+    return Store(_abs(base, cfg.get('db', 'gateway.db')), envs, key, Limits(**(cfg.get('limits') or {})))
+
+
+def _limiter(cfg: dict):
+    from .gateway.ratelimit import RateLimiter, RateLimits
+    return RateLimiter(RateLimits.from_config(cfg.get('rate_limits')))
+
+
 def build_gateway_app(path: str):
     from .gateway.app import Roster, create_gateway_app
-    from .gateway.store import Limits, Store
     cfg, base = _load(path)
     key = load_key_file(_abs(base, cfg['key_file']))
-    envs = {e: make_env(e, c) for e, c in _envs(cfg, base).items()}
-    store = Store(_abs(base, cfg.get('db', 'gateway.db')), envs, key, Limits(**(cfg.get('limits') or {})))
     workers = {w: verify_key_from_hex(h) for w, h in (cfg.get('workers') or {}).items()}
-    return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), workers, key.verify_key)
+    return create_gateway_app(_store(cfg, base, key), Roster(_abs(base, cfg['roster'])), workers, key.verify_key,
+                              limiter=_limiter(cfg))
 
 
-def build_worker(path: str):
+def _runtimes(cfg: dict, base: Path) -> dict:
+    from .executor.core import EnvRuntime
     from .render import make_renderer
-    from .sandbox import ImageCache
-    from .worker.core import EnvRuntime, Worker
-    from .worker.gateway_client import WorkerGatewayClient
-    cfg, base = _load(path)
-    key = load_key_file(_abs(base, cfg['key_file']))
     runtimes = {}
     for env_id, ecfg in _envs(cfg, base).items():
         rcfg = dict(ecfg.get('renderer') or {})
@@ -59,18 +64,50 @@ def build_worker(path: str):
         runtimes[env_id] = EnvRuntime(env=make_env(env_id, ecfg), renderer=make_renderer(rcfg),
                                       sandbox_opts=dict(ecfg.get('sandbox_opts') or {}),
                                       **{k: ecfg[k] for k in rt_keys if k in ecfg})
-    gw = WorkerGatewayClient(cfg['gateway_url'], cfg['worker_id'], key)
-    log_dir = _abs(base, cfg.get('log_dir'))
+    return runtimes
+
+
+def _executor(wcfg: dict, base: Path, key, gateway, gateway_pub, public_url: str, runtimes: dict):
+    from .executor.core import Worker
+    from .providers.sandbox import ImageCache
+    log_dir = _abs(base, wcfg.get('log_dir'))
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-    return Worker(worker_id=cfg['worker_id'], key=key, gateway=gw,
-                  gateway_pub=verify_key_from_hex(cfg['gateway_public_key']), runtimes=runtimes,
-                  public_url=cfg['public_url'], capacity=int(cfg.get('capacity', 16)),
-                  idle_ttl=int(cfg.get('idle_ttl', 15 * 60)), log_dir=log_dir,
-                  image_cache=ImageCache(max_images=int(cfg.get('max_cached_images', 10))),
-                  scratch=_abs(base, cfg.get('scratch')))
+    return Worker(worker_id=wcfg['worker_id'], key=key, gateway=gateway, gateway_pub=gateway_pub,
+                  runtimes=runtimes, public_url=public_url, capacity=int(wcfg.get('capacity', 16)),
+                  idle_ttl=int(wcfg.get('idle_ttl', 15 * 60)), log_dir=log_dir,
+                  image_cache=ImageCache(max_images=int(wcfg.get('max_cached_images', 10))),
+                  scratch=_abs(base, wcfg.get('scratch')))
+
+
+def build_worker(path: str):
+    """Standalone executor that reaches the coordinator over HTTP."""
+    from .executor.gateway_client import WorkerGatewayClient
+    cfg, base = _load(path)
+    key = load_key_file(_abs(base, cfg['key_file']))
+    gw = WorkerGatewayClient(cfg['gateway_url'], cfg['worker_id'], key)
+    return _executor(cfg, base, key, gw, verify_key_from_hex(cfg['gateway_public_key']), cfg['public_url'],
+                     _runtimes(cfg, base))
 
 
 def build_worker_app(path: str):
-    from .worker.app import create_worker_app
+    from .executor.app import create_worker_app
     return create_worker_app(build_worker(path))
+
+
+def build_server_app(path: str):
+    """gateway + coordinator + executor in one process (architecture v2). The executor calls the coordinator
+    directly and is reachable only through the gateway's /v1/start and /v1/turn."""
+    from .executor.gateway_client import InProcessGatewayClient
+    from .gateway.app import Roster, create_gateway_app
+    cfg, base = _load(path)
+    gkey = load_key_file(_abs(base, cfg['key_file']))
+    store = _store(cfg, base, gkey)
+    wcfg = {'worker_id': 'local', **(cfg.get('executor') or {})}
+    wkey = load_key_file(_abs(base, wcfg['key_file']))
+    if bytes(wkey) == bytes(gkey):
+        raise ValueError('the executor receipt key must differ from the gateway session key')
+    worker = _executor(wcfg, base, wkey, InProcessGatewayClient(store, wcfg['worker_id']), gkey.verify_key,
+                       cfg['public_url'], _runtimes(cfg, base))
+    return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), {wcfg['worker_id']: wkey.verify_key},
+                              gkey.verify_key, limiter=_limiter(cfg), executor=worker)

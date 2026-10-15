@@ -12,6 +12,8 @@ worker (worker-key-signed, domain WORKER_DOMAIN):
   POST /v1/internal/close         {session_id, outcome, reward}
 Public:
   GET  /v1/info   current epoch, gateway public key, worker public keys, env parameters (in production these come from the opening)
+Data plane (only when an in-process executor is attached; session token in `Authorization: Bearer`):
+  POST /v1/start, POST /v1/turn, GET /v1/health   -- see executor/app.py
 """
 from __future__ import annotations
 
@@ -26,9 +28,12 @@ from fastapi.responses import JSONResponse
 from nacl.signing import VerifyKey
 from starlette.concurrency import run_in_threadpool
 
-from ..auth import MINER_DOMAIN, WORKER_DOMAIN, AuthError, RequestVerifier
+from ..auth import MINER_DOMAIN, WORKER_DOMAIN, AuthError, RequestVerifier, verify_token
 from ..common import key_id, verify_key_from_hex
-from .store import CapacityError, QuotaError, Store
+from ..coordinator.store import CapacityError, QuotaError, Store
+from ..executor.app import add_executor_routes
+from ..executor.core import Worker
+from .ratelimit import RateLimiter, RateLimitError
 
 
 class Roster:
@@ -59,9 +64,13 @@ def _err(status: int, code: str, detail: str = '', headers: dict | None = None) 
 
 
 def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, VerifyKey], gateway_pub: VerifyKey,
-                       reap_interval: float = 10.0) -> FastAPI:
+                       reap_interval: float = 10.0, limiter: RateLimiter | None = None,
+                       executor: Worker | None = None) -> FastAPI:
+    """With `executor` set, the gateway also serves the data plane (`/v1/start`, `/v1/turn`) and runs that
+    executor in this process (architecture v2); executors are then never exposed directly."""
     miner_auth = RequestVerifier(MINER_DOMAIN, roster.key, store.remember_reqid)
     worker_auth = RequestVerifier(WORKER_DOMAIN, worker_keys.get, store.remember_reqid)
+    limiter = limiter or RateLimiter()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -71,14 +80,42 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
                 with contextlib.suppress(Exception):
                     await run_in_threadpool(store.reap)
         task = asyncio.create_task(reaper())
+        if executor is not None:
+            executor.start_background()
         yield
         task.cancel()
+        if executor is not None:
+            executor.stop()
 
     app = FastAPI(title='hosted-env gateway', lifespan=lifespan)
+
+    if executor is not None:
+        def limit_data_plane(token: str) -> None:
+            try:
+                hotkey = verify_token(gateway_pub, token)['hotkey']
+            except AuthError:
+                return                      # the executor rejects the token itself
+            limiter.data(hotkey)
+        add_executor_routes(app, executor, before=limit_data_plane)
+
+    def _limited(e: RateLimitError) -> JSONResponse:
+        return _err(429, e.code, e.detail, {'Retry-After': str(e.retry_after)})
+
+    @app.middleware('http')
+    async def _rate_limit_public(request: Request, call_next):
+        # Internal worker routes are authenticated by worker keys and not exposed to miners.
+        if not request.url.path.startswith('/v1/internal/'):
+            try:
+                limiter.before_auth(request.client.host if request.client else '')
+            except RateLimitError as e:
+                return _limited(e)
+        return await call_next(request)
 
     async def authed(request: Request, verifier: RequestVerifier) -> tuple[str, dict]:
         body = await request.body()
         ident = await run_in_threadpool(verifier.verify, request.method, request.url.path, request.headers, body)
+        if verifier is miner_auth:
+            limiter.control(ident)
         try:
             data = json.loads(body or b'{}')
         except ValueError:
@@ -92,6 +129,10 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
         if epoch != roster.current_epoch():
             raise QuotaError('wrong_epoch', f'current epoch is {roster.current_epoch()}', status=409)
         return epoch
+
+    @app.exception_handler(RateLimitError)
+    async def _rate_limit_error(request, e: RateLimitError):
+        return _limited(e)
 
     @app.exception_handler(AuthError)
     async def _auth_error(request, e: AuthError):

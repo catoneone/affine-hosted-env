@@ -36,3 +36,19 @@ def test_examples_build(tmp_path, capsys):
     assert (rt.max_context, rt.sandbox, rt.sandbox_opts['network'], worker.capacity) == (65536, 'docker', 'none', 16)
     assert (tmp_path / 'runs' / 'worker-logs').is_dir()
     worker.pool.shutdown()
+
+
+def test_server_example_builds(tmp_path, capsys):
+    from hosted_env.config import build_server_app
+    (tmp_path / 'cfg').mkdir()
+    (tmp_path / 'runs').mkdir()
+    main(['keygen', str(tmp_path / 'keys' / 'gateway.key')])
+    main(['keygen', str(tmp_path / 'keys' / 'executor.key')])
+    capsys.readouterr()
+    path, _ = make_swe_tasks(tmp_path)
+    (tmp_path / 'cfg' / 'tasks.jsonl').write_text(Path(path).read_text())
+    (tmp_path / 'cfg' / 'roster.json').write_text(json.dumps({'epoch': 'e1', 'hotkeys': {}}))
+    (tmp_path / 'cfg' / 'server.toml').write_text((EX / 'server.toml').read_text().replace('kind = "hf"', 'kind = "char"'))
+    app = build_server_app(str(tmp_path / 'cfg' / 'server.toml'))
+    assert {r.path for r in app.routes} >= {'/v1/tasks/open', '/v1/start', '/v1/turn', '/v1/info'}
+    assert (tmp_path / 'runs' / 'executor-logs').is_dir()

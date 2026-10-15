@@ -29,11 +29,11 @@ from ..common import canonical, key_id, sha256_hex
 from ..envs import SetupError
 from ..receipt import TrajectoryHasher, sign_receipt
 from ..render import TemplateRenderer
-from ..sandbox import DockerSandbox, ImageCache, LocalSandbox
+from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox
 from ..toolcall import parse_tool_calls, split_reasoning
 from .gateway_client import GatewayRejected, GatewayUnavailable, WorkerGatewayClient
 
-log = logging.getLogger('hosted_env.worker')
+log = logging.getLogger('hosted_env.executor')
 
 
 class WorkerError(Exception):

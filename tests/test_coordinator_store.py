@@ -1,4 +1,4 @@
-"""gateway/store.py: quotas (ported from the EXP-015 prototype tests) + task assignment, global budget, fair share, voiding."""
+"""coordinator/store.py: quotas (ported from the EXP-015 prototype tests) + task assignment, global budget, fair share, voiding."""
 import json
 import random
 import threading
@@ -8,7 +8,7 @@ from nacl.signing import SigningKey
 
 from hosted_env.auth import AuthError, verify_token
 from hosted_env.envs import DockerTaskEnv
-from hosted_env.gateway.store import CapacityError, Limits, QuotaError, Store
+from hosted_env.coordinator.store import CapacityError, Limits, QuotaError, Store
 
 NOW = 1_800_000_000.0
 EPOCH = 'e000001'

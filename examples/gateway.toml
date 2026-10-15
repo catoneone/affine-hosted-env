@@ -11,6 +11,12 @@ idle_ttl = 900                            # session idle expiry (seconds)
 max_containers = 0                        # global budget B of in-flight containers; 0 = limited only by worker capacity
 infra_error_policy = "void"               # void: void the task, refund the quota slot, put the task back in the pool
 
+[rate_limits]                             # token buckets: [per_sec, burst]; false disables; omitted scopes keep defaults
+ip = [500, 1000]                          # per source IP, before authentication
+hotkey_control = [5, 20]                  # per hotkey: tasks/open, sessions/open, tasks/finish
+hotkey_data = [200, 400]                  # per hotkey: start / turn
+total = [5000, 10000]                     # whole gateway
+
 [workers]                                 # registered workers: worker_id = public key (hex)
 w1 = "<w1 public key hex>"
 

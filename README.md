@@ -3,6 +3,7 @@
 Hosted tool-environment service for SN120. Miners keep running inference on their own GPUs, but every tool call is executed by an environment hosted by the operator; at the end of each rollout the environment signs a receipt, the miner uploads the receipt alongside its data through the existing pipeline into the bucket, and the validator and trainer check the receipt with a single pure function.
 
 Design doc: [docs/design.md](docs/design.md) (overall design v1, 2026-10-15).
+Architecture v2 (layered services on Kubernetes, in progress): [docs/architecture.md](docs/architecture.md).
 
 ## Why
 
@@ -14,8 +15,10 @@ In tool environments like SWE, about half of a trajectory is tool output rather 
 |---|---|---|
 | `hosted_env.receipt` | Trajectory hash, receipt issuance, `verify_receipt`, `loss_mask` | PyNaCl only; can be copied upstream as is |
 | `hosted_env.verify` | `verify_group`: a group's 8 receipts + the "at least one pass and one fail" gate | Same as above |
-| `hosted_env.gateway` | Hotkey signature verification, quota, task assignment, global budget / fair share, session tokens, worker registration | FastAPI + SQLite |
-| `hosted_env.worker` | Starts containers, renders task prompt / tool output tokens, executes, grades, signs receipts; long poll, idempotent retries | FastAPI + Docker |
+| `hosted_env.gateway` | Public HTTP edge: hotkey signature verification, replay protection, roster checks, routing | FastAPI |
+| `hosted_env.coordinator` | Quota, task assignment, global budget / fair share, sessions, session tokens, worker registration | SQLite |
+| `hosted_env.executor` | Formerly the worker: renders task prompt / tool output tokens, executes, grades, signs receipts; long poll, idempotent retries | FastAPI |
+| `hosted_env.providers.sandbox` | One container per rollout: `DockerSandbox` + image cache, `LocalSandbox` (tests); `k8s` planned | Docker |
 | `hosted_env.envs` | Environment interface: `docker_task` (image + task prompt + grading command), `mimo_swe` (Xiaomi MiMo SWE tasks) | |
 | `hosted_env.client` | Reference miner: opens a task, runs the group concurrently, writes the attachment into the group object; pluggable sampler | httpx |
 
@@ -39,6 +42,17 @@ Rendering tests with real tokenizers read `hf-tokenizer-mimo-9b/` and `hf-tokeni
 Verification only (validator / trainer): `pip install "affine-hosted-env @ git+https://github.com/catoneone/affine-hosted-env"`; the core install pulls only PyNaCl.
 
 ## Running
+
+Single process (architecture v2): gateway, coordinator and executor in one process. Miners only talk to this
+port, for both the control plane and `/v1/start` / `/v1/turn`.
+
+```bash
+hosted-env keygen keys/gateway.key        # signs session tokens
+hosted-env keygen keys/executor.key       # signs receipts (must be a different key)
+hosted-env server --config examples/server.toml            # default 127.0.0.1:8780
+```
+
+Split mode (a separate executor process that reaches the gateway over HTTP):
 
 ```bash
 hosted-env keygen keys/gateway.key        # prints the public key and key id

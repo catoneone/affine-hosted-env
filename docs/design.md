@@ -66,7 +66,7 @@ Miner GPU (anywhere)                         Operator
 | validator / trainer | Existing sampling proof + one `verify_receipt` call per rollout | Existing |
 
 ## 4. Identity and quotas (gateway)
-Implemented in `src/hosted_env/auth.py` and `src/hosted_env/gateway/` (tests: `tests/test_auth.py`, `tests/test_gateway_store.py`).
+Implemented in `src/hosted_env/auth.py` and `src/hosted_env/coordinator/` (tests: `tests/test_auth.py`, `tests/test_coordinator_store.py`).
 
 **Identity**
 - The miner signs every control-plane request with the supervisor's Ed25519 mining key; the signed content is `domain | method | path | hotkey | timestamp | request id | sha256(request body)`.
@@ -210,10 +210,12 @@ Implemented in `src/hosted_env/receipt.py` and `src/hosted_env/verify.py` (tests
 
 ## Appendix: code
 - `src/hosted_env/auth.py`: hotkey signature verification, session tokens.
-- `src/hosted_env/gateway/`: quotas, task assignment, global budget / fair share, worker registry (FastAPI + SQLite).
+- `src/hosted_env/gateway/`: public HTTP edge (signatures, replay protection, routing; FastAPI).
+- `src/hosted_env/coordinator/`: quotas, task assignment, global budget / fair share, worker registry (SQLite).
 - `src/hosted_env/receipt.py`: trajectory hash, receipt signing, `verify_receipt`, `loss_mask`.
 - `src/hosted_env/verify.py`: `verify_group`.
-- `src/hosted_env/worker/`: containers, token rendering, tool execution, grading, receipt signing.
+- `src/hosted_env/executor/` (formerly `worker/`): token rendering, tool execution, grading, receipt signing.
+- `src/hosted_env/providers/sandbox/`: one container per rollout (Docker, local for tests).
 - `src/hosted_env/envs/swe.py`: Xiaomi MiMo SWE task type, ported from the internal EXP-014 harness.
 - `src/hosted_env/client.py`: reference miner.
 - Tests: `uv run pytest`.

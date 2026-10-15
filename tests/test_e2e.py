@@ -15,15 +15,15 @@ from nacl.signing import SigningKey
 from hosted_env.cli import SMOKE_REPLIES
 from hosted_env.client import ApiError, GatewayClient, ScriptedSampler, run_task
 from hosted_env.common import key_id
+from hosted_env.coordinator.store import Limits, Store
 from hosted_env.envs import SweEnv
+from hosted_env.executor.app import create_worker_app
+from hosted_env.executor.core import EnvRuntime, Worker
+from hosted_env.executor.gateway_client import WorkerGatewayClient
 from hosted_env.gateway.app import Roster, create_gateway_app
-from hosted_env.gateway.store import Limits, Store
 from hosted_env.receipt import ReceiptError
 from hosted_env.render import CharRenderer
 from hosted_env.verify import verify_group
-from hosted_env.worker.app import create_worker_app
-from hosted_env.worker.core import EnvRuntime, Worker
-from hosted_env.worker.gateway_client import WorkerGatewayClient
 
 uvicorn = pytest.importorskip('uvicorn')
 EPOCH = 'e000001'
@@ -152,3 +152,54 @@ def test_auth_and_quota_errors_over_http(stack):
         gw.open_sessions(EPOCH, t['task_id'], [0])
     r = httpx.post(stack['worker'].url + '/v1/start', json={}, headers={'Authorization': 'Bearer nope'})
     assert (r.status_code, r.json()['error']) == (401, 'bad_token')
+
+
+# ---------------------------------------------------------------- single process (architecture v2)
+def test_single_process_group_and_data_plane_limit(tmp_path):
+    """gateway + coordinator + executor in one process: the miner only ever talks to the gateway, which also
+    serves /v1/start and /v1/turn and rate limits them by the session token's hotkey."""
+    from hosted_env.executor.gateway_client import InProcessGatewayClient
+    from hosted_env.gateway.ratelimit import MemoryBuckets, Rate, RateLimiter, RateLimits
+
+    class Counting(MemoryBuckets):
+        limited = 0
+
+        def check(self, scope, key, rate, cost=1.0):
+            wait = super().check(scope, key, rate, cost)
+            if wait > 0 and scope == 'hotkey_data':
+                Counting.limited += 1
+            return wait
+
+    path, ids = make_swe_tasks(tmp_path, n=1)
+    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False}
+    gkey, wkey, miner = SigningKey.generate(), SigningKey.generate(), SigningKey.generate()
+    roster = tmp_path / 'roster.json'
+    roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {'5H0': {'uid': 0,
+                                                                       'public_key': bytes(miner.verify_key).hex()}}}))
+    store = Store(str(tmp_path / 'g.db'), {'swe': SweEnv('swe', cfg)}, gkey, Limits())
+    port = free_port()
+    rt = EnvRuntime(env=SweEnv('swe', {**cfg, 'tasks': None}), renderer=CharRenderer(), sandbox='local',
+                    max_context=200_000, max_turn_tokens=20_000, max_steps=10)
+    worker = Worker(worker_id='local', key=wkey, gateway=InProcessGatewayClient(store, 'local'),
+                    gateway_pub=gkey.verify_key, runtimes={'swe': rt}, public_url=f'http://127.0.0.1:{port}',
+                    capacity=16, scratch=str(tmp_path))
+    limiter = RateLimiter(RateLimits(hotkey_data=Rate(10, 3)), Counting())   # small: the group must hit 429 and retry
+    app = create_gateway_app(store, Roster(str(roster)), {'local': wkey.verify_key}, gkey.verify_key,
+                             limiter=limiter, executor=worker)
+    with Server(app, port=port) as gw:
+        r = CharRenderer()
+        sampler = ScriptedSampler(r.encode, r.turn_end_id, {n: [FIX, 'Fixed.'] if n % 2 == 0 else ['Nothing to do.']
+                                                            for n in range(8)})
+        res = run_task(GatewayClient(gw.url, '5H0', miner), EPOCH, 'swe', sampler)
+        assert res['task']['worker_url'] == gw.url                  # the data plane goes through the gateway
+        assert [x['outcome'] for x in res['rollouts']] == ['completed'] * 8
+        assert Counting.limited > 0                                 # 429s happened and the client retried them
+        info = httpx.get(gw.url + '/v1/info').json()
+        from hosted_env.common import verify_key_from_hex
+        keys = {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
+        v = verify_group(json.loads(json.dumps(res['attachment'])), keys, epoch=EPOCH, hotkey='5H0', env_id='swe',
+                         task=res['task']['task'])
+        assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
+        assert httpx.get(gw.url + '/v1/health').json()['worker_id'] == 'local'
+        bad = httpx.post(gw.url + '/v1/start', json={}, headers={'Authorization': 'Bearer nope'})
+        assert (bad.status_code, bad.json()['error']) == (401, 'bad_token')

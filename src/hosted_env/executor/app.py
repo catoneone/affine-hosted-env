@@ -1,4 +1,4 @@
-"""worker HTTP API (design §8, data plane); the session token goes in `Authorization: Bearer`.
+"""Executor HTTP API (design §8, data plane); the session token goes in `Authorization: Bearer`.
 
   POST /v1/start {wait?}               -> {status: pending} | {status: ok, seq: 0, prompt_tokens, stop_token_ids, ...}
   POST /v1/turn  {seq, tokens, wait?}  -> {status: pending} | {status: ok, seq, done: false, tool_tokens}
@@ -8,11 +8,15 @@
 Pulling an image or running tests can take minutes, so each request waits at most `wait` seconds (<=25) and returns
 pending if not done; the client resends the same seq and token to keep waiting on the same operation (it is not
 executed twice).
+
+The routes are served either by a standalone executor process (`create_worker_app`) or by the gateway itself when
+the executor runs in the control-plane process (`add_executor_routes`, architecture v2).
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -37,15 +41,10 @@ async def _await(fut, wait: float) -> dict:
         return {'status': 'pending'}
 
 
-def create_worker_app(worker: Worker, background: bool = True) -> FastAPI:
-    @contextlib.asynccontextmanager
-    async def lifespan(app):
-        if background:
-            worker.start_background()
-        yield
-        worker.stop()
-
-    app = FastAPI(title='hosted-env worker', lifespan=lifespan)
+def add_executor_routes(app: FastAPI, worker: Worker,
+                        before: Callable[[str], None] | None = None) -> None:
+    """Mount the data-plane routes on `app`. `before(token)` runs before each start / turn; the gateway uses
+    it to rate limit by the token's hotkey when the executor runs in the same process."""
 
     @app.exception_handler(WorkerError)
     async def _worker_error(request, e: WorkerError):
@@ -69,12 +68,16 @@ def create_worker_app(worker: Worker, background: bool = True) -> FastAPI:
     @app.post('/v1/start')
     async def start(request: Request):
         token, d = _bearer(request), await body(request)
+        if before:
+            before(token)
         fut = await run_in_threadpool(worker.start, token)
         return await _await(fut, wait_of(d))
 
     @app.post('/v1/turn')
     async def turn(request: Request):
         token, d = _bearer(request), await body(request)
+        if before:
+            before(token)
         fut = await run_in_threadpool(worker.turn, token, d.get('seq'), d.get('tokens'))
         return await _await(fut, wait_of(d))
 
@@ -84,4 +87,16 @@ def create_worker_app(worker: Worker, background: bool = True) -> FastAPI:
         return {'ok': True, 'worker_id': worker.worker_id, 'key_id': worker.key_id, 'live_sessions': live,
                 'capacity': worker.capacity}
 
+
+def create_worker_app(worker: Worker, background: bool = True) -> FastAPI:
+    """Standalone executor (a separate process that reaches the coordinator over HTTP)."""
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        if background:
+            worker.start_background()
+        yield
+        worker.stop()
+
+    app = FastAPI(title='hosted-env executor', lifespan=lifespan)
+    add_executor_routes(app, worker)
     return app
