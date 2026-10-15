@@ -3,6 +3,7 @@
 Hosted tool-environment service for SN120. Miners keep running inference on their own GPUs, but every tool call is executed by an environment hosted by the operator; at the end of each rollout the environment signs a receipt, the miner uploads the receipt alongside its data through the existing pipeline into the bucket, and the validator and trainer check the receipt with a single pure function.
 
 Design doc: [docs/design.md](docs/design.md) (overall design v1, 2026-10-15).
+Architecture v2 (layered services on Kubernetes, in progress): [docs/architecture.md](docs/architecture.md).
 
 ## Why
 
