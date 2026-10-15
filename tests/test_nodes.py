@@ -33,7 +33,7 @@ def test_node_info_slots_and_filters():
     assert node_info(knode('d', unschedulable=True)) is None
     assert node_info(knode('e', taints=[('gpu', 'NoSchedule')])) is None
     cp = knode('f', taints=[('node-role.kubernetes.io/control-plane', 'NoSchedule')])
-    assert node_info(cp) is not None and node_info(cp, include_control_plane=False) is None
+    assert node_info(cp) is None and node_info(cp, include_control_plane=True) is not None
     assert node_info(knode('g', taints=[('x', 'PreferNoSchedule')])) is not None
     core = NS(list_node=lambda: NS(items=[knode('a'), knode('c', ready='False')]))
     assert [x.name for x in k8s_nodes(core)] == ['a']

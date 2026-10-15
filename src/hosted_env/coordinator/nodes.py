@@ -2,7 +2,7 @@
 it already has, read from node status instead of worker heartbeats.
 
 A node counts only if it is Ready, schedulable and has no NoSchedule/NoExecute taint (control-plane nodes are
-skipped unless asked). Slots = how many standard sandboxes (cpu, memory) fit into the node's allocatable resources
+skipped unless `include_control_plane=True`). Slots = how many standard sandboxes (cpu, memory) fit into the node's allocatable resources
 after a reserve for system pods. Cached images come from `node.status.images`; note the kubelet reports at most 50
 images per node by default (`nodeStatusMaxImages`), so on a node with a big cache this is a lower bound.
 """
@@ -68,7 +68,10 @@ def _usable(node, include_control_plane: bool) -> bool:
 
 
 def node_info(node, *, cpus='1', memory='2g', reserve_cpu='500m', reserve_memory='1Gi',
-              include_control_plane: bool = True) -> NodeInfo | None:
+              include_control_plane: bool = False) -> NodeInfo | None:
+    """include_control_plane: count a tainted control-plane node as a sandbox node (single-node dev clusters only).
+    The coordinator pins Pods with nodeName, which bypasses the scheduler and so the NoSchedule taint: this check
+    is the only thing keeping sandboxes off the control plane (EXP-018 P0 first ran a group there)."""
     if not _usable(node, include_control_plane):
         return None
     alloc = node.status.allocatable or {}

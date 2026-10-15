@@ -35,7 +35,7 @@ hotkey_data = [200, 400]
 # memory = "2g"
 # reserve_cpu = "500m"                    # left for system pods on every node
 # reserve_memory = "1Gi"
-# include_control_plane = true
+# include_control_plane = false           # true only for a single-node dev cluster: sandboxes would share the control plane
 
 # Capacity planner (architecture v2): rents and deletes whole machines that join the cluster as nodes. Needs
 # [placement] kind = "k8s". dry_run = true (the default) only logs plans; every cap defaults to 0, which means
