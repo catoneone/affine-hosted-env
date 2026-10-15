@@ -61,9 +61,12 @@ Two separate interfaces, because a machine and a sandbox are different products:
 | `SandboxProvider` | one isolated container per rollout: `start`, `execute`, `copy_text_to`, `cleanup` | `k8s` (default), `docker` (single-host dev), `local` (tests); later vendor sandboxes such as Targon Sandbox (template-based, cannot run arbitrary task images) |
 | `MachineProvider` | whole machines: create, list, delete, spec, price, limits; a boot script that joins the cluster | `boat`, `targon` (VM), `static` (machines registered by hand) |
 
-The `k8s` sandbox: one Pod per rollout, `runtimeClassName: gvisor`, a default-deny NetworkPolicy, CPU and memory
-limits, no service-account token, and the same environment repair as `DockerSandbox` (`ENV_PROBE`). Without that
-repair Go tasks cannot find their module cache and try to download it.
+The `k8s` sandbox: one Pod per rollout, CPU and memory limits, no service-account token, and the same environment
+repair as `DockerSandbox` (`ENV_PROBE`). Without that repair Go tasks cannot find their module cache and try to
+download it. Offline sandboxes are denied the network twice: the `gvisor-nonet` RuntimeClass (runsc
+`--network=none`, loopback only, checked after start; a sandbox with any other interface is refused) and a
+default-deny NetworkPolicy. The policy alone is not enough: it is enforced asynchronously, and on a freshly joined
+node the first Pod reached the internet (EXP-018).
 
 ## Cluster
 - k3s. The control plane runs on a stable dual-stack host. Avoid a boat sandbox for this role: it was IPv6-only
@@ -72,8 +75,8 @@ repair Go tasks cannot find their module cache and try to download it.
 - Nodes only need outbound access: the k3s agent tunnels kubelet traffic over its own connection.
 - Pod network: flannel `wireguard-native` (encrypted, 25 s keepalive from each node), so only the control plane
   opens a UDP port.
-- gVisor: `runsc` from the gVisor apt repository plus a containerd drop-in (`config-v3.toml.d/runsc.toml`), and a
-  `RuntimeClass` named `gvisor`.
+- gVisor: `runsc` from the gVisor apt repository plus a containerd drop-in (`config-v3.toml.d/runsc.toml`) with two
+  runtimes, `runsc` and `runsc-nonet` (`--network=none`), and RuntimeClasses `gvisor` and `gvisor-nonet`.
 - Boot scripts re-apply firewall rules on every boot, because boat snapshots do not keep them.
 
 ## Measured (EXP-017, 2026-10-15)
@@ -84,7 +87,7 @@ repair Go tasks cannot find their module cache and try to download it.
 | Task image Pod | 422 MB Xiaomi image pulled in 13 s, Pod Ready in 15 s; under 1 s once cached |
 | Exec latency | persistent client through the API server: p50 27-42 ms (runc), +10-30 ms with gVisor, 184 ms cross-region |
 | gVisor grading | Go task 002119: same test verdicts as runc, 27.5 s vs 23.9 s (+15%) |
-| Isolation | default-deny NetworkPolicy blocks egress for runc and gVisor Pods |
+| Isolation | default-deny NetworkPolicy blocks egress for runc and gVisor Pods, but asynchronously: on a node that had just joined, the first Pod reached the internet (EXP-018), hence `gvisor-nonet` |
 | Targon VM | AMD SEV-SNP guest; joins as a node; as control plane it needs two workarounds (advertised address plus local hairpin forwarder, WireGuard port equal to the public mapping) |
 
 ## Migration plan

@@ -1,8 +1,10 @@
 """Kubernetes sandboxes (architecture v2): one Pod per rollout.
 
-- The Pod runs the task image with `sleep infinity`, `runtimeClassName: gvisor` by default, CPU and memory limits,
-  no service-account token and no service links. `ensure_network_policies` installs a default-deny policy for
-  Pods labelled `hosted-env/network=none` (egress and ingress), which is how `network="none"` is enforced.
+- The Pod runs the task image with `sleep infinity`, CPU and memory limits, no service-account token and no
+  service links. For `network="none"` it uses the `gvisor-nonet` RuntimeClass (runsc `--network=none`: loopback
+  only), checks after start that loopback is the only interface (fail closed), and is also covered by a
+  default-deny NetworkPolicy for Pods labelled `hosted-env/network=none`. The policy alone is not enough: it is
+  enforced asynchronously, and on a freshly joined node the first Pod reached the internet (EXP-018).
 - Commands run through the Kubernetes exec API (measured in EXP-017: p50 27-42 ms in region with a persistent
   client). Each command is wrapped the same way as in DockerSandbox: coreutils `timeout` as a backstop and the
   environment repaired by ENV_PROBE (Docker Hub task images lost their ENV, e.g. GOPATH).
@@ -82,6 +84,17 @@ def ensure_network_policies(networking_api, namespace: str) -> None:
             raise
 
 
+def default_runtime_class(network: str) -> str:
+    """gvisor-nonet runs runsc with --network=none: the sandbox gets loopback only, from its first instruction,
+    without waiting for any policy controller. gvisor keeps the Pod network (for network != 'none')."""
+    return 'gvisor-nonet' if network == 'none' else 'gvisor'
+
+
+def parse_interfaces(proc_net_dev: str) -> list[str]:
+    """Interface names from /proc/net/dev (two header lines, then 'name: counters...')."""
+    return [ln.split(':', 1)[0].strip() for ln in proc_net_dev.splitlines()[2:] if ':' in ln]
+
+
 def _reason(pod) -> str | None:
     """Why a Pod is not starting, if it will not start on its own (bad image, crash)."""
     for cs in (getattr(pod.status, 'container_statuses', None) or []):
@@ -133,9 +146,17 @@ def ws_exec(api, namespace: str) -> ExecFn:
 
 class K8sSandbox:
     def __init__(self, image: str, cwd: str, *, api=None, networking_api=None, exec_fn: ExecFn | None = None,
-                 namespace: str = 'hosted-env', node_name: str | None = None, runtime_class: str | None = 'gvisor',
+                 namespace: str = 'hosted-env', node_name: str | None = None, runtime_class: str | None = 'auto',
                  cpus: str = '1', memory: str = '2g', network: str = 'none', repair_env: bool = True,
-                 start_timeout: float = 600, poll: float = 0.5, labels: dict | None = None, **_ignored):
+                 offline_check: str = 'interfaces', start_timeout: float = 600, poll: float = 0.5,
+                 labels: dict | None = None, **_ignored):
+        """runtime_class 'auto': gvisor-nonet for network='none', gvisor otherwise.
+        offline_check (network='none' only): 'interfaces' refuses a sandbox that has any interface besides lo;
+        'off' trusts the NetworkPolicy alone (dev clusters without gVisor). NetworkPolicy is applied either way."""
+        if offline_check not in ('interfaces', 'off'):
+            raise ValueError(f'offline_check must be interfaces or off: {offline_check!r}')
+        if runtime_class == 'auto':
+            runtime_class = default_runtime_class(network)
         if api is None:
             from kubernetes import client, config
             try:
@@ -148,7 +169,7 @@ class K8sSandbox:
         self.manifest = pod_manifest(self.name, image, cwd, namespace=namespace, node_name=node_name,
                                      runtime_class=runtime_class, cpus=cpus, memory=memory, network=network,
                                      labels=labels)
-        self.networking_api, self.network = networking_api, network
+        self.networking_api, self.network, self.offline_check = networking_api, network, offline_check
         self.exec_fn = exec_fn or ws_exec(api, namespace)
         self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env
         self.started, self.has_timeout = False, False
@@ -176,11 +197,23 @@ class K8sSandbox:
             if time.monotonic() > deadline:
                 raise SandboxError(f'pod not ready after {self.start_timeout:.0f}s ({pod.status.phase})')
             time.sleep(self.poll)
+        if self.network == 'none' and self.offline_check == 'interfaces':
+            self._check_offline()
         self.has_timeout = self.execute('command -v timeout', timeout=30, raw=True)['returncode'] == 0
         if self.repair_env:
             out = self.execute(ENV_PROBE, timeout=60, raw=True)['output']
             self.env = dict(ln.split('=', 1) for ln in out.splitlines()
                             if '=' in ln and ln.split('=', 1)[0].isupper())
+
+    def _check_offline(self) -> None:
+        """Fail closed unless the sandbox has no network interface besides loopback. NetworkPolicy enforcement is
+        asynchronous (EXP-018: the first Pod on a freshly joined node could reach the internet), so a sandbox is
+        only handed out when the runtime itself gave it no network (gVisor network=none)."""
+        r = self.execute('cat /proc/net/dev', timeout=30, raw=True)
+        ifaces = parse_interfaces(r['output']) if r['returncode'] == 0 else []
+        if not ifaces or set(ifaces) != {'lo'}:
+            raise SandboxError(f'sandbox is not offline (interfaces: {ifaces or "unreadable"}); use the '
+                               "gvisor-nonet runtime class, or offline_check='off' to rely on NetworkPolicy alone")
 
     def _argv(self, command: str, cwd: str | None, timeout: int, raw: bool) -> list[str]:
         inner = ['bash', '-lc', command]

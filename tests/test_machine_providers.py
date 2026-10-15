@@ -227,6 +227,8 @@ def test_boot_script_defaults():
     assert f'INSTALL_K3S_VERSION={K3S_VERSION}' in s and "K3S_URL=https://cp.example:6443" in s
     assert '--node-label hosted-env/provider=boat' in s and 'apt-get install -y -qq runsc' in s
     assert "runtimes.runsc]" in s and 'ufw allow from 10.42.0.0/16' in s and 'flannel.json' not in s
+    assert "runtimes.runsc-nonet]" in s and 'ConfigPath = "/etc/hosted-env/runsc-nonet.toml"' in s
+    assert '[runsc_config]\n  network = "none"\nEOF' in s
 
 
 def test_boot_script_remapped_wireguard_and_no_gvisor():
@@ -258,6 +260,7 @@ def test_server_boot_script_targon_shape():
     assert s.index('hosted-env-net.service') < s.index('get.k3s.io | INSTALL')    # hairpin before the server
     assert 'ufw allow 20004/tcp' in s and 'ufw allow 6443/tcp' in s and 'ufw allow 20000/udp' in s
     assert 'kind: RuntimeClass' in s and 'handler: runsc' in s and 'name: hosted-env' in s
+    assert 'name: gvisor-nonet\nhandler: runsc-nonet' in s
     assert 'K3S_URL' not in s
 
 

@@ -56,10 +56,25 @@ def local_exec(pod, argv, timeout):
         return (e.stdout or b''), -1, True
 
 
+PROC_NET_DEV = ('Inter-|   Receive                            |  Transmit\n'
+                ' face |bytes    packets errs drop fifo frame compressed multicast|bytes\n')
+LO_ONLY = PROC_NET_DEV + '    lo:       0       0    0    0    0     0          0         0        0\n'
+WITH_ETH0 = LO_ONLY + '  eth0:    1234      10    0    0    0     0          0         0      567\n'
+
+
+def offline_exec(dev=LO_ONLY, rc=0):
+    """local_exec, except that the offline check sees `dev` as the sandbox's /proc/net/dev."""
+    def run(pod, argv, timeout):
+        if argv[-1] == 'cat /proc/net/dev':
+            return dev.encode(), rc, False
+        return local_exec(pod, argv, timeout)
+    return run
+
+
 def make(tmp_path, **kw):
     kw.setdefault('repair_env', False)
     return K8sSandbox('img:1', str(tmp_path), api=kw.pop('api', FakeCore()), networking_api=kw.pop('net', FakeNet()),
-                      exec_fn=local_exec, poll=0, **kw)
+                      exec_fn=kw.pop('exec_fn', offline_exec()), poll=0, **kw)
 
 
 def test_pod_manifest_defaults_and_placement():
@@ -153,7 +168,8 @@ def test_executor_builds_k8s_sandboxes(tmp_path):
     from hosted_env.render import CharRenderer
     core, net = FakeCore(), FakeNet()
     rt = EnvRuntime(env=DockerTaskEnv('e', {'group_size': 8}), renderer=CharRenderer(), sandbox='k8s',
-                    sandbox_opts={'exec_fn': local_exec, 'node_name': 'node-a', 'repair_env': False, 'poll': 0})
+                    sandbox_opts={'exec_fn': offline_exec(), 'node_name': 'node-a', 'repair_env': False,
+                                  'poll': 0})
     w = Worker(worker_id='local', key=SigningKey.generate(), gateway=None, gateway_pub=SigningKey.generate().verify_key,
                runtimes={'e': rt}, public_url='http://x', k8s_api=(core, net))
     sb = w._sandbox_factory(rt)('img:1', str(tmp_path))
@@ -164,3 +180,26 @@ def test_executor_builds_k8s_sandboxes(tmp_path):
     assert core.created and net.calls == 1 and sb.execute('echo ok')['output'].strip() == 'ok'
     sb.cleanup()
     w.pool.shutdown()
+
+
+def test_offline_runtime_class_defaults(tmp_path):
+    rc = lambda **kw: make(tmp_path, **kw).manifest['spec'].get('runtimeClassName')   # noqa: E731
+    assert rc() == 'gvisor-nonet' and rc(network='bridge') == 'gvisor'
+    assert rc(runtime_class='gvisor') == 'gvisor' and rc(runtime_class=None) is None
+    with pytest.raises(ValueError):
+        make(tmp_path, offline_check='maybe')
+
+
+def test_offline_check_fails_closed(tmp_path):
+    for dev, rc in ((WITH_ETH0, 0), ('', 1), (PROC_NET_DEV, 0)):        # extra interface, unreadable, empty
+        api = FakeCore()
+        sb = make(tmp_path, api=api, exec_fn=offline_exec(dev, rc))
+        with pytest.raises(SandboxError, match='not offline'):
+            sb.start()
+        sb.cleanup()
+        assert api.deleted == [(sb.name, 'hosted-env')]
+    sb = make(tmp_path, exec_fn=local_exec, offline_check='off', runtime_class=None)  # policy-only dev clusters
+    sb.start()
+    assert sb.execute('echo ok')['output'].strip() == 'ok'
+    sb2 = make(tmp_path, exec_fn=offline_exec(WITH_ETH0), network='bridge')           # not offline: not checked
+    sb2.start()

@@ -3,8 +3,9 @@
 Steps, from internal experiment EXP-017 (k3s v1.36.5 on boat and Targon machines):
 1. Firewall. boat machines run ufw with incoming denied, and snapshots do not keep rules, so the cluster CIDRs
    (and the WireGuard port, if any) are allowed on every boot.
-2. gVisor. `runsc` from the gVisor apt repository, plus a containerd drop-in that registers the `runsc` runtime
-   for k3s (`config-v3.toml.d/runsc.toml`). Pods ask for it with `runtimeClassName: gvisor`.
+2. gVisor. `runsc` from the gVisor apt repository, plus a containerd drop-in that registers two runtimes for k3s
+   (`config-v3.toml.d/runsc.toml`): `runsc`, and `runsc-nonet` (runsc `--network=none`, loopback only). Pods ask
+   for them with `runtimeClassName: gvisor` / `gvisor-nonet`; offline sandboxes use the latter (EXP-018).
 3. WireGuard port. flannel `wireguard-native` advertises its listen port to the other nodes, so on a provider that
    remaps ports (Targon SHARED networking) the listen port must equal the public port, and traffic arriving on
    the forwarded internal port is redirected to it.
@@ -28,6 +29,7 @@ import shlex
 K3S_VERSION = 'v1.36.5+k3s1'          # the version EXP-017 ran; pin, do not follow a moving channel
 CLUSTER_CIDRS = ('10.42.0.0/16', '10.43.0.0/16')
 CONTAINERD_DROPIN = '/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/runsc.toml'
+RUNSC_NONET_CONFIG = '/etc/hosted-env/runsc-nonet.toml'    # runsc --network=none, for RuntimeClass gvisor-nonet
 _LABEL = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._/-]{0,251}[A-Za-z0-9])?$')
 
 
@@ -80,10 +82,19 @@ def _gvisor() -> list[str]:
         'https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list',
         'apt-get update -qq',
         'apt-get install -y -qq runsc',
-        f'mkdir -p {q(CONTAINERD_DROPIN.rsplit("/", 1)[0])}',
+        f'mkdir -p {q(CONTAINERD_DROPIN.rsplit("/", 1)[0])} {q(RUNSC_NONET_CONFIG.rsplit("/", 1)[0])}',
+        f"cat > {q(RUNSC_NONET_CONFIG)} <<'EOF'",
+        '[runsc_config]',
+        '  network = "none"',
+        'EOF',
         f"cat > {q(CONTAINERD_DROPIN)} <<'EOF'",
         "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]",
         '  runtime_type = "io.containerd.runsc.v1"',
+        "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-nonet]",
+        '  runtime_type = "io.containerd.runsc.v1"',
+        "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-nonet.options]",
+        '  TypeUrl = "io.containerd.runsc.v1.options"',
+        f'  ConfigPath = "{RUNSC_NONET_CONFIG}"',
         'EOF',
         '',
     ]
@@ -205,6 +216,8 @@ def render_server_boot_script(*, join_token: str, public_ip: str, api_port: int 
     manifests = [f'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {namespace}']
     if gvisor:
         manifests.append('apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: gvisor\nhandler: runsc')
+        manifests.append('apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata:\n  name: gvisor-nonet\n'
+                         'handler: runsc-nonet')
     lines += [
         '# k3s server (the token goes to the installer environment, never to the log)',
         f'curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={q(k3s_version)} K3S_TOKEN={q(join_token)} '

@@ -1,6 +1,7 @@
 """SandboxProvider implementations (architecture v2): one isolated container per rollout.
 
-- k8s: one Pod per rollout, gVisor runtime, egress denied by a NetworkPolicy (needs the `k8s` extra).
+- k8s: one Pod per rollout, gVisor runtime; offline sandboxes run with gVisor networking off (`gvisor-nonet`,
+  checked after start) plus a default-deny NetworkPolicy (needs the `k8s` extra).
 - docker: one container per rollout on a Docker host, plus the per-host image cache.
 - local: tests and local demos only, no isolation.
 """
