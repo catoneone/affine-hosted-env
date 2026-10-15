@@ -90,10 +90,10 @@ repair Go tasks cannot find their module cache and try to download it.
 ## Migration plan
 Each step is one PR with tests green:
 
-1. **Package split.** `gateway/` (HTTP edge), `coordinator/` (today's store), `executor/` (today's worker core),
-   `providers/sandbox/` (today's docker and local sandboxes). Behavior unchanged.
-2. **Gateway.** Rate limits and data-plane routing to the executor in the same process; nodes are no longer
-   public.
+1. **Package split** (done). `gateway/` (HTTP edge), `coordinator/` (today's store), `executor/` (today's worker
+   core), `providers/sandbox/` (today's docker and local sandboxes). Behavior unchanged.
+2. **Gateway** (done). Rate limits (`gateway/ratelimit.py`) and data-plane routing to an in-process executor
+   (`hosted-env server`); the split mode with a separate executor process still works.
 3. **`k8s` SandboxProvider.** Kubernetes Python client as an optional extra; unit tests against a fake API; an
    opt-in live test against a kubeconfig.
 4. **Coordinator capacity from Kubernetes.** Node allocatable resources and cached images replace the worker

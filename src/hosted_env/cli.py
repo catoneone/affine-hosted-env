@@ -30,6 +30,11 @@ def cmd_keygen(a):
                       'key_id': key_id(sk.verify_key)}))
 
 
+def cmd_server(a):
+    from .config import build_server_app
+    _serve(build_server_app(a.config), a.host, a.port)
+
+
 def cmd_gateway(a):
     from .config import build_gateway_app
     _serve(build_gateway_app(a.config), a.host, a.port)
@@ -88,7 +93,7 @@ def main(argv=None):
     k = sub.add_parser('keygen', help='Generate an Ed25519 private key file (mode 600), print the public key and key id')
     k.add_argument('path')
     k.set_defaults(fn=cmd_keygen)
-    for name, fn, port in (('gateway', cmd_gateway, 8780), ('worker', cmd_worker, 8790)):
+    for name, fn, port in (('server', cmd_server, 8780), ('gateway', cmd_gateway, 8780), ('worker', cmd_worker, 8790)):
         s = sub.add_parser(name)
         s.add_argument('--config', required=True)
         s.add_argument('--host', default='127.0.0.1')

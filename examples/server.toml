@@ -1,0 +1,50 @@
+# Example single-process config (architecture v2): gateway + coordinator + executor in one process.
+# Miners only talk to public_url; the executor is reachable only through the gateway's /v1/start and /v1/turn.
+# Relative paths are resolved against this file's directory.
+db = "../runs/gateway.db"
+key_file = "../keys/gateway.key"          # signs session tokens
+roster = "roster.json"                    # qualified identity roster for this epoch (in production, from the opening snapshot)
+public_url = "http://127.0.0.1:8780"      # what miners use for both planes; returned as worker_url by tasks/open
+
+[executor]
+worker_id = "local"
+key_file = "../keys/executor.key"         # signs receipts; must differ from the gateway key; published in /v1/info
+capacity = 16                             # how many containers run at once
+idle_ttl = 900
+log_dir = "../runs/executor-logs"
+max_cached_images = 10
+
+[limits]
+max_tasks_inflight = 9
+max_tasks_per_epoch = 20
+max_concurrent = 10
+idle_ttl = 900
+max_containers = 0
+infra_error_policy = "void"
+
+[rate_limits]                             # [per_sec, burst]; false disables; omitted scopes keep defaults
+hotkey_control = [5, 20]
+hotkey_data = [200, 400]
+
+[envs.mimo_swe]                           # coordinator (task pool) and executor (runtime) settings in one table
+kind = "mimo_swe"
+tasks = "tasks.jsonl"
+group_size = 8
+success_reward = 1.0
+sandbox = "docker"
+max_context = 65536
+max_turn_tokens = 16384
+max_steps = 100
+cleanup = true
+git_leak = "strip"
+
+[envs.mimo_swe.renderer]
+kind = "hf"
+path = "/path/to/tokenizer"
+enable_thinking = true
+
+[envs.mimo_swe.sandbox_opts]
+cpus = "1"
+memory = "2g"
+network = "none"
+pids = 4096

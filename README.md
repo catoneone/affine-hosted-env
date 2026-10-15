@@ -43,6 +43,17 @@ Verification only (validator / trainer): `pip install "affine-hosted-env @ git+h
 
 ## Running
 
+Single process (architecture v2): gateway, coordinator and executor in one process. Miners only talk to this
+port, for both the control plane and `/v1/start` / `/v1/turn`.
+
+```bash
+hosted-env keygen keys/gateway.key        # signs session tokens
+hosted-env keygen keys/executor.key       # signs receipts (must be a different key)
+hosted-env server --config examples/server.toml            # default 127.0.0.1:8780
+```
+
+Split mode (a separate executor process that reaches the gateway over HTTP):
+
 ```bash
 hosted-env keygen keys/gateway.key        # prints the public key and key id
 hosted-env keygen keys/w1.key

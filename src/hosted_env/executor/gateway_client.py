@@ -68,3 +68,41 @@ class WorkerGatewayClient:
             self.post('/v1/internal/close', {'session_id': session_id, 'outcome': outcome, 'reward': reward})
         except GatewayRejected:
             pass
+
+
+class InProcessGatewayClient:
+    """Same interface as WorkerGatewayClient, but calls the coordinator's Store directly. Used when the
+    executor runs in the control-plane process (architecture v2), so no internal HTTP hop and no worker key
+    signatures are needed for these calls."""
+
+    def __init__(self, store, worker_id: str):
+        self.store, self.worker_id = store, worker_id
+
+    def _call(self, fn, *args):
+        from ..coordinator.store import QuotaError
+        try:
+            return fn(self.worker_id, *args)
+        except QuotaError as e:
+            raise GatewayRejected(e.status, e.code) from None
+
+    def heartbeat(self, url: str, capacity: int, images: list[str], env_ids: list[str]) -> dict:
+        self._call(self.store.heartbeat, url, capacity, images, env_ids)
+        return {'ok': True, 'server_time': time.time()}
+
+    def task_spec(self, task_id: str) -> dict:
+        return self._call(self.store.worker_task_spec, task_id)
+
+    def grade_inputs(self, session_id: str) -> dict:
+        return self._call(self.store.worker_grade_inputs, session_id)
+
+    def touch(self, session_id: str) -> bool:
+        try:
+            return bool(self._call(self.store.worker_touch, session_id))
+        except GatewayRejected:
+            return False
+
+    def close(self, session_id: str, outcome: str, reward: float | None) -> None:
+        try:
+            self._call(self.store.worker_close, session_id, outcome, reward)
+        except GatewayRejected:
+            pass
