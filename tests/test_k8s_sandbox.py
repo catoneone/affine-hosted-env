@@ -1,0 +1,164 @@
+"""providers/sandbox/k8s.py with a fake Kubernetes API. exec_fn runs the generated argv on this machine, so the
+command wrapping (cd, env, timeout) is exercised for real; only the Pod lifecycle is faked."""
+import subprocess
+from types import SimpleNamespace as NS
+
+import pytest
+
+from hosted_env.providers.sandbox import SandboxError
+from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, ensure_network_policies,
+                                              network_policy_manifest, pod_manifest)
+
+
+class ApiErr(Exception):
+    def __init__(self, status):
+        super().__init__(f'status {status}')
+        self.status = status
+
+
+def _pod(phase='Running', ready=True, waiting=None):
+    st = NS(waiting=NS(reason=waiting, message='nope') if waiting else None, terminated=None)
+    return NS(status=NS(phase=phase, container_statuses=[NS(ready=ready, state=st)]))
+
+
+class FakeCore:
+    def __init__(self, pods=None):
+        self.created, self.deleted = [], []
+        self.pods = list(pods or [_pod('Pending', False), _pod()])
+
+    def create_namespaced_pod(self, ns, body):
+        self.created.append((ns, body))
+
+    def read_namespaced_pod(self, name, ns):
+        return self.pods.pop(0) if len(self.pods) > 1 else self.pods[0]
+
+    def delete_namespaced_pod(self, name, ns, grace_period_seconds=None):
+        if (name, ns) in self.deleted:
+            raise ApiErr(404)
+        self.deleted.append((name, ns))
+
+
+class FakeNet:
+    def __init__(self):
+        self.calls = 0
+
+    def create_namespaced_network_policy(self, ns, body):
+        self.calls += 1
+        if self.calls > 1:
+            raise ApiErr(409)
+
+
+def local_exec(pod, argv, timeout):
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=timeout)
+        return r.stdout + r.stderr, r.returncode, False
+    except subprocess.TimeoutExpired as e:
+        return (e.stdout or b''), -1, True
+
+
+def make(tmp_path, **kw):
+    kw.setdefault('repair_env', False)
+    return K8sSandbox('img:1', str(tmp_path), api=kw.pop('api', FakeCore()), networking_api=kw.pop('net', FakeNet()),
+                      exec_fn=local_exec, poll=0, **kw)
+
+
+def test_pod_manifest_defaults_and_placement():
+    m = pod_manifest('p1', 'img:1', '/testbed', namespace='ns', node_name='node-a', memory='3g', cpus='2')
+    spec, c = m['spec'], m['spec']['containers'][0]
+    assert (spec['runtimeClassName'], spec['nodeName'], spec['automountServiceAccountToken']) == ('gvisor', 'node-a', False)
+    assert spec['enableServiceLinks'] is False and spec['restartPolicy'] == 'Never' and spec['dnsPolicy'] == 'None'
+    assert c['resources']['limits'] == {'cpu': '2', 'memory': '3Gi'} and c['workingDir'] == '/testbed'
+    assert c['securityContext'] == {'allowPrivilegeEscalation': False} and c['command'] == ['sleep', 'infinity']
+    assert m['metadata']['labels']['hosted-env/network'] == 'none'
+    m2 = pod_manifest('p2', 'i', '/w', namespace='ns', runtime_class=None, network='bridge')
+    assert 'runtimeClassName' not in m2['spec'] and 'nodeName' not in m2['spec'] and 'dnsPolicy' not in m2['spec']
+
+
+def test_network_policy_is_default_deny_and_idempotent():
+    pol = network_policy_manifest('ns')
+    assert pol['spec'] == {'podSelector': {'matchLabels': {'hosted-env/network': 'none'}},
+                           'policyTypes': ['Egress', 'Ingress']}
+    net = FakeNet()
+    ensure_network_policies(net, 'ns')
+    ensure_network_policies(net, 'ns')                          # 409 the second time is fine
+    assert net.calls == 2
+
+
+def test_start_execute_cleanup(tmp_path):
+    api = FakeCore()
+    sb = make(tmp_path, api=api)
+    with pytest.raises(SandboxError, match='not started'):
+        sb.execute('true')
+    sb.start()
+    assert api.created[0][1]['metadata']['name'] == sb.name
+    r = sb.execute('pwd; echo err >&2; exit 3')
+    assert r['returncode'] == 3 and r['reason'] == 'ok' and str(tmp_path) in r['output'] and 'err' in r['output']
+    (tmp_path / 'sub').mkdir()
+    assert sb.execute('pwd', cwd=str(tmp_path / 'sub'))['output'].strip().endswith('/sub')
+    assert sb.execute('pwd', cwd='/does/not/exist')['returncode'] == 125
+    sb.env = {'FOO': 'bar baz'}
+    assert sb.execute('echo "$FOO"')['output'].strip() == 'bar baz'
+    sb.cleanup()
+    sb.cleanup()                                                # idempotent
+    assert api.deleted == [(sb.name, 'hosted-env')]
+
+
+def test_env_probe_runs_on_start(tmp_path):
+    sb = make(tmp_path, repair_env=True)
+    sb.start()
+    assert isinstance(sb.env, dict)                             # whatever this host needs; parsing must not fail
+
+
+def test_copy_text_multi_chunk(tmp_path):
+    sb = make(tmp_path)
+    sb.start()
+    text = ('héllo wörld ✓\n' * (WRITE_CHUNK // 8)) + 'end'
+    assert len(text.encode()) > 2 * WRITE_CHUNK
+    sb.copy_text_to(text, str(tmp_path / 'f.txt'))
+    assert (tmp_path / 'f.txt').read_text(encoding='utf-8') == text
+    sb.copy_text_to('', str(tmp_path / 'empty.txt'))
+    assert (tmp_path / 'empty.txt').read_text() == ''
+    with pytest.raises(SandboxError, match='write'):
+        sb.copy_text_to('x', str(tmp_path / 'missing' / 'f.txt'))
+
+
+def test_bad_image_fails_fast_and_cleans_up(tmp_path):
+    api = FakeCore([_pod('Pending', False, waiting='ImagePullBackOff')])
+    sb = make(tmp_path, api=api)
+    with pytest.raises(SandboxError, match='ImagePullBackOff'):
+        sb.start()
+    sb.cleanup()                                                # the executor always cleans up after a failed start
+    assert api.deleted == [(sb.name, 'hosted-env')]
+
+
+def test_start_timeout(tmp_path):
+    sb = make(tmp_path, api=FakeCore([_pod('Pending', False)]), start_timeout=0)
+    with pytest.raises(SandboxError, match='not ready'):
+        sb.start()
+
+
+def test_pod_gone_during_exec(tmp_path):
+    def gone(pod, argv, timeout):
+        raise SandboxError('pod is gone')
+    sb = K8sSandbox('i', str(tmp_path), api=FakeCore(), exec_fn=gone, repair_env=False, poll=0)
+    with pytest.raises(SandboxError, match='gone'):
+        sb.start()                                              # the `command -v timeout` probe already fails
+
+
+def test_executor_builds_k8s_sandboxes(tmp_path):
+    from nacl.signing import SigningKey
+
+    from hosted_env.envs import DockerTaskEnv
+    from hosted_env.executor.core import EnvRuntime, Worker
+    from hosted_env.render import CharRenderer
+    core, net = FakeCore(), FakeNet()
+    rt = EnvRuntime(env=DockerTaskEnv('e', {'group_size': 8}), renderer=CharRenderer(), sandbox='k8s',
+                    sandbox_opts={'exec_fn': local_exec, 'node_name': 'node-a', 'repair_env': False, 'poll': 0})
+    w = Worker(worker_id='local', key=SigningKey.generate(), gateway=None, gateway_pub=SigningKey.generate().verify_key,
+               runtimes={'e': rt}, public_url='http://x', k8s_api=(core, net))
+    sb = w._sandbox_factory(rt)('img:1', str(tmp_path))
+    assert isinstance(sb, K8sSandbox) and sb.manifest['spec']['nodeName'] == 'node-a'
+    sb.start()
+    assert core.created and net.calls == 1 and sb.execute('echo ok')['output'].strip() == 'ok'
+    sb.cleanup()
+    w.pool.shutdown()

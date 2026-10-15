@@ -94,8 +94,9 @@ Each step is one PR with tests green:
    core), `providers/sandbox/` (today's docker and local sandboxes). Behavior unchanged.
 2. **Gateway** (done). Rate limits (`gateway/ratelimit.py`) and data-plane routing to an in-process executor
    (`hosted-env server`); the split mode with a separate executor process still works.
-3. **`k8s` SandboxProvider.** Kubernetes Python client as an optional extra; unit tests against a fake API; an
-   opt-in live test against a kubeconfig.
+3. **`k8s` SandboxProvider** (done). `providers/sandbox/k8s.py`; Kubernetes Python client as the `k8s` extra;
+   unit tests against a fake API (`tests/test_k8s_sandbox.py`); an opt-in live test against a kubeconfig
+   (`tests/test_k8s_live.py`). Select it per env with `sandbox = "k8s"`.
 4. **Coordinator capacity from Kubernetes.** Node allocatable resources and cached images replace the worker
    heartbeat registry.
 5. **MachineProviders.** `boat`, `targon`, `static`, plus the node boot script (k3s agent, WireGuard, gVisor,
