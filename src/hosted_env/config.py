@@ -35,7 +35,33 @@ def _envs(cfg: dict, base: Path, keys=('tasks',)) -> dict:
 def _store(cfg: dict, base: Path, key):
     from .coordinator.store import Limits, Store
     envs = {e: make_env(e, c) for e, c in _envs(cfg, base).items()}
-    return Store(_abs(base, cfg.get('db', 'gateway.db')), envs, key, Limits(**(cfg.get('limits') or {})))
+    placement = 'nodes' if (cfg.get('placement') or {}).get('kind') == 'k8s' else 'workers'
+    return Store(_abs(base, cfg.get('db', 'gateway.db')), envs, key, Limits(**(cfg.get('limits') or {})),
+                 placement=placement)
+
+
+def _node_source(cfg: dict):
+    """[placement] kind = "k8s": read nodes from the cluster (in-cluster config, else kubeconfig). Other keys
+    (cpus, memory, reserve_cpu, reserve_memory, include_control_plane) size one standard sandbox slot."""
+    pcfg = dict(cfg.get('placement') or {})
+    if pcfg.pop('kind', None) != 'k8s':
+        return None
+    kubeconfig = pcfg.pop('kubeconfig', None)
+
+    def read():
+        from kubernetes import client, config
+
+        from .coordinator.nodes import k8s_nodes
+        if kubeconfig:
+            api = client.CoreV1Api(config.new_client_from_config(config_file=kubeconfig))
+        else:
+            try:
+                config.load_incluster_config()
+            except config.ConfigException:
+                config.load_kube_config()
+            api = client.CoreV1Api()
+        return k8s_nodes(api, **pcfg)
+    return read
 
 
 def _limiter(cfg: dict):
@@ -49,7 +75,7 @@ def build_gateway_app(path: str):
     key = load_key_file(_abs(base, cfg['key_file']))
     workers = {w: verify_key_from_hex(h) for w, h in (cfg.get('workers') or {}).items()}
     return create_gateway_app(_store(cfg, base, key), Roster(_abs(base, cfg['roster'])), workers, key.verify_key,
-                              limiter=_limiter(cfg))
+                              limiter=_limiter(cfg), node_source=_node_source(cfg))
 
 
 def _runtimes(cfg: dict, base: Path) -> dict:
@@ -110,4 +136,4 @@ def build_server_app(path: str):
     worker = _executor(wcfg, base, wkey, InProcessGatewayClient(store, wcfg['worker_id']), gkey.verify_key,
                        cfg['public_url'], _runtimes(cfg, base))
     return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), {wcfg['worker_id']: wkey.verify_key},
-                              gkey.verify_key, limiter=_limiter(cfg), executor=worker)
+                              gkey.verify_key, limiter=_limiter(cfg), executor=worker, node_source=_node_source(cfg))

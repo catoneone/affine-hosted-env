@@ -26,6 +26,17 @@ infra_error_policy = "void"
 hotkey_control = [5, 20]
 hotkey_data = [200, 400]
 
+# Kubernetes placement (architecture v2): capacity and image caches come from cluster nodes, each task's group is
+# reserved on one node, and the envs below should use sandbox = "k8s". Needs the `k8s` extra.
+# [placement]
+# kind = "k8s"
+# kubeconfig = "/path/to/kubeconfig"      # omit to use in-cluster config or ~/.kube/config
+# cpus = "1"                              # one standard sandbox slot; match sandbox_opts
+# memory = "2g"
+# reserve_cpu = "500m"                    # left for system pods on every node
+# reserve_memory = "1Gi"
+# include_control_plane = true
+
 [envs.mimo_swe]                           # coordinator (task pool) and executor (runtime) settings in one table
 kind = "mimo_swe"
 tasks = "tasks.jsonl"

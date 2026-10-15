@@ -97,8 +97,10 @@ Each step is one PR with tests green:
 3. **`k8s` SandboxProvider** (done). `providers/sandbox/k8s.py`; Kubernetes Python client as the `k8s` extra;
    unit tests against a fake API (`tests/test_k8s_sandbox.py`); an opt-in live test against a kubeconfig
    (`tests/test_k8s_live.py`). Select it per env with `sandbox = "k8s"`.
-4. **Coordinator capacity from Kubernetes.** Node allocatable resources and cached images replace the worker
-   heartbeat registry.
+4. **Coordinator capacity from Kubernetes** (done). `coordinator/nodes.py` reads node allocatable resources and
+   cached images; `Store(placement='nodes')` reserves each task's group on one node and voids tasks of lost nodes;
+   the gateway syncs nodes every 10 s; the executor passes the node to the Pod as `nodeName`. Enabled by
+   `[placement] kind = "k8s"`.
 5. **MachineProviders.** `boat`, `targon`, `static`, plus the node boot script (k3s agent, WireGuard, gVisor,
    firewall); then the capacity planner.
 6. **Live P0** on a small cluster. Needs a decision on the control-plane host.

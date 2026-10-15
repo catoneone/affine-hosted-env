@@ -261,7 +261,8 @@ class Worker:
         self._spec_cache[task_id] = (now, spec)
         return spec
 
-    def _sandbox_factory(self, rt: EnvRuntime):
+    def _sandbox_factory(self, rt: EnvRuntime, node: str | None = None):
+        """node: the cluster node the coordinator reserved for this task (k8s only)."""
         opts = dict(rt.sandbox_opts)
         if rt.sandbox == 'docker':
             return lambda image, cwd: DockerSandbox(image, cwd, **opts)
@@ -269,6 +270,8 @@ class Worker:
             return lambda image, cwd: LocalSandbox(image, cwd, base_dir=self.scratch)
         if rt.sandbox == 'k8s':
             core, net = self._kube()
+            if node:
+                opts['node_name'] = node
             return lambda image, cwd: K8sSandbox(image, cwd, api=core, networking_api=net, **opts)
         raise ValueError(f'unknown sandbox {rt.sandbox!r}')
 
@@ -298,7 +301,7 @@ class Worker:
             if rt.sandbox == 'docker':
                 self.images.acquire(spec['spec']['image'])
                 s.image = spec['spec']['image']
-            s.envsess = rt.env.open(spec['spec'], self._sandbox_factory(rt))
+            s.envsess = rt.env.open(spec['spec'], self._sandbox_factory(rt, node=spec.get('node')))
             s.envsess.setup()
             ids = rt.renderer.prompt(s.envsess.initial_messages(), s.envsess.tools)
             if len(ids) + rt.min_room > rt.max_context:

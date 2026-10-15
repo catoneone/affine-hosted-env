@@ -86,3 +86,39 @@ def test_workers_placement_unchanged(tmp_path):
     assert st.worker_task_spec('w1', t['task_id'])['node'] is None
     with pytest.raises(ValueError):
         Store(str(tmp_path / 'x.db'), {'env': env}, SigningKey.generate(), placement='pods')
+
+
+def test_gateway_node_sync_loop(tmp_path):
+    import json
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from hosted_env.gateway.app import Roster, create_gateway_app
+    roster = tmp_path / 'roster.json'
+    roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {}}))
+    st = node_store(tmp_path)
+    calls = []
+
+    def source():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError('api down')                               # one failed read must not stop the loop
+        return [NodeInfo('n1', 8, ('img-1',))]
+    app = create_gateway_app(st, Roster(str(roster)), {}, SigningKey.generate().verify_key, node_source=source,
+                             node_sync_interval=0.02)
+    with TestClient(app) as c:
+        for _ in range(100):
+            if st.db.execute('SELECT COUNT(*) FROM nodes').fetchone()[0]:
+                break
+            time.sleep(0.02)
+        assert c.get('/v1/info').status_code == 200
+    assert st.db.execute('SELECT name, slots FROM nodes').fetchall() == [('n1', 8)] and len(calls) >= 2
+
+
+def test_config_placement_k8s(tmp_path):
+    from hosted_env.config import _node_source, _store
+    cfg = {'db': str(tmp_path / 'g.db'), 'placement': {'kind': 'k8s', 'cpus': '2'}}
+    assert _store(cfg, tmp_path, SigningKey.generate()).placement == 'nodes'
+    assert callable(_node_source(cfg)) and _node_source({}) is None
+    assert _store({'db': str(tmp_path / 'h.db')}, tmp_path, SigningKey.generate()).placement == 'workers'

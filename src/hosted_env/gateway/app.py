@@ -20,8 +20,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import time
+from collections.abc import Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -34,6 +36,8 @@ from ..coordinator.store import CapacityError, QuotaError, Store
 from ..executor.app import add_executor_routes
 from ..executor.core import Worker
 from .ratelimit import RateLimiter, RateLimitError
+
+log = logging.getLogger('hosted_env.gateway')
 
 
 class Roster:
@@ -65,9 +69,11 @@ def _err(status: int, code: str, detail: str = '', headers: dict | None = None) 
 
 def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, VerifyKey], gateway_pub: VerifyKey,
                        reap_interval: float = 10.0, limiter: RateLimiter | None = None,
-                       executor: Worker | None = None) -> FastAPI:
+                       executor: Worker | None = None, node_source: Callable[[], list] | None = None,
+                       node_sync_interval: float = 10.0) -> FastAPI:
     """With `executor` set, the gateway also serves the data plane (`/v1/start`, `/v1/turn`) and runs that
-    executor in this process (architecture v2); executors are then never exposed directly."""
+    executor in this process (architecture v2); executors are then never exposed directly. With `node_source`
+    set (placement='nodes'), the cluster's nodes are read every `node_sync_interval` seconds into the store."""
     miner_auth = RequestVerifier(MINER_DOMAIN, roster.key, store.remember_reqid)
     worker_auth = RequestVerifier(WORKER_DOMAIN, worker_keys.get, store.remember_reqid)
     limiter = limiter or RateLimiter()
@@ -80,10 +86,22 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
                 with contextlib.suppress(Exception):
                     await run_in_threadpool(store.reap)
         task = asyncio.create_task(reaper())
+        tasks = [task]
+        if node_source is not None:
+            async def node_sync():
+                while True:
+                    try:
+                        nodes = await run_in_threadpool(node_source)
+                        await run_in_threadpool(store.sync_nodes, nodes)
+                    except Exception:
+                        log.exception('node sync failed')
+                    await asyncio.sleep(node_sync_interval)
+            tasks.append(asyncio.create_task(node_sync()))
         if executor is not None:
             executor.start_background()
         yield
-        task.cancel()
+        for t in tasks:
+            t.cancel()
         if executor is not None:
             executor.stop()
 

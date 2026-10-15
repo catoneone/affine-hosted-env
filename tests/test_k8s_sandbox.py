@@ -158,6 +158,8 @@ def test_executor_builds_k8s_sandboxes(tmp_path):
                runtimes={'e': rt}, public_url='http://x', k8s_api=(core, net))
     sb = w._sandbox_factory(rt)('img:1', str(tmp_path))
     assert isinstance(sb, K8sSandbox) and sb.manifest['spec']['nodeName'] == 'node-a'
+    placed = w._sandbox_factory(rt, node='node-b')('img:1', str(tmp_path))
+    assert placed.manifest['spec']['nodeName'] == 'node-b'           # the coordinator's choice wins
     sb.start()
     assert core.created and net.calls == 1 and sb.execute('echo ok')['output'].strip() == 'ok'
     sb.cleanup()
