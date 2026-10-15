@@ -26,3 +26,86 @@ def test_static_provider_counts_but_never_creates():
         p.create(MachineSpec('x', 'hosted-env-x'), '#!/bin/sh')
     with pytest.raises(NotSupported):
         p.delete('gpu-box')
+
+
+# ---------------------------------------------------------------- boat (fake HTTP)
+class FakeBoat:
+    """Just enough of the boat REST API. Records every request."""
+
+    def __init__(self, ready_after=2, fail_create=False):
+        import httpx
+        self.reqs, self.sandboxes, self.ready_after, self.fail_create = [], {}, ready_after, fail_create
+        self.http = httpx.Client(base_url='https://boat.test/api/v1', transport=httpx.MockTransport(self.handle))
+
+    def handle(self, request):
+        import json as _json
+
+        import httpx
+        self.reqs.append(request)
+        p, m = request.url.path.removeprefix('/api/v1'), request.method
+        assert request.headers['authorization'] == 'Bearer tok'
+        if m == 'POST' and p == '/sandboxes':
+            if self.fail_create:
+                return httpx.Response(402, json={'code': 'payment_required'})
+            sid = f'bx_{len(self.sandboxes)}'
+            self.sandboxes[sid] = {'id': sid, 'name': 'Box 2026', 'type': _json.loads(request.content)['type'],
+                                   'state': 'provisioned', 'ip': '2001:db8::1', 'polls': 0}
+            return httpx.Response(202, json={'sandbox': self.sandboxes[sid]})
+        if m == 'GET' and p == '/sandboxes':
+            return httpx.Response(200, json={'sandboxes': list(self.sandboxes.values()), 'pageInfo': {}})
+        sid = p.split('/')[2]
+        s = self.sandboxes.get(sid)
+        if s is None:
+            return httpx.Response(404, json={'code': 'not_found'})
+        if m == 'GET':
+            s['polls'] += 1
+            if s['polls'] >= self.ready_after:
+                s['state'] = 'idle'
+            return httpx.Response(200, json={'sandbox': s})
+        if m == 'DELETE':
+            assert request.headers['x-ascii-confirm-delete'] == sid
+            del self.sandboxes[sid]
+            return httpx.Response(202, json={'type': 'sandbox.deleting'})
+        return httpx.Response(200, json={'processId': 7})                  # files / commands
+
+
+def test_boat_create_runs_boot_script_and_lists_own(tmp_path):
+    import base64
+    import json as _json
+
+    from hosted_env.providers.machine import MachineError
+    from hosted_env.providers.machine.boat import BOOT_PATH, BoatProvider
+    fb = FakeBoat()
+    fb.sandboxes['bx_other'] = {'id': 'bx_other', 'name': 'someone else', 'type': 'large', 'state': 'idle',
+                                'ip': '2001:db8::9', 'polls': 0}
+    tok = tmp_path / 'boat.token'
+    tok.write_text('tok\n')
+    p = BoatProvider.from_token_file(str(tok), http=fb.http, poll=0)
+    m = p.create(MachineSpec('large', 'hosted-env-n1', ttl_seconds=3600), '#!/bin/bash\necho boot\n')
+    assert (m.state, m.kind, m.public_ipv6, m.public_ipv4, m.price_per_hour) == ('running', 'large', '2001:db8::1',
+                                                                                  None, 0.072)
+    post = _json.loads(fb.reqs[0].content)
+    assert post == {'type': 'large', 'name': 'hosted-env-n1', 'ttlSeconds': 3600}
+    assert 'idempotency-key' in fb.reqs[0].headers
+    files = next(r for r in fb.reqs if r.url.path.endswith('/files'))
+    assert _json.loads(files.content)['path'] == BOOT_PATH
+    assert base64.b64decode(_json.loads(files.content)['content']).decode() == '#!/bin/bash\necho boot\n'
+    cmd = _json.loads(next(r for r in fb.reqs if r.url.path.endswith('/commands')).content)
+    assert cmd['detached'] is True and cmd['command'].startswith(f'sudo bash {BOOT_PATH}')
+    assert [x.id for x in p.list()] == [m.id]                           # the API ignored our name; the id counts
+    assert [o.kind for o in p.offers()] == ['small', 'default', 'large']
+    p.delete(m.id)
+    p.delete(m.id)                                                      # 404 = already gone
+    assert p.list() == [] and 'bx_other' in fb.sandboxes
+    with pytest.raises(MachineError, match='402 payment_required') as e:
+        BoatProvider('tok', http=FakeBoat(fail_create=True).http).create(MachineSpec('large', 'hosted-env-x'), '')
+    assert 'tok' not in str(e.value)                                    # errors never carry the token
+
+
+def test_boat_create_times_out_when_never_ready():
+    from hosted_env.providers.machine import MachineError
+    from hosted_env.providers.machine.boat import BoatProvider
+    p = BoatProvider('tok', http=FakeBoat(ready_after=10 ** 9).http, ready_timeout=0, poll=0)
+    with pytest.raises(MachineError, match='did not become ready'):
+        p.create(MachineSpec('small', 'hosted-env-n2'), '')
+    assert len(p.list()) == 1                                           # still ours: the planner can delete it
