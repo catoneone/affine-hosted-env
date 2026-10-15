@@ -108,7 +108,10 @@ Each step is one PR with tests green:
 5. **MachineProviders** (done, against fakes). `providers/machine/`: interface, `static`, `boat`, `targon`, and the
    node boot script (`bootstrap.py`: firewall, gVisor, WireGuard port, pinned k3s agent). `coordinator/planner.py`
    turns waiting demand into machines and deletes idle ones, bounded by `max_machines`, `max_hourly_usd` and
-   `max_create_per_round`, and runs in dry-run mode unless told otherwise. Not yet wired into the server process.
+   `max_create_per_round`, and runs in dry-run mode unless told otherwise. It runs inside the server process
+   (`[machines]` in the config, a background round every `interval` seconds, plans logged when they change), keeps
+   the machines it owns in the coordinator Store so a restart does not orphan them, and never deletes a machine it
+   did not create; a failed create is cleaned up by the provider.
 6. **Live P0** on a small cluster. Needs a decision on the control-plane host.
 
 ## Open

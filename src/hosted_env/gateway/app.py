@@ -70,10 +70,12 @@ def _err(status: int, code: str, detail: str = '', headers: dict | None = None) 
 def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, VerifyKey], gateway_pub: VerifyKey,
                        reap_interval: float = 10.0, limiter: RateLimiter | None = None,
                        executor: Worker | None = None, node_source: Callable[[], list] | None = None,
-                       node_sync_interval: float = 10.0) -> FastAPI:
+                       node_sync_interval: float = 10.0, planner=None, planner_interval: float = 30.0) -> FastAPI:
     """With `executor` set, the gateway also serves the data plane (`/v1/start`, `/v1/turn`) and runs that
     executor in this process (architecture v2); executors are then never exposed directly. With `node_source`
-    set (placement='nodes'), the cluster's nodes are read every `node_sync_interval` seconds into the store."""
+    set (placement='nodes'), the cluster's nodes are read every `node_sync_interval` seconds into the store. With
+    `planner` set, the capacity planner runs every `planner_interval` seconds; its plan is logged whenever it
+    changes, and the latest round is kept in `app.state.planner_last`."""
     miner_auth = RequestVerifier(MINER_DOMAIN, roster.key, store.remember_reqid)
     worker_auth = RequestVerifier(WORKER_DOMAIN, worker_keys.get, store.remember_reqid)
     limiter = limiter or RateLimiter()
@@ -97,6 +99,28 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
                         log.exception('node sync failed')
                     await asyncio.sleep(node_sync_interval)
             tasks.append(asyncio.create_task(node_sync()))
+        if planner is not None:
+            async def plan_loop():
+                last_sig = None
+                while True:
+                    try:
+                        snap = await run_in_threadpool(store.capacity_snapshot)
+                        results = await run_in_threadpool(planner.step, snap)
+                        app.state.planner_last = {'at': time.time(), 'dry_run': planner.dry_run, 'snapshot': snap,
+                                                  'results': [(a.kind, a.provider, a.machine_kind, a.machine_id,
+                                                               a.reason, r) for a, r in results]}
+                        sig = [(a.kind, a.provider, a.machine_kind, a.machine_id, r) for a, r in results]
+                        if sig != last_sig or any(r != 'dry_run' for _, r in results):
+                            log.info('capacity plan (%s): need waiting=%s used=%s nodes=%d; %s',
+                                     'dry run' if planner.dry_run else 'live', snap['waiting'], snap['used'],
+                                     len(snap['nodes']), '; '.join(f'{a.kind} {a.provider} {a.machine_kind or ""}'
+                                                                   f'{a.machine_id} ({a.reason}) -> {r}'
+                                                                   for a, r in results) or 'nothing to do')
+                        last_sig = sig
+                    except Exception:
+                        log.exception('capacity planner round failed')
+                    await asyncio.sleep(planner_interval)
+            tasks.append(asyncio.create_task(plan_loop()))
         if executor is not None:
             executor.start_background()
         yield

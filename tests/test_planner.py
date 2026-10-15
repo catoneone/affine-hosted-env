@@ -4,7 +4,7 @@ from test_nodes import node_store
 
 from hosted_env.coordinator.nodes import NodeInfo
 from hosted_env.coordinator.planner import Planner, PlannerLimits
-from hosted_env.providers.machine import Machine, MachineError, Offer
+from hosted_env.providers.machine import Machine, MachineError, MachineSpec, Offer
 
 
 class FakeProvider:
@@ -139,3 +139,61 @@ def test_store_capacity_snapshot(tmp_path):
         st.open_task(EPOCH, '5H1', 'env', now=NOW)                       # full: 5H1 is now waiting
     s = st.capacity_snapshot(now=NOW)
     assert (s['waiting'], s['used'], s['nodes'], s['group_size']) == (1, 8, {'n1': {'slots': 8, 'used': 8}}, 8)
+
+
+def test_config_machines_defaults_are_safe(tmp_path):
+    from nacl.signing import SigningKey
+
+    from hosted_env.config import _planner, _store
+    (tmp_path / 'boat.token').write_text('tok\n')
+    (tmp_path / 'k3s.token').write_text('K10join::server:s3cr3t\n')
+    cfg = {'db': str(tmp_path / 'g.db'), 'placement': {'kind': 'k8s', 'cpus': '2', 'memory': '4g'},
+           'machines': {'server_url': 'https://160.0.0.1:20005', 'join_token_file': 'k3s.token',
+                        'wireguard_port': 20000, 'providers': {'boat': {'token_file': 'boat.token'}}}}
+    st = _store(cfg, tmp_path, SigningKey.generate())
+    p, interval = _planner(cfg, tmp_path, st)
+    assert p.dry_run is True and interval == 30 and list(p.providers) == ['boat'] and p.ledger is st
+    assert (p.limits.max_machines, p.limits.max_hourly_usd) == (0, 0.0) and (p.cpus, p.memory) == ('2', '4g')
+    s = p.boot_script('boat', MachineSpec('large', 'hosted-env-boat-abc123'))
+    assert 'K10join::server:s3cr3t' in s and '--node-name hosted-env-boat-abc123' in s
+    assert 'K3S_URL=https://160.0.0.1:20005' in s and '--node-label hosted-env/provider=boat' in s
+    assert '"ListenPort": 20000' in s
+    assert _planner({'db': cfg['db']}, tmp_path, st) == (None, 0)
+    with pytest.raises(ValueError, match='placement'):
+        _planner({**cfg, 'placement': {}}, tmp_path, st)
+    with pytest.raises(ValueError, match='unknown machine provider'):
+        _planner({**cfg, 'machines': {**cfg['machines'], 'providers': {'aws': {}}}}, tmp_path, st)
+
+
+def test_gateway_runs_the_planner(tmp_path):
+    import json
+    import time
+
+    from fastapi.testclient import TestClient
+    from nacl.signing import SigningKey
+    from test_coordinator_store import EPOCH
+
+    from hosted_env.gateway.app import Roster, create_gateway_app
+    roster = tmp_path / 'roster.json'
+    roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {}}))
+    st = node_store(tmp_path)
+    p = planner(PlannerLimits(max_machines=1, max_hourly_usd=1), dry_run=True)
+    seen = []
+    step = p.step
+
+    def counting_step(snap):
+        seen.append(snap)
+        if len(seen) == 1:
+            raise RuntimeError('provider api down')                      # one bad round must not stop the loop
+        return step(snap)
+    p.step = counting_step
+    app = create_gateway_app(st, Roster(str(roster)), {}, SigningKey.generate().verify_key, planner=p,
+                             planner_interval=0.02)
+    with TestClient(app):
+        for _ in range(100):
+            if getattr(app.state, 'planner_last', None):
+                break
+            time.sleep(0.02)
+    last = app.state.planner_last
+    assert len(seen) >= 2 and last['dry_run'] is True and last['results'] == []          # nobody waiting
+    assert p.providers['boat'].created == []
