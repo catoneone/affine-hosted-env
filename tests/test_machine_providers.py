@@ -126,12 +126,12 @@ class FakeTargon:
         p, m = request.url.path.removeprefix('/tha/v3'), request.method
         if p == '/inventory':
             assert 'authorization' not in request.headers                      # public endpoint
-            return httpx.Response(200, json={'items': [
+            return httpx.Response(200, json=[                                   # live shape: a bare list
                 {'name': 'cpu-small-amd', 'type': 'vm', 'gpu': False, 'cost_per_hour': 0.15, 'available': 6,
                  'spec': {'cpu_millicores': 4000, 'memory_mib': 53644, 'disk_size_mib': 393216,
                           'network_mode': 'SHARED'}},
                 {'name': 'h200-small', 'type': 'vm', 'gpu': True, 'cost_per_hour': 3.59, 'available': 0, 'spec': {}},
-                {'name': 'sandbox-small', 'type': 'sandbox', 'gpu': False, 'cost_per_hour': 0.045, 'spec': {}}]})
+                {'name': 'sandbox-small', 'type': 'sandbox', 'gpu': False, 'cost_per_hour': 0.045, 'spec': {}}])
         assert request.headers['authorization'] == 'Bearer tok'
         if p == '/orgs':
             return httpx.Response(200, json={'items': [{'slug': 'al-1'}]})

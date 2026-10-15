@@ -107,7 +107,7 @@ class TargonProvider:
         """Public inventory (no auth). Only non-GPU tiers unless gpu=True."""
         d = self._req('GET', '/inventory', auth=False, params={'type': 'vm'})
         out = []
-        for it in d.get('items', d if isinstance(d, list) else []):
+        for it in d if isinstance(d, list) else d.get('items', []):    # the live API returns a bare list
             if bool(it.get('gpu')) != self.gpu or it.get('type') != 'vm':
                 continue
             s = it.get('spec') or {}
