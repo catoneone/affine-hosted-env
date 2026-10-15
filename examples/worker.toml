@@ -1,0 +1,30 @@
+# Example worker config (one env-server on a boat large VM).
+worker_id = "w1"
+key_file = "../keys/w1.key"               # used both for calling the gateway and for signing receipts
+public_url = "https://<public URL from boat host>"
+gateway_url = "http://127.0.0.1:8780"
+gateway_public_key = "<gateway public key hex>"
+capacity = 16                             # how many containers run at once (8 without oversubscription, see design §6)
+idle_ttl = 900
+log_dir = "../runs/worker-logs"           # execution logs (command hash, output hash, duration); verification does not depend on them
+max_cached_images = 10
+
+[envs.mimo_swe]
+kind = "mimo_swe"
+sandbox = "docker"
+max_context = 65536
+max_turn_tokens = 16384
+max_steps = 100
+cleanup = true                            # anti-hack cleanup (enabled in mini-bash.yaml)
+git_leak = "strip"
+
+[envs.mimo_swe.renderer]
+kind = "hf"
+path = "/path/to/tokenizer"               # tokenizer + chat template of this epoch's model
+enable_thinking = true
+
+[envs.mimo_swe.sandbox_opts]              # one container per rollout: cgroup limits, not reservations
+cpus = "1"
+memory = "2g"
+network = "none"
+pids = 4096

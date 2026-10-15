@@ -1,0 +1,15 @@
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.26"
+      - run: uv sync
+      - run: uvx ruff@0.14.0 check src tests
+      - run: uv run pytest -q -rs

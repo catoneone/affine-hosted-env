@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "affine-hosted-env"
+version = "0.1.0"
+description = "SN120 hosted tool-environment service: gateway (identity/quota/task assignment) + worker (container execution/token rendering/trajectory receipts) + pure receipt-verification functions + miner client"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+# The core (receipt verification, request signing) depends only on PyNaCl, the same Ed25519 library upstream affine uses, so validators / trainers can import it directly
+dependencies = ["PyNaCl==1.6.2"]
+
+[project.urls]
+Homepage = "https://github.com/catoneone/affine-hosted-env"
+Repository = "https://github.com/catoneone/affine-hosted-env"
+
+[project.optional-dependencies]
+client = ["httpx==0.28.1"]
+server = ["fastapi==0.143.1", "uvicorn==0.54.0", "httpx==0.28.1"]
+tokenizer = ["transformers==5.19.0", "jinja2==3.1.6"]
+all = ["affine-hosted-env[server,tokenizer]"]
+
+[project.scripts]
+hosted-env = "hosted_env.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "affine-hosted-env[server,tokenizer]"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hosted_env"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "E731", "B008"]

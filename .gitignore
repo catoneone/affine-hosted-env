@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+# Runtime artifacts and keys: never commit
+*.key
+keys/
+*.db
+*.db-wal
+*.db-shm
+logs/
+attachments/
+runs/
+.env
