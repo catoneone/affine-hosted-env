@@ -105,6 +105,16 @@ class BoatProvider:
         d = self._req('POST', '/sandboxes', json=body, headers={'Idempotency-Key': uuid.uuid4().hex})
         mid = d['sandbox']['id']
         self._owned.add(mid)
+        try:
+            return self._boot(mid, boot_script)
+        except Exception:
+            try:                                  # a half-created machine still bills: remove it, then report
+                self.delete(mid)
+            except MachineError:
+                pass
+            raise
+
+    def _boot(self, mid: str, boot_script: BootScript) -> Machine:
         deadline = time.monotonic() + self.ready_timeout
         while True:
             m = self.get(mid)

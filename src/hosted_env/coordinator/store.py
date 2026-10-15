@@ -105,6 +105,9 @@ CREATE TABLE IF NOT EXISTS demand (epoch TEXT NOT NULL, hotkey TEXT NOT NULL, at
     PRIMARY KEY (epoch, hotkey));
 CREATE TABLE IF NOT EXISTS nodes (
     name TEXT PRIMARY KEY, slots INTEGER NOT NULL, images TEXT NOT NULL, last_seen REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS planner_machines (
+    name TEXT PRIMARY KEY, provider TEXT NOT NULL, machine_id TEXT NOT NULL, price_per_hour REAL NOT NULL,
+    slots INTEGER NOT NULL, created_at REAL NOT NULL);
 '''
 
 
@@ -435,6 +438,26 @@ class Store:
                 self._end_task(cur, task_id, 'void', 'infra_error', now)
             else:
                 self._maybe_done(cur, task_id, now)
+
+    # ------------------------------------------------------------ capacity planner ledger
+    def planner_machines(self) -> list[dict]:
+        """Machines the capacity planner created and has not deleted (survives restarts)."""
+        with self._tx() as cur:
+            rows = cur.execute('SELECT name, provider, machine_id, price_per_hour, slots, created_at '
+                               'FROM planner_machines').fetchall()
+        keys = ('name', 'provider', 'machine_id', 'price_per_hour', 'slots', 'created_at')
+        return [dict(zip(keys, r, strict=True)) for r in rows]
+
+    def planner_machine_put(self, provider: str, machine_id: str, name: str, price_per_hour: float, slots: int,
+                            created_at: float) -> None:
+        with self._tx() as cur:
+            cur.execute('INSERT OR REPLACE INTO planner_machines (name, provider, machine_id, price_per_hour, slots, '
+                        'created_at) VALUES (?, ?, ?, ?, ?, ?)',
+                        (name, provider, machine_id, price_per_hour, slots, created_at))
+
+    def planner_machine_drop(self, name: str) -> None:
+        with self._tx() as cur:
+            cur.execute('DELETE FROM planner_machines WHERE name = ?', (name,))
 
     # ------------------------------------------------------------ stats
     def capacity_snapshot(self, now: float | None = None) -> dict:

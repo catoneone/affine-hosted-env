@@ -108,7 +108,7 @@ def test_boat_create_times_out_when_never_ready():
     p = BoatProvider('tok', http=FakeBoat(ready_after=10 ** 9).http, ready_timeout=0, poll=0)
     with pytest.raises(MachineError, match='did not become ready'):
         p.create(MachineSpec('small', 'hosted-env-n2'), '')
-    assert len(p.list()) == 1                                           # still ours: the planner can delete it
+    assert p.list() == []                                               # the provider deleted what it created
 
 
 # ---------------------------------------------------------------- targon (fake HTTP)
@@ -204,7 +204,14 @@ def test_targon_never_running_fails_without_boot():
                        http=FakeTargon(ready_after=10 ** 9).http, ready_timeout=0, poll=0)
     with pytest.raises(MachineError, match='did not start'):
         p.create(MachineSpec('cpu-small-amd', 'hosted-env-tg2'), '')
-    assert booted == [] and len(p.list()) == 1                           # left for the planner to delete
+    assert booted == [] and p.list() == []                               # the provider deleted what it created
+
+    def bad_ssh(m, s):
+        raise MachineError('ssh refused')
+    p2 = TargonProvider('tok', ssh_key_uid='k', boot_runner=bad_ssh, org='al-1', http=FakeTargon().http, poll=0)
+    with pytest.raises(MachineError, match='ssh refused'):
+        p2.create(MachineSpec('cpu-small-amd', 'hosted-env-tg4'), '')
+    assert p2.list() == []
 
 
 # ---------------------------------------------------------------- boot script

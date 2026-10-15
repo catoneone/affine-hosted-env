@@ -141,6 +141,16 @@ class TargonProvider:
         if ports:
             body['ports'] = ports
         uid = self._req('POST', f'/orgs/{self.org}/workloads', json=body)['uid']
+        try:
+            return self._deploy_and_boot(uid, boot_script)
+        except Exception:
+            try:                                  # a half-created machine still bills: remove it, then report
+                self.delete(uid)
+            except MachineError:
+                pass
+            raise
+
+    def _deploy_and_boot(self, uid: str, boot_script: BootScript) -> Machine:
         self._req('POST', f'/orgs/{self.org}/workloads/{uid}/deploy')
         deadline = time.monotonic() + self.ready_timeout
         while True:

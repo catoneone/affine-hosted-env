@@ -100,16 +100,32 @@ def test_busy_or_waiting_nodes_are_kept():
     assert [(a.kind, a.name) for a in acts] == [('delete', idle)]       # the busy node stays
 
 
-def test_never_joined_is_deleted_and_failed_create_cleans_up():
+def test_never_joined_is_deleted_and_failed_create_touches_nothing_else():
     p = planner(PlannerLimits(max_machines=2, max_hourly_usd=2, max_create_per_round=1, join_timeout=100))
     p.step(snap(waiting=1))
     p.clock.t += 101
     acts = p.plan(snap(waiting=0))
     assert [(a.kind, a.reason) for a in acts] == [('delete', 'never joined the cluster')]
     bad = FakeProvider('boat', [Offer('large', 8, 16, 125, 0.072)], fail_create=True)
+    bad.machines['cp'] = Machine('cp', 'boat', 'hosted-env-cp1', 'running', 'large')   # e.g. the control plane
     p2 = planner(PlannerLimits(max_machines=2, max_hourly_usd=2, max_create_per_round=1), providers={'boat': bad})
     [(a, r)] = p2.step(snap(waiting=1))
-    assert r.startswith('failed') and bad.deleted == ['boat-1'] and p2.owned == {}
+    assert r.startswith('failed') and p2.owned == {}
+    assert bad.deleted == [] and 'cp' in bad.machines                   # cleanup is the provider's job, not ours
+
+
+def test_owned_machines_survive_a_restart(tmp_path):
+    st = node_store(tmp_path)
+    lim = PlannerLimits(max_machines=2, max_hourly_usd=2, max_create_per_round=1, idle_grace=0)
+    provs = {'boat': FakeProvider('boat', [Offer('large', 8, 16, 125, 0.072)])}
+    p = Planner(provs, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=Clock(), ledger=st)
+    p.step(snap(waiting=1))
+    [name] = p.owned
+    assert st.planner_machines()[0]['name'] == name and st.planner_machines()[0]['slots'] == 7
+    p2 = Planner(provs, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=Clock(), ledger=st)
+    assert p2.owned[name].machine_id == 'boat-1'                        # remembered, so still deletable
+    [(a, r)] = p2.step(snap(nodes={name: {'slots': 7, 'used': 0}}))
+    assert (a.kind, r) == ('delete', 'deleted') and st.planner_machines() == [] and provs['boat'].machines == {}
 
 
 def test_store_capacity_snapshot(tmp_path):

@@ -3,7 +3,9 @@
 Each round: needed slots = slots in use + one group per hotkey waiting for capacity; supply = node slots plus the
 slots of machines created but not yet joined. A deficit buys the cheapest offer per slot; an empty node that stays
 empty for `idle_grace` seconds (while nobody waits) is deleted. Only machines this planner created are ever
-deleted (static machines and other workloads are never touched).
+deleted (static machines, the control plane and other workloads are never touched). Owned machines are kept in a
+ledger (the coordinator Store) so a restart does not forget, and never delete, machines that are still billing. A
+failed create is cleaned up by the provider itself, which only ever deletes the machine it was creating.
 
 Spending money is guarded twice: hard caps (`max_machines`, `max_hourly_usd`, `max_create_per_round`) that the plan
 never exceeds, and `dry_run=True` by default, which returns the plan without calling any provider.
@@ -39,6 +41,7 @@ class Action:
     machine_id: str = ''
     name: str = ''
     price_per_hour: float = 0.0
+    slots: int = 0
 
 
 @dataclass
@@ -63,7 +66,13 @@ class Planner:
     reserve_memory: str = '1Gi'
     dry_run: bool = True
     clock: Callable[[], float] = time.time
+    ledger: object = None            # Store: planner_machines / planner_machine_put / planner_machine_drop
     owned: dict = field(default_factory=dict)       # name -> Owned
+
+    def __post_init__(self):
+        for r in (self.ledger.planner_machines() if self.ledger is not None else []):
+            self.owned.setdefault(r['name'], Owned(r['provider'], r['machine_id'], r['name'], r['price_per_hour'],
+                                                   r['slots'], r['created_at']))
 
     def slots_of(self, o: Offer) -> int:
         cpu = (o.vcpus - cpu_cores(self.reserve_cpu)) / cpu_cores(self.cpus)
@@ -111,7 +120,8 @@ class Planner:
                 for _ in range(max(0, can)):
                     name = f'hosted-env-{pname}-{uuid.uuid4().hex[:6]}'
                     actions.append(Action('create', pname, f'need {need} slots, have {supply}',
-                                          machine_kind=offer.kind, name=name, price_per_hour=offer.price_per_hour))
+                                          machine_kind=offer.kind, name=name, price_per_hour=offer.price_per_hour,
+                                          slots=n))
         # shrink: owned nodes that have been empty for idle_grace while nobody waits
         keep = len(self.owned)
         for name in sorted(joined):
@@ -136,30 +146,21 @@ class Planner:
                 if a.kind == 'create':
                     spec = MachineSpec(a.machine_kind, a.name)
                     m = p.create(spec, self.boot_script(a.provider, spec))
-                    offer = next((o for o in p.offers() if o.kind == a.machine_kind), None)
-                    self.owned[a.name] = Owned(a.provider, m.id, a.name, a.price_per_hour,
-                                               self.slots_of(offer) if offer else 0, self.clock())
+                    o = Owned(a.provider, m.id, a.name, a.price_per_hour, a.slots, self.clock())
+                    self.owned[a.name] = o
+                    if self.ledger is not None:
+                        self.ledger.planner_machine_put(o.provider, o.machine_id, o.name, o.price_per_hour,
+                                                        o.slots, o.created_at)
                     results.append((a, f'created {m.id}'))
                 else:
                     p.delete(a.machine_id)
                     self.owned.pop(a.name, None)
+                    if self.ledger is not None:
+                        self.ledger.planner_machine_drop(a.name)
                     results.append((a, 'deleted'))
             except MachineError as e:
                 results.append((a, f'failed: {e}'))
-                if a.kind == 'create':
-                    self._delete_orphans(a.provider)
         return results
-
-    def _delete_orphans(self, pname: str) -> None:
-        """A failed create can leave a billed machine behind; delete provider machines this planner does not
-        track (providers only list hosted-env machines)."""
-        p, mine = self.providers[pname], {o.machine_id for o in self.owned.values()}
-        try:
-            for m in p.list():
-                if m.id not in mine:
-                    p.delete(m.id)
-        except MachineError:
-            pass
 
     def step(self, snap: dict) -> list[tuple[Action, str]]:
         return self.apply(self.plan(snap))
