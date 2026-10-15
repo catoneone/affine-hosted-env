@@ -53,6 +53,7 @@ class Limits:
     token_ttl: int = 4 * 3600
     max_containers: int = 0          # global in-flight container budget B; 0 = limited only by worker capacity
     worker_ttl: int = 90             # a worker with no heartbeat for this long counts as lost
+    node_ttl: int = 120              # a node missing from (or not Ready in) node syncs for this long counts as lost
     demand_window: int = 60          # how long a "waiting" record is kept
     infra_error_policy: str = 'void'  # void: void the task, refund the start quota slot, return it to the pool; keep: record as usual
 
@@ -85,7 +86,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, hotkey TEXT NOT NULL, env_id TEXT NOT NULL, task TEXT NOT NULL,
     worker_id TEXT NOT NULL, slots INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('running', 'done', 'void')),
-    started_at REAL NOT NULL, last_seen REAL NOT NULL, ended_at REAL, end_reason TEXT,
+    started_at REAL NOT NULL, last_seen REAL NOT NULL, ended_at REAL, end_reason TEXT, node TEXT,
     UNIQUE (epoch, hotkey, env_id, task));
 CREATE INDEX IF NOT EXISTS tasks_hotkey ON tasks (epoch, hotkey, state);
 CREATE INDEX IF NOT EXISTS tasks_state ON tasks (state, worker_id);
@@ -102,16 +103,25 @@ CREATE TABLE IF NOT EXISTS pool (
     PRIMARY KEY (epoch, env_id, task));
 CREATE TABLE IF NOT EXISTS demand (epoch TEXT NOT NULL, hotkey TEXT NOT NULL, at REAL NOT NULL,
     PRIMARY KEY (epoch, hotkey));
+CREATE TABLE IF NOT EXISTS nodes (
+    name TEXT PRIMARY KEY, slots INTEGER NOT NULL, images TEXT NOT NULL, last_seen REAL NOT NULL);
 '''
 
 
 class Store:
     def __init__(self, db_path: str, envs: dict, signing_key: SigningKey, limits: Limits = Limits(),
-                 rng: random.Random | None = None):
-        self.envs, self.signing_key, self.limits = envs, signing_key, limits
+                 rng: random.Random | None = None, placement: str = 'workers'):
+        """placement: 'workers' -- capacity and image caches come from worker heartbeats (one host per worker);
+        'nodes' -- they come from cluster nodes (`sync_nodes`), each task is pinned to one node, and workers only
+        route (architecture v2)."""
+        if placement not in ('workers', 'nodes'):
+            raise ValueError(f'unknown placement {placement!r}')
+        self.envs, self.signing_key, self.limits, self.placement = envs, signing_key, limits, placement
         self.rng = rng or random.SystemRandom()
         self.db = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False, timeout=30)
         self.db.executescript(SCHEMA)
+        if 'node' not in {r[1] for r in self.db.execute('PRAGMA table_info(tasks)')}:
+            self.db.execute('ALTER TABLE tasks ADD COLUMN node TEXT')      # databases created before nodes
         self._mu = threading.RLock()       # one connection shared by many request threads
 
     # ------------------------------------------------------------ transactions
@@ -159,6 +169,20 @@ class Store:
                         'last_seen=excluded.last_seen',
                         (worker_id, url, int(capacity), json.dumps(sorted(images)), json.dumps(sorted(env_ids)), now))
 
+    # ------------------------------------------------------------ cluster nodes (placement='nodes')
+    def sync_nodes(self, nodes, now: float | None = None) -> None:
+        """Record the usable nodes from one cluster read (coordinator.nodes.k8s_nodes). A node that stops
+        appearing is kept until node_ttl, then its running tasks are voided as node_lost."""
+        now = time.time() if now is None else now
+        with self._tx() as cur:
+            for n in nodes:
+                cur.execute('INSERT INTO nodes VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET '
+                            'slots=excluded.slots, images=excluded.images, last_seen=excluded.last_seen',
+                            (n.name, int(n.slots), json.dumps(sorted(n.images)), now))
+            cur.execute('DELETE FROM nodes WHERE last_seen < ? AND name NOT IN '
+                        "(SELECT node FROM tasks WHERE state='running' AND node IS NOT NULL)",
+                        (now - 10 * self.limits.node_ttl,))
+
     # ------------------------------------------------------------ ending / reaping
     def _end_task(self, cur, task_id: str, state: str, reason: str, now: float) -> None:
         row = cur.execute("SELECT epoch, env_id, task FROM tasks WHERE task_id=? AND state='running'",
@@ -203,6 +227,12 @@ class Store:
             "WHERE t.state='running' AND (w.worker_id IS NULL OR w.last_seen < ?)", (now - lim.worker_ttl,))]
         for tid in lost:
             self._end_task(cur, tid, 'void', 'worker_lost', now)
+        if self.placement == 'nodes':
+            gone = [r[0] for r in cur.execute(
+                "SELECT t.task_id FROM tasks t LEFT JOIN nodes n ON n.name = t.node "
+                "WHERE t.state='running' AND (n.name IS NULL OR n.last_seen < ?)", (now - lim.node_ttl,))]
+            for tid in gone:
+                self._end_task(cur, tid, 'void', 'node_lost', now)
         for (tid,) in cur.execute("SELECT task_id FROM tasks WHERE state='running'").fetchall():
             self._maybe_done(cur, tid, now)
         cur.execute('DELETE FROM demand WHERE at < ?', (now - lim.demand_window,))
@@ -243,10 +273,24 @@ class Store:
                 workers.append({'id': wid, 'url': url, 'cap': cap, 'free': cap - used.get(wid, 0),
                                 'images': set(json.loads(images))})
         budget = sum(w['cap'] for w in workers)
+        fits = [w for w in workers if w['free'] >= slots]
+        in_flight = sum(used.values())
+        nodes, node_fits = [], []
+        if self.placement == 'nodes':
+            # capacity and image caches come from cluster nodes; the worker (executor) only routes
+            nused = dict(cur.execute("SELECT node, SUM(slots) FROM tasks WHERE state='running' AND node IS NOT NULL "
+                                     'GROUP BY node').fetchall())
+            for name, nslots, images in cur.execute('SELECT name, slots, images FROM nodes WHERE last_seen >= ?',
+                                                    (now - lim.node_ttl,)):
+                nodes.append({'name': name, 'cap': nslots, 'free': nslots - nused.get(name, 0),
+                              'images': set(json.loads(images))})
+            budget = min(budget, sum(n['cap'] for n in nodes))
+            node_fits = [n for n in nodes if n['free'] >= slots]
+            if not node_fits:
+                fits = []
         if lim.max_containers:
             budget = min(budget, lim.max_containers)
-        fits = [w for w in workers if w['free'] >= slots]
-        if not fits or sum(used.values()) + slots > (lim.max_containers or float('inf')):
+        if not fits or in_flight + slots > (lim.max_containers or float('inf')):
             self._note_demand(cur, epoch, hotkey, now)
             return CapacityError('capacity_exhausted', 'no free environment capacity, retry later')
 
@@ -266,16 +310,21 @@ class Store:
         free = [t for t in env.task_ids() if t not in taken]
         if not free:
             raise QuotaError('pool_exhausted', 'no task left for this hotkey in this epoch')
-        cached = set().union(*(w['images'] for w in fits))
+        places = node_fits if self.placement == 'nodes' else fits
+        cached = set().union(*(p['images'] for p in places))
         hot = [t for t in free if env.image_of(t) in cached]
         task = self.rng.choice(hot or free)
         image = env.image_of(task)
         worker = max(fits, key=lambda w: (image in w['images'], w['free'], w['id']))
+        node = None
+        if self.placement == 'nodes':
+            node = max(node_fits, key=lambda n: (image in n['images'], n['free'], n['name']))['name']
 
         task_id = secrets.token_hex(12)
         cur.execute("INSERT INTO pool VALUES (?, ?, ?, 'assigned', ?)", (epoch, env_id, task, task_id))
-        cur.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, NULL, NULL)",
-                    (task_id, epoch, hotkey, env_id, task, worker['id'], slots, now, now))
+        cur.execute('INSERT INTO tasks (task_id, epoch, hotkey, env_id, task, worker_id, slots, state, started_at, '
+                    "last_seen, node) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)",
+                    (task_id, epoch, hotkey, env_id, task, worker['id'], slots, now, now, node))
         cur.execute('DELETE FROM demand WHERE epoch=? AND hotkey=?', (epoch, hotkey))
         return {'task_id': task_id, 'env_id': env_id, 'task': task, 'worker_url': worker['url'],
                 'group_size': slots}
@@ -342,8 +391,10 @@ class Store:
     def worker_task_spec(self, worker_id: str, task_id: str) -> dict:
         with self._tx() as cur:
             env_id, task = self._worker_task(cur, worker_id, task_id)
+            node = cur.execute('SELECT node FROM tasks WHERE task_id=?', (task_id,)).fetchone()[0]
         env = self._env(env_id)
-        return {'env_id': env_id, 'task': task, 'group_size': env.group_size, 'spec': env.public_spec(task)}
+        return {'env_id': env_id, 'task': task, 'group_size': env.group_size, 'spec': env.public_spec(task),
+                'node': node}
 
     def worker_grade_inputs(self, worker_id: str, session_id: str) -> dict:
         with self._tx() as cur:
