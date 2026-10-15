@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -154,7 +155,11 @@ class LocalSandbox:
                     'LANG': 'C.UTF-8'}
 
     def _map(self, s: str) -> str:
-        return s.replace(self.cwd, self.root).replace('/tmp/', os.path.join(self.root, '.home') + '/')
+        # One pass, so the replacement text (which may itself live under /tmp, e.g. on Linux CI) is never
+        # re-mapped; /tmp/ only matches at the start of a path, not inside one like /var/tmp/ or /x/tmp/.
+        home = os.path.join(self.root, '.home') + '/'
+        pat = re.compile(f'{re.escape(self.cwd)}|(?<![\\w./-])/tmp/')
+        return pat.sub(lambda m: self.root if m.group(0) == self.cwd else home, s)
 
     def start(self):
         if self.image and os.path.isdir(self.image):
