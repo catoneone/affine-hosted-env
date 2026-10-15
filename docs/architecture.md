@@ -87,7 +87,8 @@ node the first Pod reached the internet (EXP-018).
 | Task image Pod | 422 MB Xiaomi image pulled in 13 s, Pod Ready in 15 s; under 1 s once cached |
 | Exec latency | persistent client through the API server: p50 27-42 ms (runc), +10-30 ms with gVisor, 184 ms cross-region |
 | gVisor grading | Go task 002119: same test verdicts as runc, 27.5 s vs 23.9 s (+15%) |
-| Isolation | default-deny NetworkPolicy blocks egress for runc and gVisor Pods, but asynchronously: on a node that had just joined, the first Pod reached the internet (EXP-018), hence `gvisor-nonet` |
+| Isolation | default-deny NetworkPolicy blocks egress for runc and gVisor Pods, but asynchronously: on a node that had just joined, the first Pod reached the internet (EXP-018). With `gvisor-nonet` the sandbox has loopback only (`Network is unreachable` for the internet, Service and Pod CIDRs), including the first Pod on a fresh node; a Pod with any other interface is refused at start (EXP-018) |
+| Offline grading | Go task 002119 under `gvisor-nonet` with ENV_PROBE: 32.4 s on 2 cores, same 9 FAILs as with network, no module downloads (EXP-018) |
 | Targon VM | AMD SEV-SNP guest; joins as a node; as control plane it needs two workarounds (advertised address plus local hairpin forwarder, WireGuard port equal to the public mapping) |
 
 ## Migration plan
