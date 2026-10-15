@@ -17,7 +17,7 @@ import uuid
 
 import httpx
 
-from .base import NAME_PREFIX, Machine, MachineError, MachineSpec, Offer
+from .base import NAME_PREFIX, BootScript, Machine, MachineError, MachineSpec, Offer, resolve_boot_script
 
 API = 'https://boat.dev/api/v1'
 BOOT_PATH = '/home/user/hosted-env-boot.sh'
@@ -98,7 +98,7 @@ class BoatProvider:
     def get(self, machine_id: str) -> Machine:
         return self._machine(self._req('GET', f'/sandboxes/{machine_id}')['sandbox'])
 
-    def create(self, spec: MachineSpec, boot_script: str) -> Machine:
+    def create(self, spec: MachineSpec, boot_script: BootScript) -> Machine:
         body = {'type': spec.kind, 'name': spec.name}
         if spec.ttl_seconds:
             body['ttlSeconds'] = int(spec.ttl_seconds)
@@ -113,8 +113,9 @@ class BoatProvider:
             if m.state in ('error', 'deleted') or time.monotonic() > deadline:
                 raise MachineError(f'boat sandbox {mid} did not become ready ({m.state})')
             time.sleep(self.poll)
+        script = resolve_boot_script(boot_script, m)
         self._req('PUT', f'/sandboxes/{mid}/files',
-                  json={'path': BOOT_PATH, 'content': base64.b64encode(boot_script.encode()).decode(),
+                  json={'path': BOOT_PATH, 'content': base64.b64encode(script.encode()).decode(),
                         'encoding': 'base64'})
         self._req('POST', f'/sandboxes/{mid}/commands',
                   json={'command': f'sudo bash {BOOT_PATH} > {BOOT_LOG} 2>&1', 'detached': True})

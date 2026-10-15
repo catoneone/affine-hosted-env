@@ -179,6 +179,10 @@ def test_targon_create_maps_ports_and_runs_boot(tmp_path):
     assert m.state == 'running' and m.public_ipv4 == '160.0.0.1' and m.price_per_hour == 0.15
     assert m.ports == {'6443': '160.0.0.1:20004', '51820': '160.0.0.1:20000', 'ssh': '160.0.0.1:20002'}
     assert booted == [(m.id, 'echo boot')]                               # boot runs only once it is running
+    m2 = p.create(MachineSpec('cpu-small-amd', 'hosted-env-tg3', ports=('51820/udp',)),
+                  lambda mach: f"wg-port {mach.ports['51820'].rsplit(':', 1)[1]}")
+    assert booted[-1] == (m2.id, 'wg-port 20000')                       # rendered with the remapped port
+    p.delete(m2.id)
     body = ft.workloads[m.id]['body']
     assert body['ports'] == [{'port': 6443, 'protocol': 'TCP'}, {'port': 51820, 'protocol': 'UDP'}]
     assert (body['type'], body['image'], body['ssh_keys'], body['vm_config']) == (

@@ -19,7 +19,7 @@ from collections.abc import Callable
 
 import httpx
 
-from .base import NAME_PREFIX, Machine, MachineError, MachineSpec, Offer
+from .base import NAME_PREFIX, BootScript, Machine, MachineError, MachineSpec, Offer, resolve_boot_script
 
 API = 'https://api.targon.com/tha/v3'
 _STATE = {'registered': 'pending', 'provisioning': 'pending', 'running': 'running', 'error': 'error',
@@ -131,7 +131,7 @@ class TargonProvider:
         w = self._req('GET', f'/orgs/{self.org}/workloads/{machine_id}')
         return self._machine(w, self._req('GET', f'/orgs/{self.org}/workloads/{machine_id}/state'))
 
-    def create(self, spec: MachineSpec, boot_script: str) -> Machine:
+    def create(self, spec: MachineSpec, boot_script: BootScript) -> Machine:
         if len(spec.name) > 32:
             raise MachineError(f'targon workload names are at most 32 characters: {spec.name!r}')
         ports = [{'port': int(p.split('/')[0]), 'protocol': (p.split('/')[1] if '/' in p else 'tcp').upper()}
@@ -150,7 +150,7 @@ class TargonProvider:
             if m.state in ('error', 'deleted') or time.monotonic() > deadline:
                 raise MachineError(f'targon workload {uid} did not start ({m.state})')
             time.sleep(self.poll)
-        self.boot_runner(m, boot_script)
+        self.boot_runner(m, resolve_boot_script(boot_script, m))
         return m
 
     def delete(self, machine_id: str) -> None:

@@ -437,6 +437,21 @@ class Store:
                 self._maybe_done(cur, task_id, now)
 
     # ------------------------------------------------------------ stats
+    def capacity_snapshot(self, now: float | None = None) -> dict:
+        """What the capacity planner needs: hotkeys waiting for capacity, slots in use, and per-node slots."""
+        now = time.time() if now is None else now
+        lim = self.limits
+        with self._tx() as cur:
+            waiting = cur.execute('SELECT COUNT(DISTINCT hotkey) FROM demand WHERE at >= ?',
+                                  (now - lim.demand_window,)).fetchone()[0]
+            used = cur.execute("SELECT COALESCE(SUM(slots), 0) FROM tasks WHERE state='running'").fetchone()[0]
+            nused = dict(cur.execute("SELECT node, SUM(slots) FROM tasks WHERE state='running' AND node IS NOT NULL "
+                                     'GROUP BY node').fetchall())
+            nodes = {n: {'slots': s, 'used': nused.get(n, 0)} for n, s in cur.execute(
+                'SELECT name, slots FROM nodes WHERE last_seen >= ?', (now - lim.node_ttl,))}
+        group = max((e.group_size for e in self.envs.values()), default=8)
+        return {'waiting': waiting, 'used': used, 'nodes': nodes, 'group_size': group}
+
     def stats(self, epoch: str | None = None) -> dict:
         with self._tx() as cur:
             q = "SELECT state, COUNT(*), COALESCE(SUM(slots), 0) FROM tasks" + (' WHERE epoch=?' if epoch else '') + \

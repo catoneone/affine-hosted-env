@@ -8,6 +8,7 @@ provider never touches other workloads in the same account.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -74,8 +75,17 @@ class MachineProvider(Protocol):
     def list(self) -> list[Machine]:
         """Machines this provider created for hosted-env (name prefix), in any state but deleted."""
 
-    def create(self, spec: MachineSpec, boot_script: str) -> Machine:
-        """Create and start one machine that runs `boot_script` once at first boot. Costs money."""
+    def create(self, spec: MachineSpec, boot_script: BootScript) -> Machine:
+        """Create and start one machine that runs `boot_script` once at first boot. Costs money.
+        `boot_script` may be a callable taking the running Machine, for scripts that need its public endpoints
+        (Targon only reveals remapped ports once the VM runs)."""
 
     def delete(self, machine_id: str) -> None:
         """Delete the machine and stop billing for it. Idempotent."""
+
+
+BootScript = str | Callable[[Machine], str]
+
+
+def resolve_boot_script(script: BootScript, machine: Machine) -> str:
+    return script(machine) if callable(script) else script
