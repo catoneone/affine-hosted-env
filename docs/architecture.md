@@ -101,8 +101,8 @@ Each step is one PR with tests green:
    cached images; `Store(placement='nodes')` reserves each task's group on one node and voids tasks of lost nodes;
    the gateway syncs nodes every 10 s; the executor passes the node to the Pod as `nodeName`. Enabled by
    `[placement] kind = "k8s"`.
-5. **MachineProviders** (in progress). Interface, `static` and `boat` done (`providers/machine/`); next `targon`
-   (vendor APIs, tested against fakes), the node boot script (k3s agent, WireGuard, gVisor, firewall), then the
+5. **MachineProviders** (in progress). Interface, `static`, `boat` and `targon` done (`providers/machine/`, vendor
+   APIs tested against fakes); next the node boot script (k3s agent, WireGuard, gVisor, firewall), then the
    capacity planner with hard caps on machine count and hourly spend.
 6. **Live P0** on a small cluster. Needs a decision on the control-plane host.
 

@@ -2,11 +2,12 @@
 
 - static: machines registered by hand (count only, never created or deleted).
 - boat: boat.dev sandboxes (REST API; creating machines costs money).
-- targon: planned.
+- targon: Targon VMs (REST API; SHARED networking remaps ports; boot script runs over SSH).
 """
 from .base import NAME_PREFIX, Machine, MachineError, MachineProvider, MachineSpec, NotSupported, Offer
 from .boat import BoatProvider
 from .static import StaticProvider
+from .targon import TargonProvider, ssh_boot_runner
 
 __all__ = ['NAME_PREFIX', 'BoatProvider', 'Machine', 'MachineError', 'MachineProvider', 'MachineSpec', 'NotSupported',
-           'Offer', 'StaticProvider']
+           'Offer', 'StaticProvider', 'TargonProvider', 'ssh_boot_runner']

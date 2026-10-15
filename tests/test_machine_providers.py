@@ -109,3 +109,95 @@ def test_boat_create_times_out_when_never_ready():
     with pytest.raises(MachineError, match='did not become ready'):
         p.create(MachineSpec('small', 'hosted-env-n2'), '')
     assert len(p.list()) == 1                                           # still ours: the planner can delete it
+
+
+# ---------------------------------------------------------------- targon (fake HTTP)
+class FakeTargon:
+    def __init__(self, ready_after=2):
+        import httpx
+        self.reqs, self.workloads, self.ready_after = [], {}, ready_after
+        self.http = httpx.Client(base_url='https://targon.test/tha/v3', transport=httpx.MockTransport(self.handle))
+
+    def handle(self, request):
+        import json as _json
+
+        import httpx
+        self.reqs.append(request)
+        p, m = request.url.path.removeprefix('/tha/v3'), request.method
+        if p == '/inventory':
+            assert 'authorization' not in request.headers                      # public endpoint
+            return httpx.Response(200, json={'items': [
+                {'name': 'cpu-small-amd', 'type': 'vm', 'gpu': False, 'cost_per_hour': 0.15, 'available': 6,
+                 'spec': {'cpu_millicores': 4000, 'memory_mib': 53644, 'disk_size_mib': 393216,
+                          'network_mode': 'SHARED'}},
+                {'name': 'h200-small', 'type': 'vm', 'gpu': True, 'cost_per_hour': 3.59, 'available': 0, 'spec': {}},
+                {'name': 'sandbox-small', 'type': 'sandbox', 'gpu': False, 'cost_per_hour': 0.045, 'spec': {}}]})
+        assert request.headers['authorization'] == 'Bearer tok'
+        if p == '/orgs':
+            return httpx.Response(200, json={'items': [{'slug': 'al-1'}]})
+        assert p.startswith('/orgs/al-1/workloads')
+        rest = p.removeprefix('/orgs/al-1/workloads').strip('/').split('/')
+        if m == 'POST' and rest == ['']:
+            b = _json.loads(request.content)
+            uid = f'wrk-{len(self.workloads)}'
+            self.workloads[uid] = {'uid': uid, 'name': b['name'], 'resource_name': b['resource_name'], 'body': b,
+                                   'polls': 0, 'state': {'status': 'registered'}}
+            return httpx.Response(200, json={'uid': uid, 'state': {'status': 'registered'}})
+        if m == 'GET' and rest == ['']:
+            items = [{k: v for k, v in w.items() if k != 'body'} for w in self.workloads.values()]
+            return httpx.Response(200, json={'items': items, 'next_cursor': None})
+        w = self.workloads.get(rest[0])
+        if w is None:
+            return httpx.Response(404, json={'reason': 'WORKLOAD_NOT_FOUND'})
+        if m == 'POST' and rest[1:] == ['deploy']:
+            w['state'] = {'status': 'provisioning', 'urls': [{'port': 6443, 'url': 'tcp://160.0.0.1:6443'}]}
+            return httpx.Response(200, json=w)
+        if m == 'GET' and rest[1:] == ['state']:
+            w['polls'] += 1
+            if w['polls'] >= self.ready_after:
+                w['state'] = {'status': 'running', 'public_ip': '160.0.0.1', 'ssh_port': 20002,
+                              'urls': [{'port': 6443, 'url': '160.0.0.1:20004'},
+                                       {'port': 51820, 'url': '160.0.0.1:20000'}]}
+            return httpx.Response(200, json=w['state'])
+        if m == 'GET':
+            return httpx.Response(200, json={k: v for k, v in w.items() if k != 'body'})
+        if m == 'DELETE':
+            del self.workloads[rest[0]]
+            return httpx.Response(204)
+        raise AssertionError((m, p))
+
+
+def test_targon_create_maps_ports_and_runs_boot(tmp_path):
+    from hosted_env.providers.machine import MachineError
+    from hosted_env.providers.machine.targon import TargonProvider
+    ft, booted = FakeTargon(), []
+    p = TargonProvider('tok', ssh_key_uid='shk-1', boot_runner=lambda m, s: booted.append((m.id, s)), http=ft.http,
+                       poll=0)
+    [o] = p.offers()
+    assert (o.kind, o.vcpus, o.price_per_hour, o.available, o.network) == ('cpu-small-amd', 4.0, 0.15, 6, 'SHARED')
+    m = p.create(MachineSpec('cpu-small-amd', 'hosted-env-tg1', ports=('6443/tcp', '51820/udp')), 'echo boot')
+    assert m.state == 'running' and m.public_ipv4 == '160.0.0.1' and m.price_per_hour == 0.15
+    assert m.ports == {'6443': '160.0.0.1:20004', '51820': '160.0.0.1:20000', 'ssh': '160.0.0.1:20002'}
+    assert booted == [(m.id, 'echo boot')]                               # boot runs only once it is running
+    body = ft.workloads[m.id]['body']
+    assert body['ports'] == [{'port': 6443, 'protocol': 'TCP'}, {'port': 51820, 'protocol': 'UDP'}]
+    assert (body['type'], body['image'], body['ssh_keys'], body['vm_config']) == (
+        'VM', 'ubuntu-24-04-lts', ['shk-1'], {'hostname': 'hosted-env-tg1'})
+    ft.workloads['wrk-x'] = {'uid': 'wrk-x', 'name': 'not-ours', 'state': {'status': 'running'}, 'polls': 0}
+    assert [x.id for x in p.list()] == [m.id]
+    p.delete(m.id)
+    p.delete(m.id)
+    assert [x.id for x in p.list()] == [] and 'wrk-x' in ft.workloads
+    with pytest.raises(MachineError, match='32 characters'):
+        p.create(MachineSpec('cpu-small-amd', 'hosted-env-' + 'x' * 30), '')
+
+
+def test_targon_never_running_fails_without_boot():
+    from hosted_env.providers.machine import MachineError
+    from hosted_env.providers.machine.targon import TargonProvider
+    booted = []
+    p = TargonProvider('tok', ssh_key_uid='k', boot_runner=lambda m, s: booted.append(m), org='al-1',
+                       http=FakeTargon(ready_after=10 ** 9).http, ready_timeout=0, poll=0)
+    with pytest.raises(MachineError, match='did not start'):
+        p.create(MachineSpec('cpu-small-amd', 'hosted-env-tg2'), '')
+    assert booted == [] and len(p.list()) == 1                           # left for the planner to delete
