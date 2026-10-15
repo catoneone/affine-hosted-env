@@ -45,6 +45,7 @@ def _header(kind: str) -> list[str]:
         'umask 077',
         'mkdir -p /var/log/hosted-env /var/lib/hosted-env',
         'exec >>/var/log/hosted-env/boot.log 2>&1',
+        'umask 022                                   # system files below are read by other users (apt runs as _apt)',
         'echo "boot start $(date -u +%FT%TZ)"',
         'export DEBIAN_FRONTEND=noninteractive',
         '',
@@ -73,8 +74,8 @@ def _gvisor() -> list[str]:
     q = shlex.quote
     return [
         '# gVisor runtime for Pods with runtimeClassName: gvisor',
-        'curl -fsSL https://gvisor.dev/archive.key | gpg --batch --yes --dearmor '
-        '-o /usr/share/keyrings/gvisor-archive-keyring.gpg',
+        'curl -fsSL https://gvisor.dev/archive.key | gpg --batch --yes --dearmor -o /tmp/gvisor-archive-keyring.gpg',
+        'install -m 0644 /tmp/gvisor-archive-keyring.gpg /usr/share/keyrings/gvisor-archive-keyring.gpg',
         'echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] '
         'https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list',
         'apt-get update -qq',

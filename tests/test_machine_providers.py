@@ -221,6 +221,9 @@ def test_boot_script_defaults():
                            labels={'hosted-env/provider': 'boat'})
     _bash_syntax_ok(s)
     assert s.count(tok) == 1 and 'set -x' not in s and 'rm -f -- "$0"' in s.splitlines()[3]
+    lines = s.splitlines()
+    assert lines.index('umask 077') < lines.index('exec >>/var/log/hosted-env/boot.log 2>&1') < next(
+        i for i, x in enumerate(lines) if x.startswith('umask 022'))   # root-only log; apt must read the keyring
     assert f'INSTALL_K3S_VERSION={K3S_VERSION}' in s and "K3S_URL=https://cp.example:6443" in s
     assert '--node-label hosted-env/provider=boat' in s and 'apt-get install -y -qq runsc' in s
     assert "runtimes.runsc]" in s and 'ufw allow from 10.42.0.0/16' in s and 'flannel.json' not in s
