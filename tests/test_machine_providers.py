@@ -201,3 +201,47 @@ def test_targon_never_running_fails_without_boot():
     with pytest.raises(MachineError, match='did not start'):
         p.create(MachineSpec('cpu-small-amd', 'hosted-env-tg2'), '')
     assert booted == [] and len(p.list()) == 1                           # left for the planner to delete
+
+
+# ---------------------------------------------------------------- boot script
+def _bash_syntax_ok(script: str) -> None:
+    import subprocess
+    r = subprocess.run(['bash', '-n'], input=script.encode(), capture_output=True)
+    assert r.returncode == 0, r.stderr.decode()
+
+
+def test_boot_script_defaults():
+    from hosted_env.providers.machine.bootstrap import K3S_VERSION, render_boot_script
+    tok = 'K10abc::server:s3cr3t'
+    s = render_boot_script(server_url='https://cp.example:6443', join_token=tok,
+                           labels={'hosted-env/provider': 'boat'})
+    _bash_syntax_ok(s)
+    assert s.count(tok) == 1 and 'set -x' not in s and 'rm -f -- "$0"' in s.splitlines()[3]
+    assert f'INSTALL_K3S_VERSION={K3S_VERSION}' in s and "K3S_URL=https://cp.example:6443" in s
+    assert '--node-label hosted-env/provider=boat' in s and 'apt-get install -y -qq runsc' in s
+    assert "runtimes.runsc]" in s and 'ufw allow from 10.42.0.0/16' in s and 'flannel.json' not in s
+
+
+def test_boot_script_remapped_wireguard_and_no_gvisor():
+    import json as _json
+
+    from hosted_env.providers.machine.bootstrap import render_boot_script
+    s = render_boot_script(server_url='https://160.0.0.1:20004', join_token='t', node_name='hosted-env-tg1',
+                           wireguard_port=20000, wireguard_forwarded_port=51820, gvisor=False)
+    _bash_syntax_ok(s)
+    conf = _json.loads(s.split("flannel.json <<'EOF'\n", 1)[1].split('\nEOF', 1)[0])
+    assert conf['Backend'] == {'Type': 'wireguard', 'ListenPort': 20000, 'PersistentKeepaliveInterval': 25}
+    assert '--dport 51820 -j REDIRECT --to-ports 20000' in s and 'ufw allow 51820/udp' in s
+    assert '--flannel-conf /etc/rancher/k3s/flannel.json' in s and '--node-name hosted-env-tg1' in s
+    assert 'runsc' not in s
+
+
+def test_boot_script_rejects_injection():
+    from hosted_env.providers.machine.bootstrap import render_boot_script
+    with pytest.raises(ValueError):
+        render_boot_script(server_url='https://x; rm -rf ~', join_token='t')
+    with pytest.raises(ValueError):
+        render_boot_script(server_url='https://x', join_token='t', labels={'a b': 'c'})
+    s = render_boot_script(server_url='https://x:6443', join_token="t'; echo pwned; '", gvisor=False)
+    _bash_syntax_ok(s)
+    assert "K3S_TOKEN='t'\"'\"'; echo pwned; '\"'\"''" in s            # quoted, never executed as code
