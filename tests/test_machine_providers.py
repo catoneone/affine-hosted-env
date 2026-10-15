@@ -240,6 +240,36 @@ def test_boot_script_remapped_wireguard_and_no_gvisor():
     assert 'runsc' not in s
 
 
+def test_server_boot_script_targon_shape():
+    from hosted_env.providers.machine.bootstrap import render_server_boot_script
+    tok = 'K10srv::server:s3cr3t'
+    s = render_server_boot_script(join_token=tok, public_ip='160.0.0.1', api_port=20004, hairpin=True,
+                                  wireguard_port=20000, wireguard_forwarded_port=51820, node_name='hosted-env-cp1')
+    _bash_syntax_ok(s)
+    assert s.count(tok) == 1 and 'set -x' not in s and 'rm -f -- "$0"' in s.splitlines()[3]
+    assert '--advertise-address 160.0.0.1 --advertise-port 20004 --tls-san 160.0.0.1' in s
+    assert '--node-external-ip 160.0.0.1' in s and 'control-plane=true:NoSchedule' in s
+    assert 'ExecStartPre=-/usr/sbin/ip addr add 160.0.0.1/32 dev lo' in s
+    assert 'TCP-LISTEN:20004,bind=160.0.0.1,reuseaddr,fork TCP:127.0.0.1:6443' in s
+    assert "ExecStartPre=/bin/sh -c 'iptables -t nat -C PREROUTING -p udp --dport 51820" in s
+    assert s.index('hosted-env-net.service') < s.index('get.k3s.io | INSTALL')    # hairpin before the server
+    assert 'ufw allow 20004/tcp' in s and 'ufw allow 6443/tcp' in s and 'ufw allow 20000/udp' in s
+    assert 'kind: RuntimeClass' in s and 'handler: runsc' in s and 'name: hosted-env' in s
+    assert 'K3S_URL' not in s
+
+
+def test_server_boot_script_plain_and_validation():
+    from hosted_env.providers.machine.bootstrap import render_server_boot_script
+    s = render_server_boot_script(join_token='t', public_ip='2001:db8::1', schedulable=True, gvisor=False)
+    _bash_syntax_ok(s)
+    assert 'socat' not in s and 'NoSchedule' not in s and 'RuntimeClass' not in s and 'flannel.json' not in s
+    assert '--advertise-port 6443' in s
+    with pytest.raises(ValueError):
+        render_server_boot_script(join_token='t', public_ip='1.2.3.4; rm -rf ~')
+    with pytest.raises(ValueError):
+        render_server_boot_script(join_token='t', public_ip='1.2.3.4', namespace='Bad_NS')
+
+
 def test_boot_script_rejects_injection():
     from hosted_env.providers.machine.bootstrap import render_boot_script
     with pytest.raises(ValueError):
