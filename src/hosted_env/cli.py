@@ -1,4 +1,4 @@
-"""Command line: hosted-env keygen / server / gateway / worker / mine / verify / machines. Services listen on
+"""Command line: hosted-env keygen / server / gateway / worker / mine / verify / machines / roster-sync. Services listen on
 127.0.0.1 only by default."""
 from __future__ import annotations
 
@@ -148,6 +148,17 @@ def cmd_machines(a):
         print(f"last listed: {ts(max((r['last_seen'] or 0) for r in rows))} UTC (--refresh lists the providers now)")
 
 
+def cmd_roster_sync(a):
+    import logging
+
+    from .chain import sync_forever, sync_once
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    if a.every:
+        sync_forever(a.out, a.every, network=a.network, netuid=a.netuid)
+    else:
+        print(json.dumps(sync_once(a.out, network=a.network, netuid=a.netuid)))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='hosted-env')
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -190,6 +201,13 @@ def main(argv=None):
                     help='list the [machines] providers now (read only; nothing is created or deleted)')
     mc.add_argument('--json', action='store_true')
     mc.set_defaults(fn=cmd_machines)
+    rs = sub.add_parser('roster-sync', help='Write the SN120 registered hotkeys (upstream registrations() rule) to a '
+                                           'roster file the gateway hot-reloads (needs the chain extra)')
+    rs.add_argument('--out', required=True, help='e.g. roster.chain.json, the server config\'s roster_chain')
+    rs.add_argument('--network', default='finney', help='bittensor network name or ws(s):// endpoint')
+    rs.add_argument('--netuid', type=int, default=120)
+    rs.add_argument('--every', type=float, default=0, help='seconds between syncs; 0 = sync once and exit')
+    rs.set_defaults(fn=cmd_roster_sync)
     a = p.parse_args(argv)
     a.fn(a)
 

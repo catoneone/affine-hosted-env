@@ -11,7 +11,7 @@ worker (worker-key-signed, domain WORKER_DOMAIN):
   POST /v1/internal/touch         {session_id}        -> {active}
   POST /v1/internal/close         {session_id, outcome, reward}
 Public:
-  GET  /v1/info   current epoch, gateway public key, worker public keys, env parameters (in production these come from the opening)
+  GET  /v1/info   current epoch, gateway public key, worker public keys, env parameters, roster size and chain block
 Data plane (only when an in-process executor is attached; session token in `Authorization: Bearer`):
   POST /v1/start, POST /v1/turn, GET /v1/health   -- see executor/app.py
 """
@@ -41,18 +41,66 @@ log = logging.getLogger('hosted_env.gateway')
 
 
 class Roster:
-    """Roster of eligible identities for this epoch. File format {"epoch": "...", "hotkeys": {hotkey: {"uid": int, "public_key": hex}}},
-    re-read automatically when the file changes (in production: the opening's identity snapshot / upstream `registrations()`)."""
+    """Eligible identities, from up to two files, each re-read automatically when it changes (hot reload):
+    - `path`, hand-edited: {"epoch": "...", "hotkeys": {hotkey: {"uid": int, "public_key": hex}}}. It sets the epoch,
+      and its hotkeys are an allowlist (test keys, partners) on top of the chain;
+    - `chain_path` (optional), written by `hosted-env roster-sync` from SN120 registrations.
+    A hotkey in both keeps the chain's key: the allowlist cannot re-key a registered hotkey. A file that turns
+    unreadable or malformed keeps its last good content (logged), so a bad edit never locks miners out; a missing
+    chain file counts as no chain hotkeys."""
 
-    def __init__(self, path: str):
-        self.path, self._mtime, self.epoch, self.keys = path, None, None, {}
+    def __init__(self, path: str, chain_path: str | None = None):
+        self.path, self.chain_path = path, chain_path
+        self._seen = {}                                   # path -> (mtime_ns, size) last loaded
+        self.epoch, self._allow, self._chain, self._chain_meta = None, {}, {}, {}
+        self.keys = {}
+        self._load(strict=True)
 
-    def _load(self):
-        m = os.stat(self.path).st_mtime_ns
-        if m != self._mtime:
-            data = json.loads(open(self.path).read())
-            self.keys = {hk: verify_key_from_hex(v['public_key']) for hk, v in data['hotkeys'].items()}
-            self.epoch, self._mtime = data['epoch'], m
+    def _read(self, path: str, strict: bool):
+        """The parsed file if it changed since the last load, else None."""
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            if strict and path == self.path:
+                raise
+            if self._seen.get(path) != 'missing':
+                self._seen[path] = 'missing'
+                return {'hotkeys': {}}
+            return None
+        sig = (st.st_mtime_ns, st.st_size)
+        if self._seen.get(path) == sig:
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            keys = {hk: verify_key_from_hex(v['public_key']) for hk, v in (data.get('hotkeys') or {}).items()}
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            if strict:
+                raise
+            log.error('roster %s is unreadable, keeping the last good copy: %s: %s', path, type(e).__name__, e)
+            self._seen[path] = sig                         # do not re-log until it changes again
+            return None
+        self._seen[path] = sig
+        return {**data, 'keys': keys}
+
+    def _load(self, strict: bool = False):
+        changed = False
+        d = self._read(self.path, strict)
+        if d is not None:
+            if 'epoch' in d:
+                self.epoch = d['epoch']
+            self._allow, changed = d.get('keys', {}), True
+        if self.chain_path:
+            d = self._read(self.chain_path, False)
+            if d is not None:
+                self._chain = d.get('keys', {})
+                self._chain_meta = {k: d.get(k) for k in ('block', 'synced_at', 'netuid')}
+                changed = True
+        if changed:
+            for hk in set(self._allow) & set(self._chain):
+                if bytes(self._allow[hk]) != bytes(self._chain[hk]):
+                    log.warning('roster: allowlist key for %s differs from the chain; the chain key is used', hk)
+            self.keys = {**self._allow, **self._chain}
 
     def current_epoch(self) -> str:
         self._load()
@@ -61,6 +109,14 @@ class Roster:
     def key(self, hotkey: str) -> VerifyKey | None:
         self._load()
         return self.keys.get(hotkey)
+
+    def status(self) -> dict:
+        self._load()
+        out = {'allowlist_hotkeys': len(self._allow)}
+        if self.chain_path:
+            out.update(chain_hotkeys=len(self._chain), chain_block=self._chain_meta.get('block'),
+                       chain_synced_at=self._chain_meta.get('synced_at'))
+        return out
 
 
 def _err(status: int, code: str, detail: str = '', headers: dict | None = None) -> JSONResponse:
@@ -243,6 +299,7 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
         return {'epoch': roster.current_epoch(), 'gateway_public_key': bytes(gateway_pub).hex(),
                 'workers': {w: {'public_key': bytes(k).hex(), 'key_id': key_id(k)} for w, k in worker_keys.items()},
                 'envs': {e: {'kind': env.kind, 'group_size': env.group_size, 'success_reward': env.success_reward}
-                         for e, env in store.envs.items()}}
+                         for e, env in store.envs.items()},
+                'roster': roster.status()}
 
     return app

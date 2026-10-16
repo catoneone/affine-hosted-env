@@ -134,14 +134,21 @@ def machine_inventory(path: str, *, refresh: bool = False) -> tuple[list[dict], 
     return store.machines(live=False), report
 
 
+def _roster(cfg: dict, base: Path):
+    """roster: the hand-edited file (epoch + allowlist); roster_chain (optional): the file `hosted-env roster-sync`
+    writes from SN120 registrations. Both hot-reload."""
+    from .gateway.app import Roster
+    return Roster(_abs(base, cfg['roster']), _abs(base, cfg.get('roster_chain')))
+
+
 def build_gateway_app(path: str):
-    from .gateway.app import Roster, create_gateway_app
+    from .gateway.app import create_gateway_app
     cfg, base = _load(path)
     key = load_key_file(_abs(base, cfg['key_file']))
     workers = {w: verify_key_from_hex(h) for w, h in (cfg.get('workers') or {}).items()}
     store = _store(cfg, base, key)
     planner, interval = _planner(cfg, base, store)
-    return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), workers, key.verify_key,
+    return create_gateway_app(store, _roster(cfg, base), workers, key.verify_key,
                               limiter=_limiter(cfg), node_source=_node_source(cfg), planner=planner,
                               planner_interval=interval)
 
@@ -193,7 +200,7 @@ def build_server_app(path: str):
     """gateway + coordinator + executor in one process (architecture v2). The executor calls the coordinator
     directly and is reachable only through the gateway's /v1/start and /v1/turn."""
     from .executor.gateway_client import InProcessGatewayClient
-    from .gateway.app import Roster, create_gateway_app
+    from .gateway.app import create_gateway_app
     cfg, base = _load(path)
     gkey = load_key_file(_abs(base, cfg['key_file']))
     store = _store(cfg, base, gkey)
@@ -204,6 +211,6 @@ def build_server_app(path: str):
     worker = _executor(wcfg, base, wkey, InProcessGatewayClient(store, wcfg['worker_id']), gkey.verify_key,
                        cfg['public_url'], _runtimes(cfg, base))
     planner, interval = _planner(cfg, base, store)
-    return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), {wcfg['worker_id']: wkey.verify_key},
+    return create_gateway_app(store, _roster(cfg, base), {wcfg['worker_id']: wkey.verify_key},
                               gkey.verify_key, limiter=_limiter(cfg), executor=worker, node_source=_node_source(cfg),
                               planner=planner, planner_interval=interval)
