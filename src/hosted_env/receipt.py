@@ -47,7 +47,8 @@ CONTEXT_FIELDS = {
     'test_command_sha256': str,     # of the test command text (UTF-8)
     'grader': str,                  # grading semantics version, e.g. isolated-v2
     'grader_user': str,             # who the hidden tests ran as: nobody or root
-    'model_patch_sha256': str,      # of the model's patch bytes as graded (the attachment carries the patch)
+    'model_patch_sha256': str,      # of the model's patch bytes as captured, before the grader put protected test
+                                    # infrastructure back (a re-grader applies the same rule); the attachment has it
     'verifier_returncode': (int, type(None)),
     'model_id': str,                # as configured on the worker
     'model_revision': str,
@@ -158,12 +159,70 @@ def sign_receipt(worker_key: SigningKey, key_id: str, *, epoch: str, hotkey: str
     return {'payload': b64u(body), 'sig': b64u(sign(worker_key, RECEIPT_DOMAIN, body))}
 
 
+def receipt_digest(receipt: Mapping) -> str:
+    """SHA-256 of a receipt's signed payload bytes: how the gateway's group seal names each receipt."""
+    try:
+        return hashlib.sha256(unb64u(receipt['payload'])).hexdigest()
+    except (KeyError, ValueError, TypeError):
+        raise ReceiptError('malformed_receipt') from None
+
+
+# ---------------------------------------------------------------- group seal (signed by the gateway)
+# When the miner finishes a task, the gateway signs which receipts make up the group, by nonce, and when the group
+# was opened and finished by its own clock. The receipt hashes come from the workers (reported when each session
+# closes), never from the miner, so receipts from different runs cannot be assembled into one group, and the
+# times do not rest on a worker's clock.
+SEAL_DOMAIN = b'affine-hosted-env-group-seal-v1|'
+SEAL_VERSION = 1
+
+
+def sign_group_seal(gateway_key: SigningKey, *, epoch: str, hotkey: str, env_id: str, task: str, task_id: str,
+                    group_size: int, opened_at_ms: int, finished_at_ms: int, receipts: Sequence[str | None]) -> dict:
+    """receipts[n] is the receipt_digest the worker reported for nonce n, or None when none was reported."""
+    payload = {'v': SEAL_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
+               'task_id': task_id, 'group_size': group_size, 'opened_at_ms': opened_at_ms,
+               'finished_at_ms': finished_at_ms, 'receipts': list(receipts)}
+    body = canonical(payload)
+    return {'payload': b64u(body), 'sig': b64u(sign(gateway_key, SEAL_DOMAIN, body))}
+
+
+def verify_group_seal(seal: Mapping, gateway_key: VerifyKey, *, epoch: str, hotkey: str, env_id: str, task: str,
+                      group_size: int) -> dict:
+    """Check the gateway's signature and the group identity; returns the seal contents."""
+    try:
+        body, sig = unb64u(seal['payload']), unb64u(seal['sig'])
+        claims = json.loads(body)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        raise ReceiptError('malformed_seal') from None
+    if not verify(gateway_key, SEAL_DOMAIN, body, sig):
+        raise ReceiptError('bad_seal_signature')
+    if not isinstance(claims, Mapping):
+        raise ReceiptError('malformed_seal')
+    expected = {'v': SEAL_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
+                'group_size': group_size}
+    if any(claims.get(k) != v or type(claims.get(k)) is not type(v) for k, v in expected.items()):
+        raise ReceiptError('seal_identity_mismatch')
+    opened, finished, receipts = claims.get('opened_at_ms'), claims.get('finished_at_ms'), claims.get('receipts')
+    if (type(opened) is not int or type(finished) is not int or opened > finished or type(claims.get('task_id'))
+            is not str or not isinstance(receipts, list) or len(receipts) != group_size):
+        raise ReceiptError('malformed_seal')
+    return claims
+
+
 def read_receipt(receipt: Mapping) -> dict:
     """Decode the contents without checking the signature (for debugging)."""
     try:
         return json.loads(unb64u(receipt['payload']))
     except (KeyError, ValueError, TypeError):
         raise ReceiptError('malformed_receipt') from None
+
+
+def check_expect(expect: Mapping | None) -> None:
+    """The verifier's own `expect` names only context fields: a typo raises ValueError up front, whatever the
+    receipts look like."""
+    bad = sorted(set(expect or {}) - set(CONTEXT_FIELDS))
+    if bad:
+        raise ValueError(f'expect: not receipt context fields: {bad}')
 
 
 def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, VerifyKey], *, epoch: str, hotkey: str,
@@ -173,6 +232,7 @@ def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, Verify
     context fields to the values the verifier knows (the task's image and test hashes from its own copy of the
     task pool, the tokenizer it trains with). Returns the receipt contents (including outcome and reward) on
     success, otherwise raises ReceiptError."""
+    check_expect(expect)
     try:
         body, sig = unb64u(receipt['payload']), unb64u(receipt['sig'])
         claims = json.loads(body)
@@ -192,8 +252,6 @@ def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, Verify
             or started > issued):
         raise ReceiptError('malformed_receipt')
     for k, v in (expect or {}).items():
-        if k not in CONTEXT_FIELDS:
-            raise ValueError(f'expect: {k!r} is not a receipt context field')     # the caller's mistake
         if claims[k] != v or type(claims[k]) is not type(v):
             raise ReceiptError('context_mismatch')      # e.g. another image, test patch or tokenizer than expected
     try:

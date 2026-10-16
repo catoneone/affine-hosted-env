@@ -30,7 +30,7 @@ from .. import __version__
 from ..auth import AuthError, verify_token
 from ..common import canonical, key_id, sha256_hex
 from ..envs import SetupError
-from ..receipt import TrajectoryHasher, sign_receipt
+from ..receipt import TrajectoryHasher, receipt_digest, sign_receipt
 from ..render import TemplateRenderer
 from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox
 from ..providers.sandbox.k8s import K8sSandbox
@@ -57,10 +57,11 @@ def _build_version() -> str:
         if not top or not os.path.isfile(mine) or not os.path.samefile(mine, __file__):
             return __version__
         sha = git('rev-parse', '--short=12', 'HEAD').stdout.strip()
-        dirty = git('status', '--porcelain', '--untracked-files=no').stdout.strip()
+        st = git('status', '--porcelain', '--untracked-files=no')
     except (OSError, subprocess.SubprocessError):
         return __version__
-    return f'{__version__}+g{sha}{".dirty" if dirty else ""}' if sha else __version__
+    mark = '.unknown' if st.returncode != 0 else '.dirty' if st.stdout.strip() else ''   # never claim clean unchecked
+    return f'{__version__}+g{sha}{mark}' if sha else __version__
 
 
 def _sha256_text(text: str) -> str:
@@ -433,7 +434,7 @@ class Worker:
                    **{k: v for k, v in grade.items() if k in GRADE_LOG_FIELDS}})
         self._teardown(s)
         try:
-            self.gw.close(s.sid, outcome, reward)
+            self.gw.close(s.sid, outcome, reward, receipt_digest(receipt))   # the group seal lists it
         except GatewayUnavailable:
             log.error('could not report close for %s', s.sid)
         res = {'status': 'ok', 'seq': seq, 'done': True, 'outcome': outcome, 'reward': reward, 'detail': detail,

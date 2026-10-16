@@ -84,6 +84,12 @@ def trusted(stack):
     return info, {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
 
 
+def gw_key(info):
+    """The key the gateway signs group seals with, as /v1/info publishes it."""
+    from hosted_env.common import verify_key_from_hex
+    return verify_key_from_hex(info['gateway_public_key'])
+
+
 def test_group_end_to_end(stack):
     r = CharRenderer()
     gw = GatewayClient(stack['gw'].url, '5H0', stack['miners']['5H0'])
@@ -96,7 +102,7 @@ def test_group_end_to_end(stack):
     info, keys = trusted(stack)
     assert key_id(stack['wkey'].verify_key) in keys and info['envs']['swe']['group_size'] == 8
     att = json.loads(json.dumps(res['attachment']))                    # round-trip through JSON, same as reading it back after upload
-    v = verify_group(att, keys, epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
+    v = verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
     assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
     assert all(sum(m) > 0 for m in v['loss_masks'])
     c0 = v['claims'][0]                                                # receipt v2 context, set by the worker
@@ -111,9 +117,9 @@ def test_group_end_to_end(stack):
     assert seg['src'] == 'T'
     seg['ids'][3] = r.encode('!')[0]                                   # tamper with tool output
     with pytest.raises(ReceiptError, match='trajectory_mismatch'):
-        verify_group(bad, keys, epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
+        verify_group(bad, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
     with pytest.raises(ReceiptError, match='identity_mismatch'):        # someone else claims this group
-        verify_group(att, keys, epoch=EPOCH, hotkey='5H1', env_id='swe', task=res['task']['task'])
+        verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H1', env_id='swe', task=res['task']['task'])
 
     # a qualified task is not assigned again this epoch; the remaining one goes to someone else
     gw1 = GatewayClient(stack['gw'].url, '5H1', stack['miners']['5H1'])
@@ -135,9 +141,10 @@ def test_smoke_replies_end_to_end(stack):
     assert tool_texts[2].startswith('<|im_start|>tool\nError: Found 1 <tool_call>')
     assert "Unknown tool 'python'" in tool_texts[3]
     assert '[TRUNCATION WARNING]' in tool_texts[4]
-    _, keys = trusted(stack)
+    info, keys = trusted(stack)
     with pytest.raises(ReceiptError, match='group_gate_failed'):         # all completed but none correct: group not qualified
-        verify_group(res['attachment'], keys, epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
+        verify_group(res['attachment'], keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe',
+                     task=res['task']['task'])
 
 
 def test_auth_and_quota_errors_over_http(stack):
@@ -204,8 +211,8 @@ def test_single_process_group_and_data_plane_limit(tmp_path):
         info = httpx.get(gw.url + '/v1/info').json()
         from hosted_env.common import verify_key_from_hex
         keys = {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
-        v = verify_group(json.loads(json.dumps(res['attachment'])), keys, epoch=EPOCH, hotkey='5H0', env_id='swe',
-                         task=res['task']['task'])
+        v = verify_group(json.loads(json.dumps(res['attachment'])), keys, gateway_key=gw_key(info), epoch=EPOCH,
+                         hotkey='5H0', env_id='swe', task=res['task']['task'])
         assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
         assert httpx.get(gw.url + '/v1/health').json()['worker_id'] == 'local'
         bad = httpx.post(gw.url + '/v1/start', json={}, headers={'Authorization': 'Bearer nope'})

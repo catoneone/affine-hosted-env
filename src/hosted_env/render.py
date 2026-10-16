@@ -127,6 +127,13 @@ class HFRenderer(TemplateRenderer):
     def __init__(self, path: str, *, enable_thinking: bool | None = None, turn_end: str = '<|im_end|>',
                  extra_stops: Sequence[str] = ('<|endoftext|>',)):
         digest = tokenizer_digest(path)            # first: a local tokenizer directory, never a hub id
+        try:                                       # else AutoTokenizer picks the class from config.json, which
+            with open(os.path.join(path, 'tokenizer_config.json')) as f:            # the digest does not cover
+                named = bool(json.load(f).get('tokenizer_class'))
+        except (OSError, ValueError, AttributeError):
+            named = False
+        if not named:
+            raise ValueError(f'{path}/tokenizer_config.json must name tokenizer_class')
         import tokenizers
         import transformers
         from transformers import AutoTokenizer

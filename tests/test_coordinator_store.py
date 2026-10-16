@@ -302,3 +302,35 @@ def test_worker_spec_and_grade_inputs_scoped(tmp_path):
     assert st.worker_grade_inputs('w1', s['session_id'])['test_command'] == 'true'
     with pytest.raises(QuotaError, match='unknown_task'):
         st.worker_grade_inputs('w2', s['session_id'])
+
+
+# ---------------------------------------------------------------- group seal
+def test_finish_returns_a_gateway_signed_seal(tmp_path):
+    """The seal lists the receipt hash each worker reported, by nonce, with the gateway's own open / finish
+    times; finishing again returns the same seal; a voided task has none."""
+    from hosted_env.receipt import ReceiptError, verify_group_seal
+    st, key = make_store(tmp_path)
+    t = st.open_task(EPOCH, '5H0', 'env', now=NOW)
+    ss = st.open_sessions(EPOCH, '5H0', t['task_id'], list(range(8)), now=NOW + 1)
+    for s in ss[:7]:
+        st.worker_close('w1', s['session_id'], 'completed', 0.0, now=NOW + 5, receipt_sha256=f'{s["nonce"]:064x}')
+    with pytest.raises(QuotaError, match='bad_receipt_sha256'):
+        st.worker_close('w1', ss[7]['session_id'], 'completed', 1.0, now=NOW + 6, receipt_sha256='XYZ')
+    seal = st.finish_task(EPOCH, '5H0', t['task_id'], now=NOW + 9.5)
+    c = verify_group_seal(seal, key.verify_key, epoch=EPOCH, hotkey='5H0', env_id='env', task=t['task'],
+                          group_size=8)
+    assert c['receipts'] == [f'{n:064x}' for n in range(7)] + [None]       # nonce 7 never reported one
+    assert (c['opened_at_ms'], c['finished_at_ms'], c['task_id']) == (int(NOW * 1000), int((NOW + 9.5) * 1000),
+                                                                      t['task_id'])
+    assert st.finish_task(EPOCH, '5H0', t['task_id'], now=NOW + 99) == seal
+    for kw, code in (({'hotkey': '5H1'}, 'seal_identity_mismatch'), ({'group_size': 3}, 'seal_identity_mismatch')):
+        with pytest.raises(ReceiptError, match=code):
+            verify_group_seal(seal, key.verify_key, **{**dict(epoch=EPOCH, hotkey='5H0', env_id='env',
+                                                              task=t['task'], group_size=8), **kw})
+    with pytest.raises(ReceiptError, match='bad_seal_signature'):              # not the gateway's key
+        verify_group_seal(seal, SigningKey.generate().verify_key, epoch=EPOCH, hotkey='5H0', env_id='env',
+                          task=t['task'], group_size=8)
+    v = st.open_task(EPOCH, '5H0', 'env', now=NOW)
+    vs = st.open_sessions(EPOCH, '5H0', v['task_id'], [0], now=NOW)
+    st.worker_close('w1', vs[0]['session_id'], 'infra_error', 0.0, now=NOW)
+    assert st.finish_task(EPOCH, '5H0', v['task_id'], now=NOW) is None
