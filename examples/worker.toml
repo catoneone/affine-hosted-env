@@ -22,6 +22,9 @@ git_leak = "strip"
 kind = "hf"
 path = "/path/to/tokenizer"               # tokenizer + chat template of this epoch's model
 enable_thinking = true
+model_id = "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B"   # recorded in every receipt (configuration, not a proof)
+revision = "<upstream revision the tokenizer files come from>"
+# tokenizer_sha256 = "<render.tokenizer_digest(path)>"   # set it and the worker refuses other tokenizer files
 
 [envs.mimo_swe.sandbox_opts]              # one container per rollout: cgroup limits, not reservations
 cpus = "1"

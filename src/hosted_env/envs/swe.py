@@ -397,8 +397,9 @@ fi
         if grader not in ('root', 'nobody'):                # a typo must not silently pick one of them
             raise GradeError(f'grader_user must be "root" or "nobody", not {grader!r}')
         patch, problem = self.capture_patch(s)
-        res = {'model_patch': patch.decode('utf-8', 'replace'), 'model_patch_sha256': hashlib.sha256(patch).hexdigest(),
-               'reward': 0.0, 'grader': GRADER_VERSION, 'grader_user': grader}
+        res = {'model_patch': patch.decode('utf-8', 'replace'), 'model_patch_b64': base64.b64encode(patch).decode(),
+               'model_patch_sha256': hashlib.sha256(patch).hexdigest(), 'reward': 0.0, 'grader': GRADER_VERSION,
+               'grader_user': grader}
         if problem:                                         # the model's own doing (deleted .git, huge diff): 0
             return {**res, 'grade_detail': problem}
         if s.factory is None:

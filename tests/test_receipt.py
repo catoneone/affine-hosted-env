@@ -163,12 +163,16 @@ def test_nonce_type_strict(setup):
 
 
 # ---------------------------------------------------------------- group
-def _group(wk, outcomes):
+def _group(wk, outcomes, patch=b'diff --git a/calc.py b/calc.py\n'):
+    import base64
+    import hashlib
     rolls = []
     for n, (o, rw) in enumerate(outcomes):
         segs = [('P', [1, 2]), ('M', [3, n + 10]), ('T', [5]), ('M', [6, 7])]
+        ctx = {**CTX, 'model_patch_sha256': hashlib.sha256(patch).hexdigest()}
         rolls.append({'nonce': n, 'segments': [{'src': s, 'ids': i} for s, i in segs],
-                      'receipt': _sign(wk, segs, o, rw, nonce=n)})
+                      'receipt': _sign(wk, segs, o, rw, nonce=n, ctx=ctx),
+                      'model_patch': base64.b64encode(patch).decode()})
     return {'version': GROUP_ATTACHMENT_VERSION, 'env_id': ID['env_id'], 'task': ID['task'], 'rollouts': rolls}
 
 
@@ -203,3 +207,27 @@ def test_group_incomplete_or_swapped():
         verify_group(swapped, keys, **GID)
     with pytest.raises(ReceiptError, match='identity_mismatch'):
         verify_group(g, keys, **{**GID, 'task': 'other'})
+
+
+def test_group_carries_the_graded_patch():
+    """The attachment's patch must be the one the receipt says was graded, so a verifier can re-grade it."""
+    import base64
+    wk = SigningKey.generate()
+    keys = {'w1': wk.verify_key}
+    outcomes = [('completed', 1.0), ('completed', 0.0)] + [('unresolved', 0.0)] * 6
+    g = _group(wk, outcomes)
+    v = verify_group(g, keys, **GID, expect={'image': CTX['image']})
+    assert v['model_patches'][0] == b'diff --git a/calc.py b/calc.py\n'
+    with pytest.raises(ReceiptError, match='context_mismatch'):
+        verify_group(g, keys, **GID, expect={'test_command_sha256': '0' * 64})
+    swapped = copy.deepcopy(g)                              # a better-looking patch than the one graded
+    swapped['rollouts'][1]['model_patch'] = base64.b64encode(b'diff --git a/x b/x\n').decode()
+    with pytest.raises(ReceiptError, match='model_patch_mismatch'):
+        verify_group(swapped, keys, **GID)
+    for bad in ('not base64!', 7, 'A' * (3_000_000)):
+        broken = copy.deepcopy(g)
+        broken['rollouts'][0]['model_patch'] = bad
+        with pytest.raises(ReceiptError, match='malformed_group'):
+            verify_group(broken, keys, **GID)
+    with pytest.raises(ReceiptError, match='bad_attachment_version'):
+        verify_group(dict(g, version='hosted-env-group-v1'), keys, **GID)
