@@ -137,13 +137,13 @@ RESET_LIST_REMOTE = '/tmp/_hosted_env_reset.list'
 TREE_INDEX_REMOTE = '/tmp/_hosted_env_tree.index'
 LOCK_LIST_REMOTE = '/tmp/_hosted_env_lock.list'
 GRADER_UID = 65534                     # nobody: the hidden tests run without root (cfg grader_user = "root" to opt out)
-GRADER_HOME = '/tmp/hosted-env-grader'
 
 
 def as_grader(command: str) -> str:
-    """Run `command` as GRADER_UID with no supplementary groups, a fresh HOME and no profile or rc file."""
+    """Run `command` as GRADER_UID with no supplementary groups and no profile or rc file. HOME stays the
+    image's (its caches and toolchains: Go module cache, nvm, cargo, ...), which _lock_down hands to the grader."""
     return (f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups -- '
-            f'env HOME={GRADER_HOME} USER=nobody LOGNAME=nobody bash --noprofile --norc -c {shlex.quote(command)}')
+            f'env USER=nobody LOGNAME=nobody bash --noprofile --norc -c {shlex.quote(command)}')
 MAX_MODEL_PATCH_BYTES = 2_000_000
 GRADER_VERSION = 'isolated-v1'
 
@@ -293,30 +293,29 @@ class SweEnv(DockerTaskEnv):
             raise GradeError('reset_protected_failed: ' + r['output'][-300:])
 
     def _lock_down(self, sb, repo: str, test_patch: str) -> float:
-        """Before the hidden tests run as GRADER_UID: the repo becomes the grader's (tests may write caches and
-        scratch files), but the test infrastructure (every file of the test patch and each directory holding one,
-        up to the repo root) stays root's and read-only for the grader, so code under test cannot rewrite the
-        tests or the grading script while they run. Tools the image installed under /root (nvm, pipx, cargo, ...)
-        are made readable. Returns the seconds it took."""
+        """Before the hidden tests run as GRADER_UID. The repo and the image's HOME become the grader's, so tests
+        write caches and scratch files exactly where they would as root (pytest cache, rollup temp configs, the
+        Go build cache, nvm/cargo toolchains). The test infrastructure stays root's: every file of the test patch
+        is root-owned and read-only, and each directory holding one, up to the repo root, is root-owned with mode
+        1777 (like /tmp), so the grader can create files there but cannot replace, rename or delete the tests or
+        the grading script while they run. Returns the seconds it took. (EXP-018 parity runs: a read-only repo
+        root broke pytest with -W error and rollup; a changed HOME hid the Go module cache.)"""
         t0 = time.time()
         files = [f.encode('utf-8', 'surrogateescape') for f in patch_touched_files(test_patch)]
         self._put_bytes(sb, b'\0'.join(files) + (b'\0' if files else b''), LOCK_LIST_REMOTE)
         r = sb.execute(f'''set -e
 command -v setpriv >/dev/null || {{ echo "setpriv not found: cannot drop privileges"; exit 3; }}
 chown -R {GRADER_UID}:{GRADER_UID} .
+h="${{HOME:-/root}}"
+if [ -d "$h" ] && [ "$h" != / ]; then chown -R {GRADER_UID}:{GRADER_UID} "$h"; fi
 while IFS= read -r -d "" f; do
-  [ -e "$f" ] || continue
+  [ -e "$f" ] || [ -L "$f" ] || continue
   chown -h 0:0 -- "$f"; [ -L "$f" ] || chmod a-w -- "$f"
   d=$(dirname -- "$f")
-  while [ "$d" != "." ] && [ "$d" != "/" ]; do chown 0:0 -- "$d"; chmod 755 -- "$d"; d=$(dirname -- "$d"); done
+  while [ "$d" != "." ] && [ "$d" != "/" ]; do chown 0:0 -- "$d"; chmod 1777 -- "$d"; d=$(dirname -- "$d"); done
 done < {LOCK_LIST_REMOTE}
 rm -f {LOCK_LIST_REMOTE}
-chown 0:0 .; chmod 755 .
-chmod o+x /root 2>/dev/null || true
-for d in /root/.nvm /root/.local /root/.cargo /root/.rustup /root/go /root/.pyenv /root/.bun /root/.deno; do
-  [ -d "$d" ] && chmod -R o+rX "$d" || true
-done
-rm -rf {GRADER_HOME} && mkdir -p {GRADER_HOME} && chown {GRADER_UID}:{GRADER_UID} {GRADER_HOME}
+chown 0:0 .; chmod 1777 .
 ''', cwd=repo, timeout=900, login=False)
         if r['returncode'] != 0:
             raise GradeError('cannot prepare non-root grading: ' + r['output'][-300:])

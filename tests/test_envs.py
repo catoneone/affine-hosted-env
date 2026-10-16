@@ -254,11 +254,11 @@ def test_local_sandbox_map_root_under_tmp(tmp_path):
 def test_as_grader_drops_root_and_quotes_the_command():
     import shlex
 
-    from hosted_env.envs.swe import GRADER_HOME, GRADER_UID, as_grader
+    from hosted_env.envs.swe import GRADER_UID, as_grader
     cmd = as_grader("bash /testbed/mimo_test_command.sh; echo 'it''s' \"$HOME\"")
     argv = shlex.split(cmd)
     assert argv[:5] == ['setpriv', f'--reuid={GRADER_UID}', f'--regid={GRADER_UID}', '--clear-groups', '--']
-    assert argv[5:9] == ['env', f'HOME={GRADER_HOME}', 'USER=nobody', 'LOGNAME=nobody']
-    assert argv[9:12] == ['bash', '--noprofile', '--norc'] and argv[12] == '-c'
-    assert argv[13] == "bash /testbed/mimo_test_command.sh; echo 'it''s' \"$HOME\""   # passed through intact
+    assert argv[5:8] == ['env', 'USER=nobody', 'LOGNAME=nobody']                    # HOME stays the image's
+    assert argv[8:11] == ['bash', '--noprofile', '--norc'] and argv[11] == '-c'
+    assert argv[12] == "bash /testbed/mimo_test_command.sh; echo 'it''s' \"$HOME\""   # passed through intact
     assert SweEnv('swe', {}).cfg.get('grader_user', 'nobody') == 'nobody'          # non-root is the default
