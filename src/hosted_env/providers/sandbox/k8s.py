@@ -28,6 +28,7 @@ MANAGED_BY = {'app.kubernetes.io/managed-by': 'hosted-env'}
 NETWORK_LABEL = 'hosted-env/network'
 CONTAINER = 'task'
 WRITE_CHUNK = 48 * 1024          # bytes of file content per exec when writing files (base64 grows it by 4/3)
+HANDSHAKE_RETRIES, HANDSHAKE_BACKOFF = 3, 1.0     # exec WebSocket handshakes answered with 5xx (see ws_exec)
 
 # exec_fn(pod, argv, timeout) -> (output bytes with stdout and stderr merged, returncode, timed_out)
 ExecFn = Callable[[str, list[str], float], tuple[bytes, int, bool]]
@@ -134,13 +135,22 @@ def ws_exec(api, namespace: str) -> ExecFn:
         return a
 
     def run(pod: str, argv: list[str], timeout: float) -> tuple[bytes, int, bool]:
-        try:
-            resp = stream(exec_api().connect_get_namespaced_pod_exec, pod, namespace, container=CONTAINER,
-                          command=argv, stdin=False, stdout=True, stderr=True, tty=False, _preload_content=False)
-        except ApiException as e:
-            if e.status == 404:
-                raise SandboxError('pod is gone') from None
-            raise SandboxError(f'exec failed: {e.status} {e.reason}') from None
+        # A failed WebSocket handshake means the command never started, so retrying is safe. On boat nodes the
+        # API server reaches the kubelet through the node's own outbound tunnel, and about 1 in 70 rollouts saw
+        # a handshake answered with 500 (EXP-018): retry those a few times before calling it an infra error.
+        for attempt in range(HANDSHAKE_RETRIES + 1):
+            try:
+                resp = stream(exec_api().connect_get_namespaced_pod_exec, pod, namespace, container=CONTAINER,
+                              command=argv, stdin=False, stdout=True, stderr=True, tty=False,
+                              _preload_content=False)
+                break
+            except ApiException as e:
+                if e.status == 404:
+                    raise SandboxError('pod is gone') from None
+                transient = e.status == 0 and 'Handshake status 5' in str(e.reason)
+                if not transient or attempt == HANDSHAKE_RETRIES:
+                    raise SandboxError(f'exec failed: {e.status} {e.reason}') from None
+                time.sleep(HANDSHAKE_BACKOFF * (attempt + 1))
         buf, deadline, timed_out = bytearray(), time.monotonic() + timeout, False
         try:
             while resp.is_open():
@@ -164,6 +174,7 @@ class K8sSandbox:
                  namespace: str = 'hosted-env', node_name: str | None = None, runtime_class: str | None = 'auto',
                  cpus: str = '1', memory: str = '2g', network: str = 'none', repair_env: bool = True,
                  offline_check: str = 'interfaces', start_timeout: float = 600, poll: float = 0.5,
+                 delete_timeout: float = 120,
                  labels: dict | None = None, **_ignored):
         """runtime_class 'auto': gvisor-nonet for network='none', gvisor otherwise.
         offline_check (network='none' only): 'interfaces' refuses a sandbox that has any interface besides lo;
@@ -187,6 +198,7 @@ class K8sSandbox:
         self.networking_api, self.network, self.offline_check = networking_api, network, offline_check
         self.exec_fn = exec_fn or ws_exec(api, namespace)
         self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env
+        self.delete_timeout = delete_timeout
         self.started, self.has_timeout = False, False
         self.env: dict[str, str] = {}
 
@@ -206,7 +218,9 @@ class K8sSandbox:
                 raise SandboxError(f'read pod failed: {str(e)[:300]}') from None
             if _ready(pod):
                 break
-            why = _reason(pod) or (f'pod {pod.status.phase}' if pod.status.phase in ('Failed', 'Succeeded') else None)
+            why = _reason(pod) or (f'pod {pod.status.phase}' + (f' ({pod.status.reason}: {pod.status.message})'
+                                                            if getattr(pod.status, 'reason', None) else '')
+                                   if pod.status.phase in ('Failed', 'Succeeded') else None)
             if why:
                 raise SandboxError(why)
             if time.monotonic() > deadline:
@@ -230,19 +244,20 @@ class K8sSandbox:
             raise SandboxError(f'sandbox is not offline (interfaces: {ifaces or "unreadable"}); use the '
                                "gvisor-nonet runtime class, or offline_check='off' to rely on NetworkPolicy alone")
 
-    def _argv(self, command: str, cwd: str | None, timeout: int, raw: bool) -> list[str]:
-        inner = ['bash', '-lc', command]
+    def _argv(self, command: str, cwd: str | None, timeout: int, raw: bool, login: bool = True) -> list[str]:
+        inner = ['bash', '-lc', command] if login else ['bash', '--noprofile', '--norc', '-c', command]
         if self.has_timeout and not raw:
             inner = ['timeout', '-k', '5', str(int(timeout)), *inner]
         env = ['env', *(f'{k}={v}' for k, v in self.env.items())] if self.env else []
         # exec has no working-directory option: change directory first, then exec the real command
         return ['sh', '-c', 'cd "$1" || exit 125; shift; exec "$@"', 'sh', cwd or self.cwd, *env, *inner]
 
-    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False) -> dict:
+    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
+                login: bool = True) -> dict:
         """Returns {output, returncode, reason}; reason is ok / client_timeout."""
         if not self.started:
             raise SandboxError('sandbox not started')
-        out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw), timeout + 30)
+        out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw, login), timeout + 30)
         if self.has_timeout and not raw and rc == 124:
             timed_out = True
         return {'output': out[:OUTPUT_CAP_BYTES].decode('utf-8', 'replace'), 'returncode': rc,
@@ -259,6 +274,9 @@ class K8sSandbox:
                 raise SandboxError(f'write {remote_path} failed: {out[-300:].decode("utf-8", "replace")}')
 
     def cleanup(self):
+        """Delete the Pod and wait until it is gone: a deleted Pod keeps its CPU and memory on the node until
+        the kubelet tears it down, and the next sandbox placed on that node (the grading container, the next
+        group) would be refused with OutOfmemory / OutOfcpu (EXP-018)."""
         if not self.started:
             return
         self.started = False
@@ -267,3 +285,13 @@ class K8sSandbox:
         except Exception as e:
             if getattr(e, 'status', None) != 404:
                 raise
+        deadline = time.monotonic() + self.delete_timeout
+        while time.monotonic() < deadline:
+            try:
+                self.api.read_namespaced_pod(self.name, self.ns)
+            except Exception as e:
+                if getattr(e, 'status', None) == 404:
+                    return
+                raise
+            time.sleep(self.poll)
+        raise SandboxError(f'pod {self.name} still exists {self.delete_timeout:.0f}s after delete')

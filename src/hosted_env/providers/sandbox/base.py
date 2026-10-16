@@ -19,8 +19,12 @@ class Sandbox(Protocol):
     def start(self) -> None:
         """Create the container and make it ready for commands."""
 
-    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False) -> dict:
-        """Run a shell command. Returns {output, returncode, reason}; reason is ok / client_timeout."""
+    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
+                login: bool = True) -> dict:
+        """Run a shell command. Returns {output, returncode, reason}; reason is ok / client_timeout.
+        login=True runs `bash -lc` (what the model's tool calls get); login=False runs
+        `bash --noprofile --norc -c`, so no profile or rc file the model could have edited is read (grading).
+        Environment variables captured from the pristine image at start are applied either way."""
 
     def copy_text_to(self, text: str, remote_path: str) -> None:
         """Write a text file inside the container."""

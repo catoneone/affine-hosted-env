@@ -10,6 +10,7 @@ aligned with mimoagent opensource_code.py).
 """
 from __future__ import annotations
 
+import base64
 import re
 import time
 
@@ -130,10 +131,45 @@ def future_commits(sb, repo: str, base: str) -> list[str]:
 
 
 TEST_PATCH_REMOTE = '/tmp/_hosted_env_test.patch'
+MODEL_PATCH_REMOTE = '/tmp/_hosted_env_model.patch'
+RESET_LIST_REMOTE = '/tmp/_hosted_env_reset.list'
+TREE_INDEX_REMOTE = '/tmp/_hosted_env_tree.index'
+MAX_MODEL_PATCH_BYTES = 2_000_000
+GRADER_VERSION = 'isolated-v1'
+
+# Test infrastructure the model's patch must not change: anything here that the patch touches is put back to the
+# base commit in the grading container before the hidden tests run (the test_patch files are handled separately).
+# These are files that decide how tests are collected, configured or reported rather than the code under test.
+_PROTECTED_NAMES = {
+    # python: pytest/tox/nox configuration, conftest plugins, interpreter start-up hooks
+    'conftest.py', 'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'noxfile.py',
+    'sitecustomize.py', 'usercustomize.py',
+    # go: module graph (replace directives) and workspace
+    'go.mod', 'go.sum', 'go.work', 'go.work.sum',
+    # js/ts: package scripts and test-runner / transpiler configuration
+    'package.json', '.npmrc', '.babelrc', '.babelrc.json', '.babelrc.js',
+    # generic: the grading entry points, build entry points, attributes that change how patches apply
+    'mimo_test_command.sh', 'test_commands.json', 'Makefile', 'makefile', 'GNUmakefile', '.gitattributes',
+    '.gitmodules',
+}
+_PROTECTED_RE = re.compile(
+    r'(^|/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*\.pth|[^/]*_test\.go'
+    r'|[^/]*\.(test|spec)\.[cm]?[jt]sx?'
+    r'|(jest|vitest|vite|ava|babel)\.(config|setup|workspace)\.[^/]*|setupTests\.[^/]*|karma\.conf\.[^/]*'
+    r'|\.mocharc[^/]*|\.env[^/]*)$'
+    r'|(^|/)(__tests__|__mocks__)/')
+
+
+def protected_paths(files: list[str]) -> list[str]:
+    return [f for f in files if f.rsplit('/', 1)[-1] in _PROTECTED_NAMES or _PROTECTED_RE.search(f)]
 
 
 class SweEnv(DockerTaskEnv):
-    """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error')."""
+    """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error').
+
+    Grading never trusts the rollout container: the model's changes are captured as a git patch, that container is
+    destroyed, and the hidden tests run in a fresh container from the same image with only the patch applied,
+    the test infrastructure reset (`protected_paths`), and a non-login shell (no profile or rc file is read)."""
 
     kind = 'mimo_swe'
 
@@ -141,8 +177,9 @@ class SweEnv(DockerTaskEnv):
         r = self._load()[task]
         return {**super().grade_inputs(task), 'test_patch': r['test_patch']}
 
-    def setup(self, s: EnvSession) -> None:
-        sb, repo = s.sb, s.spec['cwd']
+    def _prepare_repo(self, sb, repo: str, lang: str) -> str:
+        """Bring a fresh container's repo to the base state the model starts from (also used for the grading
+        container, so both start from the same tree). Returns the base commit."""
         sb.execute(f'git config --global --add safe.directory {repo}', timeout=60)
         if sb.execute('git rev-parse --git-dir', cwd=repo, timeout=60)['returncode'] != 0:
             r = sb.execute('git init -q && git add -A && git -c user.email=env@local -c user.name=env '
@@ -153,6 +190,26 @@ class SweEnv(DockerTaskEnv):
         base = r['output'].strip().split()[-1] if r['output'].strip() else ''
         if r['returncode'] != 0 or len(base) != 40:
             raise SetupError(f'cannot read HEAD: {r["output"][-300:]}')
+        if self.cfg.get('cleanup', True):
+            anti_hack_cleanup(sb, repo, lang)
+        return base
+
+    def _tree(self, sb, repo: str, base: str) -> str:
+        """Content hash of the working tree as git sees it: the base commit's tracked files plus every non-ignored
+        file, read through a throwaway index so neither HEAD nor the real index changes (the model's view stays
+        exactly as before). Identical trees give identical hashes, which is how the grading container proves it
+        starts where the rollout started even when an image's working tree differs from its own HEAD."""
+        r = sb.execute(f'export GIT_INDEX_FILE={TREE_INDEX_REMOTE}; rm -f "$GIT_INDEX_FILE"; '
+                       f'git read-tree {base} && git add -A >/dev/null 2>&1 && git write-tree; '
+                       'rc=$?; rm -f "$GIT_INDEX_FILE"; exit $rc', cwd=repo, timeout=600, login=False)
+        tree = r['output'].strip().split()[-1] if r['output'].strip() else ''
+        if r['returncode'] != 0 or len(tree) != 40:
+            raise SetupError(f'cannot snapshot the working tree: {r["output"][-300:]}')
+        return tree
+
+    def setup(self, s: EnvSession) -> None:
+        sb, repo = s.sb, s.spec['cwd']
+        base = self._prepare_repo(sb, repo, s.spec.get('lang', ''))
         stripped = False
         if future_commits(sb, repo, base):
             if self.cfg.get('git_leak', 'strip') != 'strip':
@@ -161,29 +218,113 @@ class SweEnv(DockerTaskEnv):
             stripped = True
             if future_commits(sb, repo, base):
                 raise SetupError('future commits still visible after git strip')
-        if self.cfg.get('cleanup', True):
-            anti_hack_cleanup(sb, repo, s.spec.get('lang', ''))
-        s.state.update(base=base, git_stripped=stripped)
+        s.state.update(base=base, git_stripped=stripped, start_tree=self._tree(sb, repo, base))
+
+    def capture_patch(self, s: EnvSession) -> tuple[bytes, str]:
+        """(patch bytes, problem) from the rollout container: the model's changes as a binary-safe git patch from
+        the tree it started with to the tree it left (tracked and non-ignored files). It travels base64-encoded (no
+        UTF-8 decoding, no stderr mixed in), with no login shell and with external diff drivers and textconv
+        filters off."""
+        repo = s.spec['cwd']
+        try:
+            end_tree = self._tree(s.sb, repo, s.state['base'])
+        except SetupError:
+            return b'', 'model_patch_capture_failed'      # e.g. the model deleted .git
+        r = s.sb.execute(f'set -o pipefail; git diff --binary --no-color --no-ext-diff --no-textconv '
+                         f'{s.state["start_tree"]} {end_tree} 2>/dev/null '
+                         f'| head -c {MAX_MODEL_PATCH_BYTES + 1} | base64 | tr -d "\\n"',
+                         cwd=repo, timeout=300, login=False)
+        try:
+            data = base64.b64decode(r['output'].strip(), validate=True)
+        except ValueError:
+            return b'', 'model_patch_capture_failed'
+        if len(data) > MAX_MODEL_PATCH_BYTES:
+            return b'', 'model_patch_too_large'
+        if r['returncode'] != 0:
+            return b'', 'model_patch_capture_failed'
+        return data, ''
+
+    def _put_bytes(self, sb, data: bytes, path: str) -> None:
+        sb.copy_text_to(base64.b64encode(data).decode(), path + '.b64')
+        r = sb.execute(f'base64 -d < {path}.b64 > {path} && rm -f {path}.b64', timeout=120, login=False)
+        if r['returncode'] != 0:
+            raise GradeError(f'cannot write {path}: {r["output"][-200:]}')
+
+    def _patch_paths(self, sb, repo: str, path: str) -> list[bytes]:
+        """Every path the patch touches (both sides of renames), as git itself parses it (`--numstat -z`), so
+        quoted names, force-added ignored files and renames cannot hide a protected file."""
+        r = sb.execute(f'set -o pipefail; git apply --numstat -z {path} | base64 | tr -d "\\n"', cwd=repo,
+                       timeout=120, login=False)
+        if r['returncode'] != 0:
+            raise GradeError('cannot list model patch paths: ' + r['output'][-300:])
+        items, out, i = base64.b64decode(r['output'].strip()).split(b'\0'), [], 0
+        while i < len(items):
+            fields = items[i].split(b'\t')
+            if len(fields) == 3 and fields[2] == b'' and i + 2 < len(items):   # rename/copy: src and dst follow
+                out += [items[i + 1], items[i + 2]]
+                i += 3
+                continue
+            if len(fields) == 3 and fields[2]:
+                out.append(fields[2])
+            i += 1
+        return out
+
+    def _reset_paths(self, sb, repo: str, start: str, paths: list[bytes]) -> None:
+        """Put each path back to the start tree, or delete it when the start tree does not have it (NUL-separated,
+        so any name)."""
+        if not paths:
+            return
+        self._put_bytes(sb, b'\0'.join(paths) + b'\0', RESET_LIST_REMOTE)
+        r = sb.execute(f'while IFS= read -r -d "" f; do\n'
+                       f'  if git cat-file -e {start}:"$f" 2>/dev/null; then git checkout {start} -- "$f" || exit 1\n'
+                       '  else git rm -rf -q --cached --ignore-unmatch -- "$f" >/dev/null && rm -rf -- "$f"; fi\n'
+                       f'done < {RESET_LIST_REMOTE}; rm -f {RESET_LIST_REMOTE}', cwd=repo, timeout=300, login=False)
+        if r['returncode'] != 0:
+            raise GradeError('reset_protected_failed: ' + r['output'][-300:])
 
     def grade(self, s: EnvSession, gi: dict) -> dict:
-        sb, repo, base = s.sb, s.spec['cwd'], s.state['base']
-        diff = sb.execute('git add -A >/dev/null 2>&1 && git -c core.fileMode=false diff HEAD 2>/dev/null', cwd=repo,
-                          timeout=120)
-        res = {'model_patch': diff['output'] if diff['returncode'] == 0 else '', 'reward': 0.0}
-        reset_cmd = reset_test_files_cmd(gi['test_patch'], base)
+        repo = s.spec['cwd']
+        patch, problem = self.capture_patch(s)
+        res = {'model_patch': patch.decode('utf-8', 'replace'), 'reward': 0.0, 'grader': GRADER_VERSION}
+        if problem:                                         # the model's own doing (deleted .git, huge diff): 0
+            return {**res, 'grade_detail': problem}
+        if s.factory is None:
+            raise GradeError('no sandbox factory for an isolated grading container')
+        s.sb.cleanup()                                      # the rollout container is never used again
+        sb = s.grader_sb = s.factory(s.spec['image'], repo)
         try:
-            if reset_cmd and sb.execute(reset_cmd, cwd=repo, timeout=300)['returncode'] != 0:
+            sb.start()
+            base = self._prepare_repo(sb, repo, s.spec.get('lang', ''))
+            start = self._tree(sb, repo, base)
+            if start != s.state['start_tree']:
+                raise GradeError(f'grading container starts from tree {start[:12]}, the rollout started from '
+                                 f'{s.state["start_tree"][:12]} (non-deterministic image or setup)')
+            reverted = []
+            if patch:
+                self._put_bytes(sb, patch, MODEL_PATCH_REMOTE)
+                touched = self._patch_paths(sb, repo, MODEL_PATCH_REMOTE)
+                ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
+                                timeout=300, login=False)
+                sb.execute(f'rm -f {MODEL_PATCH_REMOTE}', timeout=60, login=False)
+                if ap['returncode'] != 0:                   # same start tree, so only the patch can be at fault
+                    return {**res, 'grade_detail': 'model_patch_does_not_apply: ' + ap['output'][-300:]}
+                prot = protected_paths([p.decode('utf-8', 'surrogateescape') for p in touched])
+                reverted = sorted(set(prot))
+                self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])
+            reset_cmd = reset_test_files_cmd(gi['test_patch'], base)
+            if reset_cmd and sb.execute(reset_cmd, cwd=repo, timeout=300, login=False)['returncode'] != 0:
                 raise GradeError('reset_tests_failed')
             sb.copy_text_to(gi['test_patch'], TEST_PATCH_REMOTE)
-            ap = sb.execute(f'git apply --verbose {TEST_PATCH_REMOTE}', cwd=repo, timeout=300)
-            sb.execute(f'rm -f {TEST_PATCH_REMOTE}', timeout=60)
+            ap = sb.execute(f'git apply --verbose {TEST_PATCH_REMOTE}', cwd=repo, timeout=300, login=False)
+            sb.execute(f'rm -f {TEST_PATCH_REMOTE}', timeout=60, login=False)
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
             t0 = time.time()
-            r = sb.execute(gi['test_command'], cwd=repo, timeout=gi['verifier_timeout'])
+            r = sb.execute(gi['test_command'], cwd=repo, timeout=gi['verifier_timeout'], login=False)
             return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                     'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
-                    'test_output': r['output'][-3000:]}
+                    'test_output': r['output'][-3000:], 'reverted_paths': reverted}
+        except SetupError as e:
+            raise GradeError(f'grading container setup failed: {e}') from None
         finally:
-            if reset_cmd:
-                sb.execute(reset_cmd, cwd=repo, timeout=300)
+            sb.cleanup()
