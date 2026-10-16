@@ -24,6 +24,11 @@ k3s cluster: one sandbox Pod per rollout                MachineProvider: boat, t
 
 ### Gateway
 - Verifies hotkey request signatures and replay ids (`auth.py`) and checks the epoch roster.
+- Roster = SN120 registrations + a hand-edited allowlist, both hot-reloaded. `hosted-env roster-sync --every 300`
+  writes the chain part with upstream's `registrations()` rule (a UID on netuid 120 plus a revealed
+  `affine2|activate` commitment signed by the hotkey's Ed25519 key, owner excluded); the allowlist (`roster`) sets
+  the epoch and adds test keys, and cannot re-key a registered hotkey. A sync that would drop more than half the
+  hotkeys is refused and the previous file kept.
 - Rate limits with token buckets: per source IP before auth, per hotkey after auth, and globally. Over the limit
   returns 429 with `Retry-After`. Buckets live in process memory for now behind an interface, so a shared store
   can replace them when the gateway runs as several replicas.

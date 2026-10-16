@@ -22,6 +22,9 @@ server = ["fastapi==0.143.1", "uvicorn==0.54.0", "httpx==0.28.1"]
 tokenizer = ["transformers==5.19.0", "jinja2==3.1.6"]
 k8s = ["kubernetes==31.0.0"]
 all = ["affine-hosted-env[server,tokenizer,k8s]"]
+chain = [
+    "bittensor==11.0.2",
+]
 
 [project.scripts]
 hosted-env = "hosted_env.cli:main"

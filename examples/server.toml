@@ -3,7 +3,8 @@
 # Relative paths are resolved against this file's directory.
 db = "../runs/gateway.db"
 key_file = "../keys/gateway.key"          # signs session tokens
-roster = "roster.json"                    # qualified identity roster for this epoch (in production, from the opening snapshot)
+roster = "roster.json"                    # hand-edited: the epoch + an allowlist (test keys); hot-reloaded
+# roster_chain = "roster.chain.json"      # SN120 registered hotkeys, written by `hosted-env roster-sync`; hot-reloaded
 public_url = "http://127.0.0.1:8780"      # what miners use for both planes; returned as worker_url by tasks/open
 
 [executor]
