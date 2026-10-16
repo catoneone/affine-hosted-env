@@ -14,12 +14,18 @@ from hosted_env.verify import GROUP_ATTACHMENT_VERSION, verify_group
 ID = dict(epoch='e000001', hotkey='5Hotkey0', env_id='mimo_swe', task='002119', nonce=3)
 SEGS = [('P', [151644, 8948, 198]), ('M', [40, 1184, 311, 1349]), ('T', [27, 14172, 9, 29]),
         ('M', [785, 5046, 151645])]
+CTX = {'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64, 'test_patch_sha256': 'a' * 64,
+       'test_command_sha256': 'b' * 64, 'grader': 'isolated-v2', 'grader_user': 'nobody',
+       'model_patch_sha256': 'd' * 64, 'verifier_returncode': 0, 'model_id': 'XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B',
+       'model_revision': '2367e865', 'tokenizer_sha256': 'e' * 64, 'chat_template_sha256': 'f' * 64,
+       'renderer': 'hf/transformers-4.57.1', 'executor_version': '0.1.0+g07c593529e5c',
+       'started_at_ms': 1_800_000_000_000}
 
 
-def _sign(wk, segs=SEGS, outcome='completed', reward=1.0, kid='w1', **ident):
+def _sign(wk, segs=SEGS, outcome='completed', reward=1.0, kid='w1', ctx=CTX, **ident):
     d, n = trajectory_sha256(segs)
-    return sign_receipt(wk, kid, trajectory_sha256=d, n_tokens=n, outcome=outcome, reward=reward,
-                        issued_at=1_800_000_000, **{**ID, **ident})
+    return sign_receipt(wk, kid, trajectory_sha256=d, n_tokens=n, outcome=outcome, reward=reward, context=ctx,
+                        issued_at_ms=1_800_000_123_456, **{**ID, **ident})
 
 
 @pytest.fixture
@@ -31,7 +37,43 @@ def setup():
 def test_roundtrip(setup):
     _, keys, r = setup
     c = verify_receipt(r, SEGS, keys, **ID)
-    assert (c['outcome'], c['reward'], c['n_tokens']) == ('completed', 1.0, 14)
+    assert (c['outcome'], c['reward'], c['n_tokens'], c['v']) == ('completed', 1.0, 14, 2)
+    assert {k: c[k] for k in CTX} == CTX and c['issued_at_ms'] == 1_800_000_123_456
+
+
+def test_context_is_complete_and_typed():
+    """The worker cannot sign a v2 receipt that leaves out what the reward depends on, or adds to it."""
+    wk = SigningKey.generate()
+    for bad in ({k: v for k, v in CTX.items() if k != 'image'}, {**CTX, 'extra': 'x'},
+                {**CTX, 'verifier_returncode': '0'}, {**CTX, 'started_at_ms': True},
+                {**CTX, 'tokenizer_sha256': 'E' * 64}, {**CTX, 'model_patch_sha256': 'abc'}):
+        with pytest.raises(ValueError, match='bad receipt context'):
+            _sign(wk, ctx=bad)
+    _sign(wk, ctx={**CTX, 'verifier_returncode': None, 'model_patch_sha256': ''})   # an ungraded rollout
+
+
+def test_expect_pins_context(setup):
+    """The verifier pins what it knows independently: the task's image and test patch, its own tokenizer."""
+    _, keys, r = setup
+    verify_receipt(r, SEGS, keys, **ID, expect={'image': CTX['image'], 'tokenizer_sha256': 'e' * 64})
+    for k, v in (('image', 'docker.io/x/y@sha256:' + '0' * 64), ('test_patch_sha256', '0' * 64),
+                 ('tokenizer_sha256', '1' * 64), ('grader', 'isolated-v1')):
+        with pytest.raises(ReceiptError, match='context_mismatch'):
+            verify_receipt(r, SEGS, keys, **ID, expect={k: v})
+
+
+def test_v1_and_hand_made_payloads_are_rejected(setup):
+    """A v1 payload, or a v2 payload with a context field dropped, fails even when signed by a trusted key."""
+    from hosted_env.common import canonical, sign
+    from hosted_env.receipt import RECEIPT_DOMAIN
+    wk, keys, r = setup
+    body = json.loads(unb64u(r['payload']))
+    for forged, code in (({**body, 'v': 1}, 'identity_mismatch'),
+                         ({k: v for k, v in body.items() if k != 'grader'}, 'malformed_receipt'),
+                         ({**body, 'started_at_ms': body['issued_at_ms'] + 1}, 'malformed_receipt')):
+        raw = canonical(forged)
+        with pytest.raises(ReceiptError, match=code):
+            verify_receipt({'payload': b64u(raw), 'sig': b64u(sign(wk, RECEIPT_DOMAIN, raw))}, SEGS, keys, **ID)
 
 
 def test_dict_segments_and_loss_mask(setup):

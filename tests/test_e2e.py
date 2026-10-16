@@ -99,6 +99,10 @@ def test_group_end_to_end(stack):
     v = verify_group(att, keys, epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
     assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
     assert all(sum(m) > 0 for m in v['loss_masks'])
+    c0 = v['claims'][0]                                                # receipt v2 context, set by the worker
+    assert (c0['grader'], c0['grader_user'], c0['renderer']) == ('isolated-v2', 'root', 'char/v1/enable_thinking=false')
+    assert len(c0['model_patch_sha256']) == len(c0['test_patch_sha256']) == len(c0['tokenizer_sha256']) == 64
+    assert c0['image'] and c0['verifier_returncode'] == 0 and c0['started_at_ms'] <= c0['issued_at_ms']
 
     bad = copy.deepcopy(att)
     seg = bad['rollouts'][0]['segments'][2]

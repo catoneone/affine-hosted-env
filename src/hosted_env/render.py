@@ -14,8 +14,34 @@ encode the text after the assistant end marker. This avoids hand-writing the for
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import threading
 from collections.abc import Sequence
+
+# The files tokenizer_digest covers, by name, when present at the top of a tokenizer directory. A fixed list so
+# anyone holding the same upstream files (e.g. the model's HF repo at its revision) gets the same digest.
+TOKENIZER_FILES = ('added_tokens.json', 'chat_template.jinja', 'merges.txt', 'special_tokens_map.json',
+                   'tokenizer.json', 'tokenizer.model', 'tokenizer_config.json', 'vocab.json')
+
+
+def tokenizer_digest(path: str) -> str:
+    """SHA-256 over 'name NUL sha256(content) LF' for each TOKENIZER_FILES entry present in `path`, in name order."""
+    h = hashlib.sha256(b'hosted-env-tokenizer-v1\n')
+    for name in TOKENIZER_FILES:
+        f = os.path.join(path, name)
+        if os.path.isfile(f):
+            with open(f, 'rb') as fh:
+                h.update(name.encode() + b'\0' + hashlib.sha256(fh.read()).hexdigest().encode() + b'\n')
+    return h.hexdigest()
+
+
+def _sha256_text(text) -> str:
+    if not text:
+        return ''
+    raw = text if isinstance(text, str) else json.dumps(text, sort_keys=True)     # a dict of named templates
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 _DUMMY = [{'role': 'user', 'content': 'x'},
           # With reasoning: Qwen-family templates render the think block differently for the "last assistant"
@@ -28,7 +54,13 @@ class RenderError(RuntimeError):
 
 
 class TemplateRenderer:
-    """Subclasses implement render_text / encode / decode / token_id / vocab_size."""
+    """Subclasses implement render_text / encode / decode / token_id / vocab_size, and set `identity`: what the
+    receipt records about how tokens were rendered ({renderer, tokenizer_sha256, chat_template_sha256}).
+    model_id / model_revision are the worker's configuration (make_renderer)."""
+
+    identity: dict = {'renderer': '', 'tokenizer_sha256': '', 'chat_template_sha256': ''}
+    model_id = ''
+    model_revision = ''
 
     def __init__(self, turn_end: str = '<|im_end|>', extra_stops: Sequence[str] = ('<|endoftext|>',)):
         self.turn_end = turn_end               # end marker of assistant messages in the template; each model turn ends with it
@@ -82,9 +114,14 @@ class HFRenderer(TemplateRenderer):
 
     def __init__(self, path: str, *, enable_thinking: bool | None = None, turn_end: str = '<|im_end|>',
                  extra_stops: Sequence[str] = ('<|endoftext|>',)):
+        import transformers
         from transformers import AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(path)
         self.enable_thinking = enable_thinking
+        think = '' if enable_thinking is None else f'/enable_thinking={str(enable_thinking).lower()}'
+        self.identity = {'renderer': f'hf/transformers-{transformers.__version__}{think}',
+                         'tokenizer_sha256': tokenizer_digest(path),
+                         'chat_template_sha256': _sha256_text(self.tok.chat_template)}
         self._lock = threading.Lock()          # HF fast tokenizer occasionally raises "Already borrowed" on concurrent encodes
         self.vocab_size = len(self.tok)
         super().__init__(turn_end, extra_stops)
@@ -121,9 +158,11 @@ class CharRenderer(TemplateRenderer):
     OFFSET = 16
 
     def __init__(self, enable_thinking: bool = False):
-        import json
         self._json = json
         self.enable_thinking = enable_thinking
+        self.identity = {'renderer': f'char/v1/enable_thinking={str(enable_thinking).lower()}',
+                         'tokenizer_sha256': hashlib.sha256(b'hosted-env-char-renderer-v1').hexdigest(),
+                         'chat_template_sha256': ''}
         self.vocab_size = 0x110000 + self.OFFSET
         self._rev = {v: k for k, v in self.SPECIAL.items()}
         super().__init__('<|im_end|>', ('<|endoftext|>',))
@@ -171,9 +210,17 @@ def make_renderer(cfg: dict) -> TemplateRenderer:
     {"kind": "char"}."""
     kind = cfg.get('kind', 'hf')
     if kind == 'char':
-        return CharRenderer(enable_thinking=bool(cfg.get('enable_thinking', False)))
-    if kind == 'hf':
-        return HFRenderer(cfg['path'], enable_thinking=cfg.get('enable_thinking'),
-                          turn_end=cfg.get('turn_end', '<|im_end|>'),
-                          extra_stops=tuple(cfg.get('extra_stops', ('<|endoftext|>',))))
-    raise ValueError(f'unknown renderer kind {kind!r}')
+        r: TemplateRenderer = CharRenderer(enable_thinking=bool(cfg.get('enable_thinking', False)))
+    elif kind == 'hf':
+        r = HFRenderer(cfg['path'], enable_thinking=cfg.get('enable_thinking'),
+                       turn_end=cfg.get('turn_end', '<|im_end|>'),
+                       extra_stops=tuple(cfg.get('extra_stops', ('<|endoftext|>',))))
+    else:
+        raise ValueError(f'unknown renderer kind {kind!r}')
+    # model_id / revision: what the receipt records the worker was set up for; tokenizer_sha256 pins the files
+    r.model_id, r.model_revision = str(cfg.get('model_id', '')), str(cfg.get('revision', ''))
+    want = cfg.get('tokenizer_sha256')
+    if want and want != r.identity['tokenizer_sha256']:
+        raise ValueError(f'tokenizer files do not match tokenizer_sha256: expected {want}, '
+                         f'found {r.identity["tokenizer_sha256"]}')
+    return r
