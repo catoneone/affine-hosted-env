@@ -164,6 +164,15 @@ def test_protected_test_infrastructure_is_reset_whatever_its_name(tmp_path):
     assert sorted(g['reverted_paths']) == sorted(files)
 
 
+def test_protected_file_renamed_away_is_put_back(tmp_path):
+    # git diff records a 100% rename (conftest.py -> notes.txt); git apply --numstat would name only notes.txt
+    prep = 'printf "import os\\n# fixtures the hidden tests rely on\\n" > conftest.py'
+    g, _ = graded(tmp_path, 'mv conftest.py notes.txt', 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
+                  image_prep=prep)
+    assert 'rename from conftest.py' in g['model_patch']
+    assert g['reward'] == 1.0 and g['reverted_paths'] == ['conftest.py']
+
+
 def test_patch_problems_are_the_models_own_zero(tmp_path):
     g, _ = graded(tmp_path, 'head -c 2500000 /dev/urandom | base64 > big.txt')
     assert (g['reward'], g['grade_detail'], g['model_patch']) == (0.0, 'model_patch_too_large', '')
