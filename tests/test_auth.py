@@ -14,10 +14,10 @@ def env():
     miners = {f'5Hotkey{i}': SigningKey.generate() for i in range(3)}
     seen = set()
 
-    def remember(reqid, now):
-        if reqid in seen:
+    def remember(scope, reqid, now):
+        if (scope, reqid) in seen:
             return False
-        seen.add(reqid)
+        seen.add((scope, reqid))
         return True
 
     v = RequestVerifier(MINER_DOMAIN, lambda hk: miners[hk].verify_key if hk in miners else None, remember)
@@ -64,6 +64,20 @@ def test_replay_rejected(env):
     v.verify('POST', '/open', h, b'x', now=NOW)
     with pytest.raises(AuthError, match='replayed_request'):
         v.verify('POST', '/open', h, b'x', now=NOW + 1)
+
+
+def test_request_ids_are_per_signer(env):
+    """Another hotkey copying a request id seen on the wire into its own request first does not lock out the
+    original; the same signer reusing one is still a replay."""
+    v, miners = env
+    rid = 'r' * 32
+    first = sign_request(miners['5Hotkey1'], 'POST', '/open', '5Hotkey1', b'y', ts=int(NOW), reqid=rid)
+    v.verify('POST', '/open', first, b'y', now=NOW)
+    victim = sign_request(miners['5Hotkey0'], 'POST', '/open', '5Hotkey0', b'x', ts=int(NOW), reqid=rid)
+    assert v.verify('POST', '/open', victim, b'x', now=NOW) == '5Hotkey0'
+    again = sign_request(miners['5Hotkey0'], 'POST', '/close', '5Hotkey0', b'z', ts=int(NOW), reqid=rid)
+    with pytest.raises(AuthError, match='replayed_request'):
+        v.verify('POST', '/close', again, b'z', now=NOW + 1)
 
 
 def test_token_tamper():

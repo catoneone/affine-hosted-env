@@ -334,3 +334,22 @@ def test_finish_returns_a_gateway_signed_seal(tmp_path):
     vs = st.open_sessions(EPOCH, '5H0', v['task_id'], [0], now=NOW)
     st.worker_close('w1', vs[0]['session_id'], 'infra_error', 0.0, now=NOW)
     assert st.finish_task(EPOCH, '5H0', v['task_id'], now=NOW) is None
+
+
+def test_reqids_are_scoped_and_legacy_ones_still_count(tmp_path):
+    """Per signer scope; an id recorded before scopes existed (an upgraded database) blocks every scope until it
+    ages out, so a request signed just before the upgrade cannot be replayed after it."""
+    import sqlite3
+
+    from hosted_env.auth import REQID_TTL
+    old = sqlite3.connect(tmp_path / 'g.db')                  # a database from before per-signer scopes
+    old.execute('CREATE TABLE reqids (reqid TEXT PRIMARY KEY, seen_at REAL NOT NULL)')
+    old.execute('INSERT INTO reqids VALUES (?, ?)', ('legacy' * 4, NOW))
+    old.commit()
+    old.close()
+    st, _ = make_store(tmp_path)
+    assert st.remember_reqid('miner|5H0', 'a' * 32, NOW) and st.remember_reqid('miner|5H1', 'a' * 32, NOW)
+    assert not st.remember_reqid('miner|5H0', 'a' * 32, NOW + 1)
+    assert not st.remember_reqid('miner|5H0', 'legacy' * 4, NOW + 1)
+    assert st.remember_reqid('miner|5H0', 'legacy' * 4, NOW + REQID_TTL + 1)    # aged out
+    assert st.remember_reqid('miner|5H0', 'a' * 32, NOW + REQID_TTL + 2)

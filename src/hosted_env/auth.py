@@ -49,11 +49,13 @@ def sign_request(key: SigningKey, method: str, path: str, identity: str, body: b
 
 
 class RequestVerifier:
-    """keys(identity) returns that identity's public key or None; remember(reqid, now) records the request id and
-    returns False if it was seen before (replay protection)."""
+    """keys(identity) returns that identity's public key or None; remember(scope, reqid, now) records the request
+    id and returns False if it was seen before in that scope (replay protection). The scope is the domain and the
+    signing identity: request ids are only unique per signer, so one signer can never use up another's (for
+    example by copying a request id seen on the wire into a request of its own before the original arrives)."""
 
     def __init__(self, domain: str, keys: Callable[[str], VerifyKey | None],
-                 remember: Callable[[str, float], bool]):
+                 remember: Callable[[str, str, float], bool]):
         self.domain, self.keys, self.remember = domain, keys, remember
 
     def verify(self, method: str, path: str, headers: Mapping, body: bytes, now: float | None = None) -> str:
@@ -73,7 +75,7 @@ class RequestVerifier:
         if not verify(key, b'', request_message(self.domain, method, path, identity, ts, reqid, body), sig):
             raise AuthError('bad_signature')
         # Record the reqid only after the signature checks out, so others cannot fill the table with junk requests
-        if not self.remember(reqid, now):
+        if not self.remember(f'{self.domain}|{identity}', reqid, now):
             raise AuthError('replayed_request')
         return identity
 

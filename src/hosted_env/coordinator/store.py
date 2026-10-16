@@ -81,7 +81,9 @@ class CapacityError(QuotaError):
 
 SCHEMA = '''
 PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS reqids (reqid TEXT PRIMARY KEY, seen_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS reqids (reqid TEXT PRIMARY KEY, seen_at REAL NOT NULL);   -- before per-signer scopes
+CREATE TABLE IF NOT EXISTS reqid_scopes (scope TEXT NOT NULL, reqid TEXT NOT NULL, seen_at REAL NOT NULL,
+    PRIMARY KEY (scope, reqid));
 CREATE TABLE IF NOT EXISTS workers (
     worker_id TEXT PRIMARY KEY, url TEXT NOT NULL, capacity INTEGER NOT NULL, images TEXT NOT NULL,
     envs TEXT NOT NULL, last_seen REAL NOT NULL);
@@ -177,11 +179,17 @@ class Store:
         return env
 
     # ------------------------------------------------------------ replay protection
-    def remember_reqid(self, reqid: str, now: float) -> bool:
+    def remember_reqid(self, scope: str, reqid: str, now: float) -> bool:
+        """False when this signer (scope: domain and identity) already used reqid within REQID_TTL. Request ids
+        recorded before scopes existed (table reqids) still count for every scope until they age out, so a request
+        signed just before an upgrade cannot be replayed just after it."""
         with self._tx() as cur:
             cur.execute('DELETE FROM reqids WHERE seen_at < ?', (now - REQID_TTL,))
+            cur.execute('DELETE FROM reqid_scopes WHERE seen_at < ?', (now - REQID_TTL,))
+            if cur.execute('SELECT 1 FROM reqids WHERE reqid=?', (reqid,)).fetchone():
+                return False
             try:
-                cur.execute('INSERT INTO reqids VALUES (?, ?)', (reqid, now))
+                cur.execute('INSERT INTO reqid_scopes (scope, reqid, seen_at) VALUES (?, ?, ?)', (scope, reqid, now))
             except sqlite3.IntegrityError:
                 return False
         return True
