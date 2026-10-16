@@ -159,6 +159,56 @@ def sign_receipt(worker_key: SigningKey, key_id: str, *, epoch: str, hotkey: str
     return {'payload': b64u(body), 'sig': b64u(sign(worker_key, RECEIPT_DOMAIN, body))}
 
 
+def receipt_digest(receipt: Mapping) -> str:
+    """SHA-256 of a receipt's signed payload bytes: how the gateway's group seal names each receipt."""
+    try:
+        return hashlib.sha256(unb64u(receipt['payload'])).hexdigest()
+    except (KeyError, ValueError, TypeError):
+        raise ReceiptError('malformed_receipt') from None
+
+
+# ---------------------------------------------------------------- group seal (signed by the gateway)
+# When the miner finishes a task, the gateway signs which receipts make up the group, by nonce, and when the group
+# was opened and finished by its own clock. The receipt hashes come from the workers (reported when each session
+# closes), never from the miner, so receipts from different runs cannot be assembled into one group, and the
+# times do not rest on a worker's clock.
+SEAL_DOMAIN = b'affine-hosted-env-group-seal-v1|'
+SEAL_VERSION = 1
+
+
+def sign_group_seal(gateway_key: SigningKey, *, epoch: str, hotkey: str, env_id: str, task: str, task_id: str,
+                    group_size: int, opened_at_ms: int, finished_at_ms: int, receipts: Sequence[str | None]) -> dict:
+    """receipts[n] is the receipt_digest the worker reported for nonce n, or None when none was reported."""
+    payload = {'v': SEAL_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
+               'task_id': task_id, 'group_size': group_size, 'opened_at_ms': opened_at_ms,
+               'finished_at_ms': finished_at_ms, 'receipts': list(receipts)}
+    body = canonical(payload)
+    return {'payload': b64u(body), 'sig': b64u(sign(gateway_key, SEAL_DOMAIN, body))}
+
+
+def verify_group_seal(seal: Mapping, gateway_key: VerifyKey, *, epoch: str, hotkey: str, env_id: str, task: str,
+                      group_size: int) -> dict:
+    """Check the gateway's signature and the group identity; returns the seal contents."""
+    try:
+        body, sig = unb64u(seal['payload']), unb64u(seal['sig'])
+        claims = json.loads(body)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        raise ReceiptError('malformed_seal') from None
+    if not verify(gateway_key, SEAL_DOMAIN, body, sig):
+        raise ReceiptError('bad_seal_signature')
+    if not isinstance(claims, Mapping):
+        raise ReceiptError('malformed_seal')
+    expected = {'v': SEAL_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
+                'group_size': group_size}
+    if any(claims.get(k) != v or type(claims.get(k)) is not type(v) for k, v in expected.items()):
+        raise ReceiptError('seal_identity_mismatch')
+    opened, finished, receipts = claims.get('opened_at_ms'), claims.get('finished_at_ms'), claims.get('receipts')
+    if (type(opened) is not int or type(finished) is not int or opened > finished or type(claims.get('task_id'))
+            is not str or not isinstance(receipts, list) or len(receipts) != group_size):
+        raise ReceiptError('malformed_seal')
+    return claims
+
+
 def read_receipt(receipt: Mapping) -> dict:
     """Decode the contents without checking the signature (for debugging)."""
     try:

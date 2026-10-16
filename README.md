@@ -76,7 +76,8 @@ See [examples/](examples/) for config examples. Services listen on 127.0.0.1 onl
 - Append-only context, no re-rendering (token in, token out); the incremental tool output is obtained by diff-rendering with the chat template.
 - Each request waits at most 25 s; if not done it returns `pending`, and resending the same seq with the same tokens keeps waiting on the same operation.
 - Receipt (v2): epoch, hotkey, env_id, task, nonce, trajectory hash, token count, outcome (completed / unresolved / infra_error), reward, worker key id, and what the reward depends on: image digest, test patch / test command / model patch hashes, grader version and user, verifier exit code, model id and revision (worker config), tokenizer and chat-template hashes, renderer, executor version, start and issue times in ms. Signed with the worker's Ed25519 key; `verify_receipt(..., expect={...})` pins fields the verifier knows.
-- Group attachment: `{"version": "hosted-env-group-v2", "env_id", "task", "rollouts": [{"nonce", "segments": [{"src", "ids"}], "receipt", "model_patch"}]}`; `model_patch` is the graded patch (base64) and must hash to the receipt's `model_patch_sha256`, so a verifier can re-grade offline.
+- Group attachment: `{"version": "hosted-env-group-v2", "env_id", "task", "seal", "rollouts": [{"nonce", "segments": [{"src", "ids"}], "receipt", "model_patch"}]}`; `model_patch` is the graded patch (base64) and must hash to the receipt's `model_patch_sha256`, so a verifier can re-grade offline.
+- Group seal: returned by `POST /v1/tasks/finish` and signed with the gateway key (`gateway_public_key` in `/v1/info`): epoch, hotkey, env, task, task id, group size, the gateway-clock open and finish times in ms, and by nonce the hash of each receipt as the worker reported it when the session closed. `verify_group(..., gateway_key=...)` requires it, so receipts from different runs cannot be assembled into one group.
 
 ## Status
 

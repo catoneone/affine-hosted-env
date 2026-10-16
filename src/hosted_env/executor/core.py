@@ -30,7 +30,7 @@ from .. import __version__
 from ..auth import AuthError, verify_token
 from ..common import canonical, key_id, sha256_hex
 from ..envs import SetupError
-from ..receipt import TrajectoryHasher, sign_receipt
+from ..receipt import TrajectoryHasher, receipt_digest, sign_receipt
 from ..render import TemplateRenderer
 from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox
 from ..providers.sandbox.k8s import K8sSandbox
@@ -434,7 +434,7 @@ class Worker:
                    **{k: v for k, v in grade.items() if k in GRADE_LOG_FIELDS}})
         self._teardown(s)
         try:
-            self.gw.close(s.sid, outcome, reward)
+            self.gw.close(s.sid, outcome, reward, receipt_digest(receipt))   # the group seal lists it
         except GatewayUnavailable:
             log.error('could not report close for %s', s.sid)
         res = {'status': 'ok', 'seq': seq, 'done': True, 'outcome': outcome, 'reward': reward, 'detail': detail,

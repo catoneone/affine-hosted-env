@@ -84,7 +84,8 @@ def cmd_verify(a):
     keys = {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
     env = info['envs'][att['env_id']]
     try:
-        v = verify_group(att, keys, epoch=a.epoch or info['epoch'], hotkey=a.hotkey, env_id=att['env_id'],
+        v = verify_group(att, keys, gateway_key=verify_key_from_hex(info['gateway_public_key']),
+                         epoch=a.epoch or info['epoch'], hotkey=a.hotkey, env_id=att['env_id'],
                          task=att['task'], group_size=env['group_size'], success_reward=env['success_reward'])
     except ReceiptError as e:
         print(json.dumps({'ok': False, 'error': e.code}))

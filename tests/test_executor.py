@@ -30,8 +30,8 @@ class InProcGateway:
     def touch(self, sid):
         return self.st.worker_touch(self.wid, sid)
 
-    def close(self, sid, outcome, reward):
-        self.st.worker_close(self.wid, sid, outcome, reward)
+    def close(self, sid, outcome, reward, receipt_sha256=None):
+        self.st.worker_close(self.wid, sid, outcome, reward, receipt_sha256=receipt_sha256)
 
 
 @pytest.fixture

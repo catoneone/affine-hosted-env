@@ -63,9 +63,10 @@ class WorkerGatewayClient:
         except GatewayRejected:
             return False
 
-    def close(self, session_id: str, outcome: str, reward: float | None) -> None:
+    def close(self, session_id: str, outcome: str, reward: float | None, receipt_sha256: str | None = None) -> None:
         try:
-            self.post('/v1/internal/close', {'session_id': session_id, 'outcome': outcome, 'reward': reward})
+            self.post('/v1/internal/close', {'session_id': session_id, 'outcome': outcome, 'reward': reward,
+                                             'receipt_sha256': receipt_sha256})
         except GatewayRejected:
             pass
 
@@ -101,8 +102,8 @@ class InProcessGatewayClient:
         except GatewayRejected:
             return False
 
-    def close(self, session_id: str, outcome: str, reward: float | None) -> None:
+    def close(self, session_id: str, outcome: str, reward: float | None, receipt_sha256: str | None = None) -> None:
         try:
-            self._call(self.store.worker_close, session_id, outcome, reward)
+            self._call(self.store.worker_close, session_id, outcome, reward, None, receipt_sha256)
         except GatewayRejected:
             pass

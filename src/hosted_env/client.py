@@ -97,8 +97,9 @@ class GatewayClient:
     def open_sessions(self, epoch: str, task_id: str, nonces: list[int]) -> list[dict]:
         return self._post('/v1/sessions/open', {'epoch': epoch, 'task_id': task_id, 'nonces': nonces})['sessions']
 
-    def finish_task(self, epoch: str, task_id: str) -> None:
-        self._post('/v1/tasks/finish', {'epoch': epoch, 'task_id': task_id})
+    def finish_task(self, epoch: str, task_id: str) -> dict | None:
+        """Returns the gateway-signed group seal (None when the task was voided)."""
+        return self._post('/v1/tasks/finish', {'epoch': epoch, 'task_id': task_id}).get('seal')
 
 
 class WorkerClient:
@@ -185,6 +186,7 @@ def run_task(gateway: GatewayClient, epoch: str, env_id: str, sampler: Sampler, 
     any rollout voids the group and refunds it, so there is nothing to upload)."""
     t = gateway.open_task(epoch, env_id, max_wait=max_wait)
     results: list[dict] = []
+    seal = None
     try:
         sessions = gateway.open_sessions(epoch, t['task_id'], list(range(t['group_size'])))
         worker = worker_factory(t['worker_url'])
@@ -192,13 +194,13 @@ def run_task(gateway: GatewayClient, epoch: str, env_id: str, sampler: Sampler, 
             results = list(ex.map(lambda s: run_rollout(worker, s['token'], sampler, nonce=s['nonce']), sessions))
     finally:
         try:
-            gateway.finish_task(epoch, t['task_id'])
+            seal = gateway.finish_task(epoch, t['task_id'])
         except ApiError as e:
             if e.status not in (404, 409, 410):        # an already ended (voided) task cannot be finished again
                 raise
     voided = any(x['outcome'] in ('voided', 'infra_error') for x in results)
     attachment = None if voided else {
-        'version': GROUP_ATTACHMENT_VERSION, 'env_id': t['env_id'], 'task': t['task'],
+        'version': GROUP_ATTACHMENT_VERSION, 'env_id': t['env_id'], 'task': t['task'], 'seal': seal,
         'rollouts': [{'nonce': x['nonce'], 'segments': x['segments'], 'receipt': x['receipt'],
                       'model_patch': x['model_patch']}
                      for x in sorted(results, key=lambda x: x['nonce'])]}

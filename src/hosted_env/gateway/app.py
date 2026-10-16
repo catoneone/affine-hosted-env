@@ -3,13 +3,13 @@
 Miner (hotkey-signed, domain MINER_DOMAIN):
   POST /v1/tasks/open      {epoch, env_id}            -> {task_id, env_id, task, worker_url, group_size}
   POST /v1/sessions/open   {epoch, task_id, nonces}   -> {sessions: [{nonce, session_id, token}]}
-  POST /v1/tasks/finish    {epoch, task_id}           -> {ok}
+  POST /v1/tasks/finish    {epoch, task_id}           -> {ok, seal}  (gateway-signed group seal; null if voided)
 worker (worker-key-signed, domain WORKER_DOMAIN):
   POST /v1/internal/heartbeat     {url, capacity, images, env_ids}
   POST /v1/internal/task-spec     {task_id}           -> {env_id, task, group_size, spec}
   POST /v1/internal/grade-inputs  {session_id}        -> grading inputs
   POST /v1/internal/touch         {session_id}        -> {active}
-  POST /v1/internal/close         {session_id, outcome, reward}
+  POST /v1/internal/close         {session_id, outcome, reward, receipt_sha256}
 Public:
   GET  /v1/info   current epoch, gateway public key, worker public keys, env parameters, roster size and chain block
 Data plane (only when an in-process executor is attached; session token in `Authorization: Bearer`):
@@ -259,8 +259,8 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
     @app.post('/v1/tasks/finish')
     async def tasks_finish(request: Request):
         hotkey, data = await authed(request, miner_auth)
-        await run_in_threadpool(store.finish_task, str(data.get('epoch')), hotkey, str(data.get('task_id')))
-        return {'ok': True}
+        seal = await run_in_threadpool(store.finish_task, str(data.get('epoch')), hotkey, str(data.get('task_id')))
+        return {'ok': True, 'seal': seal}
 
     # ---------------------------------------------------------------- worker
     @app.post('/v1/internal/heartbeat')
@@ -288,9 +288,10 @@ def create_gateway_app(store: Store, roster: Roster, worker_keys: dict[str, Veri
     @app.post('/v1/internal/close')
     async def close(request: Request):
         wid, d = await authed(request, worker_auth)
-        reward = d.get('reward')
+        reward, digest = d.get('reward'), d.get('receipt_sha256')
         await run_in_threadpool(store.worker_close, wid, str(d.get('session_id')), str(d.get('outcome')),
-                                None if reward is None else float(reward))
+                                None if reward is None else float(reward), None,
+                                None if digest is None else str(digest))
         return {'ok': True}
 
     # ---------------------------------------------------------------- public

@@ -40,6 +40,9 @@ from dataclasses import dataclass
 from nacl.signing import SigningKey
 
 from ..auth import REQID_TTL, issue_token
+from ..receipt import sign_group_seal
+
+_HEX = frozenset('0123456789abcdef')
 
 SESSION_OUTCOMES = ('completed', 'unresolved', 'infra_error', 'abandoned')
 
@@ -86,14 +89,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, hotkey TEXT NOT NULL, env_id TEXT NOT NULL, task TEXT NOT NULL,
     worker_id TEXT NOT NULL, slots INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('running', 'done', 'void')),
-    started_at REAL NOT NULL, last_seen REAL NOT NULL, ended_at REAL, end_reason TEXT, node TEXT,
+    started_at REAL NOT NULL, last_seen REAL NOT NULL, ended_at REAL, end_reason TEXT, node TEXT, seal TEXT,
     UNIQUE (epoch, hotkey, env_id, task));
 CREATE INDEX IF NOT EXISTS tasks_hotkey ON tasks (epoch, hotkey, state);
 CREATE INDEX IF NOT EXISTS tasks_state ON tasks (state, worker_id);
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY, task_id TEXT NOT NULL, nonce INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('active', 'closed', 'expired')),
-    outcome TEXT, reward REAL, opened_at REAL NOT NULL, last_seen REAL NOT NULL,
+    outcome TEXT, reward REAL, opened_at REAL NOT NULL, last_seen REAL NOT NULL, receipt_sha256 TEXT,
     UNIQUE (task_id, nonce));
 CREATE INDEX IF NOT EXISTS sessions_task ON sessions (task_id, state);
 CREATE INDEX IF NOT EXISTS sessions_active ON sessions (state, last_seen);
@@ -137,8 +140,9 @@ class Store:
         self.rng = rng or random.SystemRandom()
         self.db = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False, timeout=30)
         self.db.executescript(SCHEMA)
-        if 'node' not in {r[1] for r in self.db.execute('PRAGMA table_info(tasks)')}:
-            self.db.execute('ALTER TABLE tasks ADD COLUMN node TEXT')      # databases created before nodes
+        for table, col in (('tasks', 'node'), ('tasks', 'seal'), ('sessions', 'receipt_sha256')):
+            if col not in {r[1] for r in self.db.execute(f'PRAGMA table_info({table})')}:
+                self.db.execute(f'ALTER TABLE {table} ADD COLUMN {col} TEXT')     # databases from before it
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='planner_machines'").fetchone():
             # databases from before the inventory: the planner's own machines move into `machines`
             self.db.executescript(
@@ -384,8 +388,8 @@ class Store:
             for n in nonces:
                 sid = secrets.token_hex(16)
                 try:
-                    cur.execute("INSERT INTO sessions VALUES (?, ?, ?, 'active', NULL, NULL, ?, ?)",
-                                (sid, task_id, n, now, now))
+                    cur.execute('INSERT INTO sessions (id, task_id, nonce, state, opened_at, last_seen) '
+                                "VALUES (?, ?, ?, 'active', ?, ?)", (sid, task_id, n, now, now))
                 except sqlite3.IntegrityError:
                     raise QuotaError('nonce_used', f'nonce {n} already opened for this task') from None
                 claims = {'sid': sid, 'task_id': task_id, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id,
@@ -394,14 +398,33 @@ class Store:
             cur.execute('UPDATE tasks SET last_seen=? WHERE task_id=?', (now, task_id))
         return out
 
-    def finish_task(self, epoch: str, hotkey: str, task_id: str, now: float | None = None) -> None:
-        """Miner finishes or abandons the task: close all its active sessions, end the task, free the "running" quota slot immediately."""
+    def finish_task(self, epoch: str, hotkey: str, task_id: str, now: float | None = None) -> dict | None:
+        """Miner finishes or abandons the task: close all its active sessions, end the task, free the "running"
+        quota slot immediately. Returns the gateway-signed group seal (receipt.sign_group_seal) of a task that
+        ended done, the same one on every call; None for a voided task."""
         now = time.time() if now is None else now
         with self._tx() as cur:
             row = cur.execute('SELECT epoch, hotkey FROM tasks WHERE task_id=?', (task_id,)).fetchone()
             if not row or row[0] != epoch or row[1] != hotkey:
                 raise QuotaError('unknown_task', status=404)
             self._end_task(cur, task_id, 'done', 'finished', now)
+            return self._seal(cur, task_id)
+
+    def _seal(self, cur, task_id: str) -> dict | None:
+        epoch, hotkey, env_id, task, state, started, ended, seal = cur.execute(
+            'SELECT epoch, hotkey, env_id, task, state, started_at, ended_at, seal FROM tasks WHERE task_id=?',
+            (task_id,)).fetchone()
+        if state != 'done':
+            return None
+        if seal:
+            return json.loads(seal)
+        size = self._env(env_id).group_size
+        got = dict(cur.execute('SELECT nonce, receipt_sha256 FROM sessions WHERE task_id=?', (task_id,)).fetchall())
+        out = sign_group_seal(self.signing_key, epoch=epoch, hotkey=hotkey, env_id=env_id, task=task,
+                              task_id=task_id, group_size=size, opened_at_ms=int(started * 1000),
+                              finished_at_ms=int(ended * 1000), receipts=[got.get(n) for n in range(size)])
+        cur.execute('UPDATE tasks SET seal=? WHERE task_id=?', (json.dumps(out), task_id))
+        return out
 
     # ------------------------------------------------------------ worker internal API
     def _worker_task(self, cur, worker_id: str, task_id: str):
@@ -440,19 +463,22 @@ class Store:
         return n == 1
 
     def worker_close(self, worker_id: str, session_id: str, outcome: str, reward: float | None,
-                     now: float | None = None) -> None:
+                     now: float | None = None, receipt_sha256: str | None = None) -> None:
+        """receipt_sha256: receipt.receipt_digest of the receipt the worker issued; the group seal lists it."""
         now = time.time() if now is None else now
         if outcome not in SESSION_OUTCOMES:
             raise QuotaError('bad_outcome', status=400)
+        if receipt_sha256 is not None and (len(receipt_sha256) != 64 or not set(receipt_sha256) <= _HEX):
+            raise QuotaError('bad_receipt_sha256', status=400)
         with self._tx() as cur:
             row = cur.execute('SELECT s.task_id FROM sessions s JOIN tasks t ON t.task_id = s.task_id '
                               "WHERE s.id=? AND t.worker_id=?", (session_id, worker_id)).fetchone()
             if not row:
                 raise QuotaError('unknown_session', status=404)
             task_id = row[0]
-            cur.execute("UPDATE sessions SET state='closed', outcome=?, reward=?, last_seen=? "
+            cur.execute("UPDATE sessions SET state='closed', outcome=?, reward=?, last_seen=?, receipt_sha256=? "
                         "WHERE id=? AND state IN ('active', 'expired') AND outcome IS NULL",
-                        (outcome, reward, now, session_id))
+                        (outcome, reward, now, receipt_sha256, session_id))
             cur.execute('UPDATE tasks SET last_seen=? WHERE task_id=?', (now, task_id))
             if outcome == 'infra_error' and self.limits.infra_error_policy == 'void':
                 self._end_task(cur, task_id, 'void', 'infra_error', now)

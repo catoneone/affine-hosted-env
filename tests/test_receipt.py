@@ -181,10 +181,22 @@ def _group(wk, outcomes, patch=b'diff --git a/calc.py b/calc.py\n'):
         rolls.append({'nonce': n, 'segments': [{'src': s, 'ids': i} for s, i in segs],
                       'receipt': _sign(wk, segs, o, rw, nonce=n, ctx=ctx),
                       'model_patch': base64.b64encode(patch).decode()})
-    return {'version': GROUP_ATTACHMENT_VERSION, 'env_id': ID['env_id'], 'task': ID['task'], 'rollouts': rolls}
+    return {'version': GROUP_ATTACHMENT_VERSION, 'env_id': ID['env_id'], 'task': ID['task'], 'rollouts': rolls,
+            'seal': _seal([r['receipt'] for r in rolls])}
 
 
-GID = dict(epoch=ID['epoch'], hotkey=ID['hotkey'], env_id=ID['env_id'], task=ID['task'])
+GW = SigningKey.generate()                                  # the gateway's key: signs group seals
+
+
+def _seal(receipts, **kw):
+    from hosted_env.receipt import receipt_digest, sign_group_seal
+    args = dict(epoch=ID['epoch'], hotkey=ID['hotkey'], env_id=ID['env_id'], task=ID['task'], task_id='tk-1',
+                group_size=len(receipts), opened_at_ms=1_800_000_000_000, finished_at_ms=1_800_000_200_000,
+                receipts=[receipt_digest(r) for r in receipts])
+    return sign_group_seal(GW, **{**args, **kw})
+
+
+GID = dict(epoch=ID['epoch'], hotkey=ID['hotkey'], env_id=ID['env_id'], task=ID['task'], gateway_key=GW.verify_key)
 
 
 def test_group_ok_and_gate():
@@ -211,6 +223,10 @@ def test_group_incomplete_or_swapped():
         verify_group(short, keys, **GID)
     swapped = copy.deepcopy(g)                               # swap the nonce labels of two rollouts
     swapped['rollouts'][0]['nonce'], swapped['rollouts'][1]['nonce'] = 1, 0
+    with pytest.raises(ReceiptError, match='seal_mismatch'):
+        verify_group(swapped, keys, **GID)
+    # even with a seal over the swapped receipts, each receipt still names its own nonce
+    swapped['seal'] = _seal([r['receipt'] for r in sorted(swapped['rollouts'], key=lambda r: r['nonce'])])
     with pytest.raises(ReceiptError, match='identity_mismatch'):
         verify_group(swapped, keys, **GID)
     with pytest.raises(ReceiptError, match='identity_mismatch'):
@@ -239,3 +255,26 @@ def test_group_carries_the_graded_patch():
             verify_group(broken, keys, **GID)
     with pytest.raises(ReceiptError, match='bad_attachment_version'):
         verify_group(dict(g, version='hosted-env-group-v1'), keys, **GID)
+
+
+def test_group_seal_binds_the_receipts_and_the_gateway():
+    """Receipts from another run of the same task and nonce (each validly signed by the worker) cannot be
+    swapped in, and the seal must come from the gateway and name this group."""
+    wk = SigningKey.generate()
+    keys = {'w1': wk.verify_key}
+    outcomes = [('completed', 1.0), ('completed', 0.0)] + [('unresolved', 0.0)] * 6
+    g, other_run = _group(wk, outcomes), _group(wk, [('completed', 1.0)] * 8)
+    v = verify_group(g, keys, **GID)
+    assert v['seal']['finished_at_ms'] - v['seal']['opened_at_ms'] == 200_000 and v['seal']['task_id'] == 'tk-1'
+    mixed = copy.deepcopy(g)                                 # a better rollout from another run, same nonce
+    mixed['rollouts'][1] = other_run['rollouts'][1]
+    with pytest.raises(ReceiptError, match='seal_mismatch'):
+        verify_group(mixed, keys, **GID)
+    receipts = [r['receipt'] for r in g['rollouts']]
+    for seal, code in ((None, 'malformed_seal'), (dict(g['seal'], sig=other_run['seal']['sig']), 'bad_seal_signature'),
+                       (_seal(receipts, hotkey='5Hotkey1'), 'seal_identity_mismatch'),
+                       (_seal(receipts, opened_at_ms=1_900_000_000_000), 'malformed_seal')):
+        with pytest.raises(ReceiptError, match=code):
+            verify_group(dict(g, seal=seal), keys, **GID)
+    with pytest.raises(ReceiptError, match='bad_seal_signature'):    # signed by a worker key, not the gateway's
+        verify_group(g, keys, **{**GID, 'gateway_key': wk.verify_key})
