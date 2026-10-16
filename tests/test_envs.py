@@ -421,3 +421,57 @@ def test_model_cannot_block_the_test_patch(tmp_path, shape):
     test_command and its scripts have fixed, known names (every mimo task runs `bash mimo_test_command.sh`)."""
     g, _ = graded(tmp_path, shape, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')
     assert g['reward'] == 1.0
+
+
+def _rich_task(tmp_path):
+    """A base with existing tests and a `fixtures` file, and a test patch that modifies, renames and deletes
+    test files and turns `fixtures` into a directory."""
+    import json
+
+    from conftest import _run
+    tpl = tmp_path / 'tpl'
+    (tpl / 'tests').mkdir(parents=True)
+    (tpl / 'calc.py').write_text('def add(a, b):\n    return a - b\n')
+    (tpl / 'fixtures').write_text('x = 1\n')
+    (tpl / 'tests' / 'helper.py').write_text('OLD = 1\n')
+    (tpl / 'tests' / 'obsolete.py').write_text('assert True\n')
+    (tpl / 'tests' / 'test_old.py').write_text('print(0)\n')
+    _run('git init -q -b master && git add -A && git commit -qm base', tpl)
+    tp = tmp_path / 'tp'
+    shutil.copytree(tpl, tp, symlinks=True)
+    _run('git rm -q fixtures tests/obsolete.py && git mv tests/helper.py tests/helpers.py', tp)
+    (tp / 'fixtures').mkdir()
+    (tp / 'fixtures' / 'data.txt').write_text('5\n')
+    (tp / 'tests' / 'test_old.py').write_text(
+        'import sys\nsys.path[:0] = [".", "tests"]\nfrom calc import add\nfrom helpers import OLD\n'
+        'assert add(2, 3) == int(open("fixtures/data.txt").read()) and OLD == 1\nprint("ok")\n')
+    (tp / 'mimo_test_command.sh').write_text('cd "$(dirname "$0")" && python3 tests/test_old.py\n')
+    test_patch = _run('git add -A && git diff --cached --no-color -M', tp).stdout
+    assert 'rename from tests/helper.py' in test_patch and 'deleted file mode' in test_patch
+    path = tmp_path / 'tasks.jsonl'
+    path.write_text(json.dumps({'id': 'rich', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'python',
+                                'problem_statement': 'add() subtracts', 'test_patch': test_patch,
+                                'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root'}), 'rich'
+
+
+@pytest.mark.parametrize('shape', [
+    '',                                                                     # honest: file -> dir in the test patch
+    'rm -rf tests && ln -s {canary} tests',                                 # tests/ points outside the repo
+    'rm fixtures && mkdir fixtures && printf "0\\n" > fixtures/data.txt',  # pre-empts the file -> dir change
+    'mkdir -p tests/helpers.py && printf "x\\n" > tests/helpers.py/x',     # a dir at the rename target
+])
+def test_test_patch_that_modifies_renames_deletes_and_retypes(tmp_path, shape):
+    canary = tmp_path / 'canary'
+    canary.mkdir()
+    (canary / 'keep').write_text('keep\n')
+    env, task = _rich_task(tmp_path)
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    for c in (shape.format(canary=canary), 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'):
+        if c:
+            assert s.sb.execute(c)['returncode'] == 0, c
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert g['reward'] == 1.0, g.get('test_output') or g.get('grade_detail')
+    assert sorted(os.listdir(canary)) == ['keep']                           # nothing outside the repo touched

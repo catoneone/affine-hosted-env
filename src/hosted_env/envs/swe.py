@@ -288,7 +288,7 @@ class SweEnv(DockerTaskEnv):
         if not paths:
             return
         self._put_bytes(sb, b'\0'.join(paths) + b'\0', RESET_LIST_REMOTE)
-        r = sb.execute(f'while IFS= read -r -d "" f; do\n'
+        r = sb.execute(f'export GIT_LITERAL_PATHSPECS=1; while IFS= read -r -d "" f; do\n'
                        f'  if git cat-file -e {start}:"$f" 2>/dev/null; then git checkout {start} -- "$f" || exit 1\n'
                        '  else git rm -rf -q --cached --ignore-unmatch -- "$f" >/dev/null && rm -rf -- "$f"; fi\n'
                        f'done < {RESET_LIST_REMOTE}; rm -f {RESET_LIST_REMOTE}', cwd=repo, timeout=300, login=False)
@@ -300,11 +300,14 @@ class SweEnv(DockerTaskEnv):
         the base does not have it, whatever the model left there. That includes a directory at a file's path
         (mimo_test_command.sh/x) and a leading component turned into a file or a symlink (tests -> elsewhere):
         the first such component is removed, then the path itself (rm -rf), so the trusted test patch always
-        applies and the model cannot turn its own rollout into an infra error."""
+        applies and the model cannot turn its own rollout into an infra error. Two passes: everything is cleared
+        before anything is restored, so restoring `fixtures` (a file the test patch replaces with a directory)
+        is not undone by clearing `fixtures/data.txt`. Literal pathspecs: a name is never git pathspec magic."""
         if not paths:
             return
         self._put_bytes(sb, b''.join(p + b'\0' for p in paths), RESET_LIST_REMOTE)
-        r = sb.execute(f'''while IFS= read -r -d "" f; do
+        r = sb.execute(f'''export GIT_LITERAL_PATHSPECS=1
+while IFS= read -r -d "" f; do
   case "/$f/" in //*|*/../*) echo "unsafe test path: $f"; exit 4;; esac
   a=; rest=$f
   while :; do                                   # top-down: stop at the first component that is not a real dir
@@ -314,6 +317,8 @@ class SweEnv(DockerTaskEnv):
     if [ -L "$a" ] || {{ [ -e "$a" ] && [ ! -d "$a" ]; }}; then rm -f -- "$a" || exit 1; break; fi
   done
   rm -rf -- "$f" || exit 1
+done < {RESET_LIST_REMOTE}
+while IFS= read -r -d "" f; do
   if git cat-file -e {base}:"$f" 2>/dev/null; then git checkout -q {base} -- "$f" || exit 1
   else git rm -rf -q --cached --ignore-unmatch -- "$f" >/dev/null || exit 1; fi
 done < {RESET_LIST_REMOTE}; rm -f {RESET_LIST_REMOTE}''', cwd=repo, timeout=300, login=False)
@@ -419,6 +424,8 @@ fi
                 test_paths = self._patch_paths(sb, repo, TEST_PATCH_REMOTE)
             if base:
                 self._reset_test_paths(sb, repo, base, test_paths)
+            if grader == 'nobody':                          # lock what the patch leaves behind, not what it deletes
+                test_paths = self._patch_paths(sb, repo, TEST_PATCH_REMOTE)
             ap = sb.execute(f'git apply --verbose {TEST_PATCH_REMOTE}', cwd=repo, timeout=300, login=False)
             sb.execute(f'rm -f {TEST_PATCH_REMOTE}', timeout=60, login=False)
             if ap['returncode'] != 0:
