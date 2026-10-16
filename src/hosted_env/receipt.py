@@ -204,7 +204,8 @@ def verify_group_seal(seal: Mapping, gateway_key: VerifyKey, *, epoch: str, hotk
         raise ReceiptError('seal_identity_mismatch')
     opened, finished, receipts = claims.get('opened_at_ms'), claims.get('finished_at_ms'), claims.get('receipts')
     if (type(opened) is not int or type(finished) is not int or opened > finished or type(claims.get('task_id'))
-            is not str or not isinstance(receipts, list) or len(receipts) != group_size):
+            is not str or not isinstance(receipts, list) or len(receipts) != group_size
+            or any(r is not None and type(r) is not str for r in receipts)):
         raise ReceiptError('malformed_seal')
     return claims
 

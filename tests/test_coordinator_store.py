@@ -323,6 +323,11 @@ def test_finish_returns_a_gateway_signed_seal(tmp_path):
     assert (c['opened_at_ms'], c['finished_at_ms'], c['task_id']) == (int(NOW * 1000), int((NOW + 9.5) * 1000),
                                                                       t['task_id'])
     assert st.finish_task(EPOCH, '5H0', t['task_id'], now=NOW + 99) == seal
+    st.envs['env'].group_size = 3                  # a config change after the task was opened does not resize it
+    t2 = st.open_task(EPOCH, '5H1', 'env', now=NOW)
+    st.envs['env'].group_size = 8
+    assert len(verify_group_seal(st.finish_task(EPOCH, '5H1', t2['task_id'], now=NOW + 1), key.verify_key,
+                                 epoch=EPOCH, hotkey='5H1', env_id='env', task=t2['task'], group_size=3)['receipts']) == 3
     for kw, code in (({'hotkey': '5H1'}, 'seal_identity_mismatch'), ({'group_size': 3}, 'seal_identity_mismatch')):
         with pytest.raises(ReceiptError, match=code):
             verify_group_seal(seal, key.verify_key, **{**dict(epoch=EPOCH, hotkey='5H0', env_id='env',
@@ -334,3 +339,22 @@ def test_finish_returns_a_gateway_signed_seal(tmp_path):
     vs = st.open_sessions(EPOCH, '5H0', v['task_id'], [0], now=NOW)
     st.worker_close('w1', vs[0]['session_id'], 'infra_error', 0.0, now=NOW)
     assert st.finish_task(EPOCH, '5H0', v['task_id'], now=NOW) is None
+
+
+def test_reqids_are_scoped_and_legacy_ones_still_count(tmp_path):
+    """Per signer scope; an id recorded before scopes existed (an upgraded database) blocks every scope until it
+    ages out, so a request signed just before the upgrade cannot be replayed after it."""
+    import sqlite3
+
+    from hosted_env.auth import REQID_TTL
+    old = sqlite3.connect(tmp_path / 'g.db')                  # a database from before per-signer scopes
+    old.execute('CREATE TABLE reqids (reqid TEXT PRIMARY KEY, seen_at REAL NOT NULL)')
+    old.execute('INSERT INTO reqids VALUES (?, ?)', ('legacy' * 4, NOW))
+    old.commit()
+    old.close()
+    st, _ = make_store(tmp_path)
+    assert st.remember_reqid('miner|5H0', 'a' * 32, NOW) and st.remember_reqid('miner|5H1', 'a' * 32, NOW)
+    assert not st.remember_reqid('miner|5H0', 'a' * 32, NOW + 1)
+    assert not st.remember_reqid('miner|5H0', 'legacy' * 4, NOW + 1)
+    assert st.remember_reqid('miner|5H0', 'legacy' * 4, NOW + REQID_TTL + 1)    # aged out
+    assert st.remember_reqid('miner|5H0', 'a' * 32, NOW + REQID_TTL + 2)

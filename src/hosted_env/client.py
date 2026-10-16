@@ -198,7 +198,8 @@ def run_task(gateway: GatewayClient, epoch: str, env_id: str, sampler: Sampler, 
         except ApiError as e:
             if e.status not in (404, 409, 410):        # an already ended (voided) task cannot be finished again
                 raise
-    voided = any(x['outcome'] in ('voided', 'infra_error') for x in results)
+    # no seal (the gateway voided the task, or finish was refused): the group could never verify, nothing to upload
+    voided = seal is None or any(x['outcome'] in ('voided', 'infra_error') for x in results)
     attachment = None if voided else {
         'version': GROUP_ATTACHMENT_VERSION, 'env_id': t['env_id'], 'task': t['task'], 'seal': seal,
         'rollouts': [{'nonce': x['nonce'], 'segments': x['segments'], 'receipt': x['receipt'],
