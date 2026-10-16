@@ -133,6 +133,7 @@ def future_commits(sb, repo: str, base: str) -> list[str]:
 TEST_PATCH_REMOTE = '/tmp/_hosted_env_test.patch'
 MODEL_PATCH_REMOTE = '/tmp/_hosted_env_model.patch'
 RESET_LIST_REMOTE = '/tmp/_hosted_env_reset.list'
+TREE_INDEX_REMOTE = '/tmp/_hosted_env_tree.index'
 MAX_MODEL_PATCH_BYTES = 2_000_000
 GRADER_VERSION = 'isolated-v1'
 
@@ -193,6 +194,19 @@ class SweEnv(DockerTaskEnv):
             anti_hack_cleanup(sb, repo, lang)
         return base
 
+    def _tree(self, sb, repo: str, base: str) -> str:
+        """Content hash of the working tree as git sees it: the base commit's tracked files plus every non-ignored
+        file, read through a throwaway index so neither HEAD nor the real index changes (the model's view stays
+        exactly as before). Identical trees give identical hashes, which is how the grading container proves it
+        starts where the rollout started even when an image's working tree differs from its own HEAD."""
+        r = sb.execute(f'export GIT_INDEX_FILE={TREE_INDEX_REMOTE}; rm -f "$GIT_INDEX_FILE"; '
+                       f'git read-tree {base} && git add -A >/dev/null 2>&1 && git write-tree; '
+                       'rc=$?; rm -f "$GIT_INDEX_FILE"; exit $rc', cwd=repo, timeout=600, login=False)
+        tree = r['output'].strip().split()[-1] if r['output'].strip() else ''
+        if r['returncode'] != 0 or len(tree) != 40:
+            raise SetupError(f'cannot snapshot the working tree: {r["output"][-300:]}')
+        return tree
+
     def setup(self, s: EnvSession) -> None:
         sb, repo = s.sb, s.spec['cwd']
         base = self._prepare_repo(sb, repo, s.spec.get('lang', ''))
@@ -204,16 +218,22 @@ class SweEnv(DockerTaskEnv):
             stripped = True
             if future_commits(sb, repo, base):
                 raise SetupError('future commits still visible after git strip')
-        s.state.update(base=base, git_stripped=stripped)
+        s.state.update(base=base, git_stripped=stripped, start_tree=self._tree(sb, repo, base))
 
     def capture_patch(self, s: EnvSession) -> tuple[bytes, str]:
-        """(patch bytes, problem) from the rollout container: every tracked and untracked change against the base
-        as a binary-safe git patch. It travels base64-encoded (no UTF-8 decoding, no stderr mixed in), with no
-        login shell and with external diff drivers and textconv filters off."""
-        r = s.sb.execute('set -o pipefail; git add -A >/dev/null 2>&1; git -c core.fileMode=false diff --cached '
-                         '--binary --no-color --no-ext-diff --no-textconv HEAD 2>/dev/null '
+        """(patch bytes, problem) from the rollout container: the model's changes as a binary-safe git patch from
+        the tree it started with to the tree it left (tracked and non-ignored files). It travels base64-encoded (no
+        UTF-8 decoding, no stderr mixed in), with no login shell and with external diff drivers and textconv
+        filters off."""
+        repo = s.spec['cwd']
+        try:
+            end_tree = self._tree(s.sb, repo, s.state['base'])
+        except SetupError:
+            return b'', 'model_patch_capture_failed'      # e.g. the model deleted .git
+        r = s.sb.execute(f'set -o pipefail; git diff --binary --no-color --no-ext-diff --no-textconv '
+                         f'{s.state["start_tree"]} {end_tree} 2>/dev/null '
                          f'| head -c {MAX_MODEL_PATCH_BYTES + 1} | base64 | tr -d "\\n"',
-                         cwd=s.spec['cwd'], timeout=300, login=False)
+                         cwd=repo, timeout=300, login=False)
         try:
             data = base64.b64decode(r['output'].strip(), validate=True)
         except ValueError:
@@ -249,13 +269,14 @@ class SweEnv(DockerTaskEnv):
             i += 1
         return out
 
-    def _reset_paths(self, sb, repo: str, base: str, paths: list[bytes]) -> None:
-        """Put each path back to `base`, or delete it when base does not have it (NUL-separated, so any name)."""
+    def _reset_paths(self, sb, repo: str, start: str, paths: list[bytes]) -> None:
+        """Put each path back to the start tree, or delete it when the start tree does not have it (NUL-separated,
+        so any name)."""
         if not paths:
             return
         self._put_bytes(sb, b'\0'.join(paths) + b'\0', RESET_LIST_REMOTE)
         r = sb.execute(f'while IFS= read -r -d "" f; do\n'
-                       f'  if git cat-file -e {base}:"$f" 2>/dev/null; then git checkout {base} -- "$f" || exit 1\n'
+                       f'  if git cat-file -e {start}:"$f" 2>/dev/null; then git checkout {start} -- "$f" || exit 1\n'
                        '  else git rm -rf -q --cached --ignore-unmatch -- "$f" >/dev/null && rm -rf -- "$f"; fi\n'
                        f'done < {RESET_LIST_REMOTE}; rm -f {RESET_LIST_REMOTE}', cwd=repo, timeout=300, login=False)
         if r['returncode'] != 0:
@@ -274,6 +295,10 @@ class SweEnv(DockerTaskEnv):
         try:
             sb.start()
             base = self._prepare_repo(sb, repo, s.spec.get('lang', ''))
+            start = self._tree(sb, repo, base)
+            if start != s.state['start_tree']:
+                raise GradeError(f'grading container starts from tree {start[:12]}, the rollout started from '
+                                 f'{s.state["start_tree"][:12]} (non-deterministic image or setup)')
             reverted = []
             if patch:
                 self._put_bytes(sb, patch, MODEL_PATCH_REMOTE)
@@ -281,11 +306,11 @@ class SweEnv(DockerTaskEnv):
                 ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
                                 timeout=300, login=False)
                 sb.execute(f'rm -f {MODEL_PATCH_REMOTE}', timeout=60, login=False)
-                if ap['returncode'] != 0:
-                    raise GradeError('apply_model_patch_failed: ' + ap['output'][-500:])
+                if ap['returncode'] != 0:                   # same start tree, so only the patch can be at fault
+                    return {**res, 'grade_detail': 'model_patch_does_not_apply: ' + ap['output'][-300:]}
                 prot = protected_paths([p.decode('utf-8', 'surrogateescape') for p in touched])
                 reverted = sorted(set(prot))
-                self._reset_paths(sb, repo, base, [p.encode('utf-8', 'surrogateescape') for p in reverted])
+                self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])
             reset_cmd = reset_test_files_cmd(gi['test_patch'], base)
             if reset_cmd and sb.execute(reset_cmd, cwd=repo, timeout=300, login=False)['returncode'] != 0:
                 raise GradeError('reset_tests_failed')

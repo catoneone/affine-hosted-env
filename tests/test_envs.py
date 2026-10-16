@@ -94,13 +94,16 @@ def test_setup_strips_and_grades(tmp_path):
     s.close()
 
 
-def graded(tmp_path, *cmds, in_place_check=False):
+def graded(tmp_path, *cmds, in_place_check=False, image_prep=None):
     """One rollout: the model runs `cmds` in its container, then the isolated grader runs. With in_place_check,
     also run the hidden tests inside the model's own container first (what the old grader did) and return that
-    exit code too."""
+    exit code too. image_prep runs once in the image template (to build images with unusual states)."""
     tmp_path = tmp_path / f'g{len(list(tmp_path.iterdir()))}'          # each call builds its own task
     tmp_path.mkdir()
     env, task = make_task(tmp_path)
+    if image_prep:
+        import subprocess
+        subprocess.run(['bash', '-c', image_prep], cwd=env.public_spec(task)['image'], check=True)
     s = open_local(env, task, tmp_path)
     s.setup()
     for c in cmds:
@@ -139,7 +142,8 @@ def test_sitecustomize_exploit_works_in_place_but_not_isolated(tmp_path):
     assert in_place == 0                                               # the old in-container grading is fooled
     assert g['reward'] == 0.0 and g['reverted_paths'] == ['sitecustomize.py']
     g, _ = graded(tmp_path, hack, 'git add -f sitecustomize.py && printf "sitecustomize.py\\n" > .gitignore')
-    assert g['reward'] == 0.0 and 'sitecustomize.py' in g['reverted_paths']   # force-added and ignored: still reset
+    assert g['reward'] == 0.0
+    assert 'diff --git a/sitecustomize.py' not in g['model_patch']    # force-added but ignored: never carried over
 
 
 def test_home_profile_and_path_shims_never_reach_the_grader(tmp_path):
@@ -175,6 +179,29 @@ def test_protected_paths_rules():
                             'src/setupTests.ts', 'go.mod']) == [
         'src/conftest.py', 'lib/util_test.go', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
         'src/setupTests.ts', 'go.mod']
+
+
+def test_image_whose_tree_differs_from_its_head(tmp_path):
+    """Real images (e.g. 001488) ship a working tree that differs from their own HEAD: deleted tracked files,
+    edits, extra files. That state is the task, not the model's work: a no-op rollout yields an empty patch, and
+    a fix on top of it carries over exactly."""
+    dirty = ('git rm -q --cached calc.py >/dev/null; printf "def add(a, b):\\n    return a - b\\n" > calc.py; '
+             'printf "keep\\n" > notes.txt; printf "x\\n" > gone.txt && git add gone.txt && '
+             'git -c user.email=t@t -c user.name=t commit -qm gone && rm gone.txt')
+    g, _ = graded(tmp_path, image_prep=dirty)
+    assert (g['reward'], g['model_patch'], g.get('grade_detail')) == (0.0, '', None)
+    g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak', image_prep=dirty)
+    assert g['reward'] == 1.0
+
+
+def test_patch_that_cannot_apply_is_the_models_zero(tmp_path, monkeypatch):
+    from hosted_env.envs import swe
+    real = swe.SweEnv.capture_patch
+    monkeypatch.setattr(swe.SweEnv, 'capture_patch',
+                        lambda self, s: (real(self, s)[0] + b'diff --git a/nope b/nope\n--- a/nope\n+++ b/nope\n'
+                                         b'@@ -1 +1 @@\n-x\n+y\n', ''))
+    g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')
+    assert g['reward'] == 0.0 and g['grade_detail'].startswith('model_patch_does_not_apply')
 
 
 def test_public_spec_hides_grading(tmp_path):
