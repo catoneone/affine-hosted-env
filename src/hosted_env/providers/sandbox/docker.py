@@ -83,11 +83,12 @@ class DockerSandbox:
             self.env = dict(ln.split('=', 1) for ln in out.splitlines()
                             if '=' in ln and ln.split('=', 1)[0].isupper())
 
-    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False) -> dict:
+    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
+                login: bool = True) -> dict:
         """Returns {output, returncode, reason}; reason is ok / client_timeout."""
         if not self.cid:
             raise SandboxError('sandbox not started')
-        inner = ['bash', '-lc', command]
+        inner = ['bash', '-lc', command] if login else ['bash', '--noprofile', '--norc', '-c', command]
         if self.has_timeout and not raw:
             inner = ['timeout', '-k', '5', str(int(timeout)), *inner]
         envs = [x for k, v in self.env.items() for x in ('-e', f'{k}={v}')]

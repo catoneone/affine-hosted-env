@@ -230,19 +230,20 @@ class K8sSandbox:
             raise SandboxError(f'sandbox is not offline (interfaces: {ifaces or "unreadable"}); use the '
                                "gvisor-nonet runtime class, or offline_check='off' to rely on NetworkPolicy alone")
 
-    def _argv(self, command: str, cwd: str | None, timeout: int, raw: bool) -> list[str]:
-        inner = ['bash', '-lc', command]
+    def _argv(self, command: str, cwd: str | None, timeout: int, raw: bool, login: bool = True) -> list[str]:
+        inner = ['bash', '-lc', command] if login else ['bash', '--noprofile', '--norc', '-c', command]
         if self.has_timeout and not raw:
             inner = ['timeout', '-k', '5', str(int(timeout)), *inner]
         env = ['env', *(f'{k}={v}' for k, v in self.env.items())] if self.env else []
         # exec has no working-directory option: change directory first, then exec the real command
         return ['sh', '-c', 'cd "$1" || exit 125; shift; exec "$@"', 'sh', cwd or self.cwd, *env, *inner]
 
-    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False) -> dict:
+    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
+                login: bool = True) -> dict:
         """Returns {output, returncode, reason}; reason is ok / client_timeout."""
         if not self.started:
             raise SandboxError('sandbox not started')
-        out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw), timeout + 30)
+        out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw, login), timeout + 30)
         if self.has_timeout and not raw and rc == 124:
             timed_out = True
         return {'output': out[:OUTPUT_CAP_BYTES].decode('utf-8', 'replace'), 'returncode': rc,

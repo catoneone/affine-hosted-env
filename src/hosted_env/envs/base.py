@@ -118,8 +118,10 @@ SandboxFactory = Callable[[str, str], object]   # (image, cwd) -> sandbox
 class EnvSession:
     """Environment state of one rollout on the worker."""
 
-    def __init__(self, env: 'DockerTaskEnv', spec: dict, sandbox):
+    def __init__(self, env: 'DockerTaskEnv', spec: dict, sandbox, factory: SandboxFactory | None = None):
         self.env, self.spec, self.sb = env, spec, sandbox
+        self.factory = factory            # makes the fresh grading sandbox (same image, same node)
+        self.grader_sb = None
         self.tools = [BASH_TOOL]
         self.state: dict = {}
 
@@ -139,7 +141,9 @@ class EnvSession:
         return self.env.grade(self, grade_inputs)
 
     def close(self) -> None:
-        self.sb.cleanup()
+        for sb in (self.sb, self.grader_sb):
+            if sb is not None:
+                sb.cleanup()
 
 
 class DockerTaskEnv:
@@ -190,7 +194,7 @@ class DockerTaskEnv:
 
     # ------------------------------------------------ worker side
     def open(self, spec: dict, sandbox_factory: SandboxFactory) -> EnvSession:
-        return EnvSession(self, spec, sandbox_factory(spec['image'], spec['cwd']))
+        return EnvSession(self, spec, sandbox_factory(spec['image'], spec['cwd']), sandbox_factory)
 
     def initial_messages(self, spec: dict) -> list[dict]:
         system = self.cfg.get('system_template', SYSTEM_TEMPLATE)

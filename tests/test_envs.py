@@ -1,13 +1,14 @@
 """toolcall.py, envs/: ported from EXP-014 test_harness.py. No docker needed: LocalSandbox runs in a temp
 directory on the host."""
 import os
+import shutil
 
 import pytest
 from conftest import make_swe_tasks
 
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, truncate_middle
-from hosted_env.envs.swe import future_commits, patch_touched_files, reset_test_files_cmd
+from hosted_env.envs.swe import future_commits, patch_touched_files, protected_paths, reset_test_files_cmd
 from hosted_env.providers.sandbox import LocalSandbox
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
 
@@ -87,17 +88,93 @@ def test_setup_strips_and_grades(tmp_path):
     env.setup(s)
     assert s.state['git_stripped'] and future_commits(s.sb, '/testbed', s.state['base']) == []
     assert 'a + b' not in s.sb.execute('git log --all -p')['output']   # the fix commit is physically deleted
-    gi = env.grade_inputs(task)
-    assert s.grade(gi)['reward'] == 0.0                                # base state grades 0
-    s.sb.execute('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')
-    g = s.grade(gi)
-    assert g['reward'] == 1.0 and 'a + b' in g['model_patch']
-    assert not os.path.exists(os.path.join(s.sb.root, 'tests', 'test_calc.py'))   # test files restored after grading
-    s.sb.execute(f'git checkout -q {s.state["base"]} -- calc.py; printf "exit 0\\n" > mimo_test_command.sh')
-    assert s.grade(gi)['reward'] == 0.0                                # an always-pass grading script planted by the model is removed by the reset
-    root = s.sb.root
+    rollout_root = s.sb.root
+    assert s.grade(env.grade_inputs(task))['reward'] == 0.0           # base state grades 0
+    assert not os.path.exists(rollout_root) and not os.path.exists(s.grader_sb.root)   # both containers gone
     s.close()
-    assert not os.path.exists(root)
+
+
+def graded(tmp_path, *cmds, in_place_check=False):
+    """One rollout: the model runs `cmds` in its container, then the isolated grader runs. With in_place_check,
+    also run the hidden tests inside the model's own container first (what the old grader did) and return that
+    exit code too."""
+    tmp_path = tmp_path / f'g{len(list(tmp_path.iterdir()))}'          # each call builds its own task
+    tmp_path.mkdir()
+    env, task = make_task(tmp_path)
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    for c in cmds:
+        assert s.sb.execute(c)['returncode'] == 0, c
+    gi = env.grade_inputs(task)
+    in_place = None
+    if in_place_check:
+        probe = open_local(env, task, tmp_path)                        # a copy of the model's container state
+        shutil.rmtree(probe.sb.root)
+        shutil.copytree(s.sb.root, probe.sb.root, symlinks=True)
+        os.makedirs(probe.sb.env['HOME'], exist_ok=True)
+        probe.sb.copy_text_to(gi['test_patch'], '/tmp/tp.patch')
+        assert probe.sb.execute('git apply /tmp/tp.patch')['returncode'] == 0
+        in_place = probe.sb.execute(gi['test_command'])['returncode']
+        probe.close()
+    g = s.grade(gi)
+    s.close()
+    return g, in_place
+
+
+def test_honest_fix_scores_and_is_kept(tmp_path):
+    g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
+                  'printf "notes\\n" > NOTES.md', 'mkdir -p pkg && printf "x = 1\\n" > pkg/helper.py')
+    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v1' and g['reverted_paths'] == []
+    assert 'a + b' in g['model_patch'] and 'pkg/helper.py' in g['model_patch']
+
+
+def test_planted_grading_script_is_reset(tmp_path):
+    g, _ = graded(tmp_path, 'printf "exit 0\\n" > mimo_test_command.sh')
+    assert g['reward'] == 0.0
+
+
+def test_sitecustomize_exploit_works_in_place_but_not_isolated(tmp_path):
+    hack = 'printf "import os\\nos._exit(0)\\n" > sitecustomize.py'    # python imports it from PYTHONPATH at start-up
+    g, in_place = graded(tmp_path, hack, in_place_check=True)
+    assert in_place == 0                                               # the old in-container grading is fooled
+    assert g['reward'] == 0.0 and g['reverted_paths'] == ['sitecustomize.py']
+    g, _ = graded(tmp_path, hack, 'git add -f sitecustomize.py && printf "sitecustomize.py\\n" > .gitignore')
+    assert g['reward'] == 0.0 and 'sitecustomize.py' in g['reverted_paths']   # force-added and ignored: still reset
+
+
+def test_home_profile_and_path_shims_never_reach_the_grader(tmp_path):
+    shim = ('mkdir -p "$HOME/bin" && printf "#!/bin/sh\\nexit 0\\n" > "$HOME/bin/python3" && '
+            'chmod +x "$HOME/bin/python3" && printf "export PATH=$HOME/bin:$PATH\\n" | tee "$HOME/.profile" '
+            '"$HOME/.bashrc" > /dev/null && printf "python3() { return 0; }\\n" >> "$HOME/.bashrc"')
+    g, _ = graded(tmp_path, shim)
+    assert g['reward'] == 0.0 and g['model_patch'] == ''               # outside the repo: not part of the patch
+
+
+def test_protected_test_infrastructure_is_reset_whatever_its_name(tmp_path):
+    files = ['conftest.py', 'pytest.ini', 'sub dir/conftest.py', 'pkg/zz_test.go', 'web/__mocks__/m.js',
+             'web/a.spec.ts', 'package.json', 'Makefile', 'tests/test_extra.py', 'x.pth']
+    cmds = [f'mkdir -p "$(dirname "{f}")" && printf "exit 0\\n" > "{f}"' for f in files]
+    g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak', *cmds)
+    assert g['reward'] == 1.0                                          # the fix itself is kept
+    assert sorted(g['reverted_paths']) == sorted(files)
+
+
+def test_patch_problems_are_the_models_own_zero(tmp_path):
+    g, _ = graded(tmp_path, 'head -c 2500000 /dev/urandom | base64 > big.txt')
+    assert (g['reward'], g['grade_detail'], g['model_patch']) == (0.0, 'model_patch_too_large', '')
+    g, _ = graded(tmp_path, 'rm -rf .git')
+    assert (g['reward'], g['grade_detail']) == (0.0, 'model_patch_capture_failed')
+    g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
+                  'head -c 3000 /dev/urandom > blob.bin')
+    assert g['reward'] == 1.0 and 'GIT binary patch' in g['model_patch']   # binary files carry over
+
+
+def test_protected_paths_rules():
+    assert protected_paths(['src/app.py', 'src/conftest.py', 'lib/util.go', 'lib/util_test.go', 'README.md',
+                            'tests/helpers.py', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
+                            'src/setupTests.ts', 'go.mod']) == [
+        'src/conftest.py', 'lib/util_test.go', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
+        'src/setupTests.ts', 'go.mod']
 
 
 def test_public_spec_hides_grading(tmp_path):
@@ -138,7 +215,7 @@ def test_local_sandbox_map_root_under_tmp(tmp_path):
     sb = LocalSandbox('', '/w', base_dir=str(base))
     real_root = sb.root
     sb.root = '/tmp/pytest-0/hosted-env-local-abc'          # what tempfile returns on a Linux runner
-    home = sb.root + '/.home/'
+    home = sb.root + '-home/'
     assert sb._map('/w/a.py') == sb.root + '/a.py'
     assert sb._map('cat /tmp/x && cd /w') == f'cat {home}x && cd {sb.root}'
     assert sb._map('"/tmp/y" :/tmp/z') == f'"{home}y" :{home}z'

@@ -19,7 +19,7 @@ class LocalSandbox:
     def __init__(self, image: str, cwd: str, *, base_dir: str | None = None):
         self.image, self.cwd = image, cwd
         self.root = tempfile.mkdtemp(prefix='hosted-env-local-', dir=base_dir)
-        home = os.path.join(self.root, '.home')
+        home = self.root + '-home'          # next to the repo, never inside it (git add -A would pick it up)
         self.env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': home, 'GIT_CONFIG_NOSYSTEM': '1',
                     'GIT_CEILING_DIRECTORIES': os.path.dirname(self.root), 'PYTHONDONTWRITEBYTECODE': '1',
                     'LANG': 'C.UTF-8'}
@@ -27,7 +27,7 @@ class LocalSandbox:
     def _map(self, s: str) -> str:
         # One pass, so the replacement text (which may itself live under /tmp, e.g. on Linux CI) is never
         # re-mapped; /tmp/ only matches at the start of a path, not inside one like /var/tmp/ or /x/tmp/.
-        home = os.path.join(self.root, '.home') + '/'
+        home = self.root + '-home/'
         pat = re.compile(f'{re.escape(self.cwd)}|(?<![\\w./-])/tmp/')
         return pat.sub(lambda m: self.root if m.group(0) == self.cwd else home, s)
 
@@ -36,9 +36,11 @@ class LocalSandbox:
             shutil.copytree(self.image, self.root, symlinks=True, dirs_exist_ok=True)
         os.makedirs(self.env['HOME'], exist_ok=True)
 
-    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False) -> dict:
+    def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
+                login: bool = True) -> dict:
+        shell = ['bash', '-c'] if login else ['bash', '--noprofile', '--norc', '-c']   # never a login shell here
         try:
-            r = subprocess.run(['bash', '-c', self._map(command)], cwd=self._map(cwd) if cwd else self.root,
+            r = subprocess.run([*shell, self._map(command)], cwd=self._map(cwd) if cwd else self.root,
                                env=self.env, capture_output=True, timeout=timeout)
             out, rc, reason = r.stdout + r.stderr, r.returncode, 'ok'
         except subprocess.TimeoutExpired as e:
@@ -51,3 +53,4 @@ class LocalSandbox:
 
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.env['HOME'], ignore_errors=True)
