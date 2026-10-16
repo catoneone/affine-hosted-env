@@ -1,4 +1,5 @@
-"""Command line: hosted-env keygen / gateway / worker / mine / verify. Services listen on 127.0.0.1 only by default."""
+"""Command line: hosted-env keygen / server / gateway / worker / mine / verify / machines. Services listen on
+127.0.0.1 only by default."""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +20,11 @@ SMOKE_REPLIES = [
 
 
 def _serve(app, host: str, port: int):
+    import logging
+
     import uvicorn
+    # uvicorn configures only its own loggers; without this, hosted_env INFO lines (capacity plans) are dropped
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     uvicorn.run(app, host=host, port=port, log_level='info')
 
 
@@ -87,6 +92,62 @@ def cmd_verify(a):
                       'trainable_tokens': [sum(m) for m in v['loss_masks']]}))
 
 
+def _machine_rows(rows: list[dict], now: float) -> list[dict]:
+    """Add hours and an estimated cost (list price x hours since created, or since first seen for machines the
+    planner did not create)."""
+    out = []
+    for r in rows:
+        hours = max(0.0, ((r['ended_at'] or now) - r['created_at']) / 3600)
+        cost = None if r['price_per_hour'] is None else hours * r['price_per_hour']
+        out.append({**r, 'hours': round(hours, 3), 'est_cost_usd': None if cost is None else round(cost, 4)})
+    return out
+
+
+def cmd_machines(a):
+    import time
+    from datetime import UTC, datetime
+
+    from .config import machine_inventory
+    from .coordinator.store import LIVE_MACHINE_STATES
+    rows, report = machine_inventory(a.config, refresh=a.refresh)
+    now = time.time()
+    rows = _machine_rows(rows, now)
+    live = [r for r in rows if r['state'] in LIVE_MACHINE_STATES]
+    shown = rows if a.all else live
+    if a.json:
+        print(json.dumps({'machines': shown, 'refresh': report}))
+        return
+
+    def ts(t):
+        return '-' if t is None else datetime.fromtimestamp(t, UTC).strftime('%m-%d %H:%M')
+
+    head = ('PROVIDER', 'NAME', 'ID', 'ORIGIN', 'STATE', 'KIND', '$/H', 'SINCE(UTC)', 'SEEN(UTC)', 'HOURS', '~COST',
+            'ADDRESS', 'NOTE')
+    table = [head] + [(r['provider'], r['name'], r['machine_id'], r['origin'],
+                       r['state'] + (f"/{r['provider_state']}" if r['provider_state'] not in (None, 'running') else ''),
+                       r['kind'], '-' if r['price_per_hour'] is None else f"{r['price_per_hour']:.3f}",
+                       ts(r['created_at']), ts(r['last_seen']), f"{r['hours']:.2f}",
+                       '-' if r['est_cost_usd'] is None else f"${r['est_cost_usd']:.2f}",
+                       r['public_ipv4'] or r['public_ipv6'] or '-', r['note']) for r in shown]
+    widths = [max(len(str(row[i])) for row in table) for i in range(len(head) - 1)]
+    for row in table:
+        print('  '.join(str(c).ljust(w) for c, w in zip(row, widths, strict=False)) + '  ' + str(row[-1]))
+    by_origin = {}
+    for r in live:
+        by_origin[r['origin']] = by_origin.get(r['origin'], 0) + 1
+    rate = sum(r['price_per_hour'] or 0 for r in live)
+    planner = [r for r in rows if r['origin'] == 'planner']
+    print(f"\nlive: {len(live)} machines ({', '.join(f'{k} {v}' for k, v in sorted(by_origin.items())) or 'none'}), "
+          f'${rate:.3f}/h at list prices')
+    print(f"planner, all time: {len(planner)} machines, {sum(r['hours'] for r in planner):.2f} machine-hours, "
+          f"~${sum(r['est_cost_usd'] or 0 for r in planner):.2f}")
+    if report is not None:
+        print(f"refreshed: {len(report['new'])} new, {len(report['gone'])} gone"
+              + ''.join(f'; {p} list failed: {e}' for p, e in report['errors'].items()))
+    elif rows:
+        print(f"last listed: {ts(max((r['last_seen'] or 0) for r in rows))} UTC (--refresh lists the providers now)")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='hosted-env')
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -121,6 +182,14 @@ def main(argv=None):
     v.add_argument('--hotkey', required=True)
     v.add_argument('--epoch')
     v.set_defaults(fn=cmd_verify)
+    mc = sub.add_parser('machines', help='Machine inventory: every machine the planner created plus unmanaged '
+                                         'hosted-env- machines found at the providers, with hours and est. cost')
+    mc.add_argument('--config', required=True, help='the server or gateway config (its db and [machines])')
+    mc.add_argument('--all', action='store_true', help='include deleted and gone machines (history)')
+    mc.add_argument('--refresh', action='store_true',
+                    help='list the [machines] providers now (read only; nothing is created or deleted)')
+    mc.add_argument('--json', action='store_true')
+    mc.set_defaults(fn=cmd_machines)
     a = p.parse_args(argv)
     a.fn(a)
 

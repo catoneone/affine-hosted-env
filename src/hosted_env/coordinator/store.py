@@ -53,6 +53,7 @@ class Limits:
     token_ttl: int = 4 * 3600
     max_containers: int = 0          # global in-flight container budget B; 0 = limited only by worker capacity
     worker_ttl: int = 90             # a worker with no heartbeat for this long counts as lost
+    node_ttl: int = 120              # a node missing from (or not Ready in) node syncs for this long counts as lost
     demand_window: int = 60          # how long a "waiting" record is kept
     infra_error_policy: str = 'void'  # void: void the task, refund the start quota slot, return it to the pool; keep: record as usual
 
@@ -85,7 +86,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY, epoch TEXT NOT NULL, hotkey TEXT NOT NULL, env_id TEXT NOT NULL, task TEXT NOT NULL,
     worker_id TEXT NOT NULL, slots INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('running', 'done', 'void')),
-    started_at REAL NOT NULL, last_seen REAL NOT NULL, ended_at REAL, end_reason TEXT,
+    started_at REAL NOT NULL, last_seen REAL NOT NULL, ended_at REAL, end_reason TEXT, node TEXT,
     UNIQUE (epoch, hotkey, env_id, task));
 CREATE INDEX IF NOT EXISTS tasks_hotkey ON tasks (epoch, hotkey, state);
 CREATE INDEX IF NOT EXISTS tasks_state ON tasks (state, worker_id);
@@ -102,16 +103,48 @@ CREATE TABLE IF NOT EXISTS pool (
     PRIMARY KEY (epoch, env_id, task));
 CREATE TABLE IF NOT EXISTS demand (epoch TEXT NOT NULL, hotkey TEXT NOT NULL, at REAL NOT NULL,
     PRIMARY KEY (epoch, hotkey));
+CREATE TABLE IF NOT EXISTS nodes (
+    name TEXT PRIMARY KEY, slots INTEGER NOT NULL, images TEXT NOT NULL, last_seen REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS machines (
+    provider TEXT NOT NULL, machine_id TEXT NOT NULL, name TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('planner', 'static', 'unmanaged')),
+    state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'orphaned', 'deleted', 'gone')),
+    provider_state TEXT, kind TEXT NOT NULL DEFAULT '', price_per_hour REAL, slots INTEGER NOT NULL DEFAULT 0,
+    public_ipv4 TEXT, public_ipv6 TEXT, created_at REAL NOT NULL, last_seen REAL, ended_at REAL,
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (provider, machine_id));
+CREATE INDEX IF NOT EXISTS machines_state ON machines (state);
 '''
+
+# Machine inventory states. Live: creating (the planner asked for it, the boot is not done or was interrupted),
+# running (it exists), orphaned (the planner's create failed and the provider could not delete it; the planner
+# retries the delete). Ended: deleted (by the planner, or cleaned up after a failed create), gone (a machine the
+# planner does not own stopped being listed by its provider).
+LIVE_MACHINE_STATES = ('creating', 'running', 'orphaned')
+_MACHINE_COLS = ('provider', 'machine_id', 'name', 'origin', 'state', 'provider_state', 'kind', 'price_per_hour',
+                 'slots', 'public_ipv4', 'public_ipv6', 'created_at', 'last_seen', 'ended_at', 'note')
 
 
 class Store:
     def __init__(self, db_path: str, envs: dict, signing_key: SigningKey, limits: Limits = Limits(),
-                 rng: random.Random | None = None):
-        self.envs, self.signing_key, self.limits = envs, signing_key, limits
+                 rng: random.Random | None = None, placement: str = 'workers'):
+        """placement: 'workers' -- capacity and image caches come from worker heartbeats (one host per worker);
+        'nodes' -- they come from cluster nodes (`sync_nodes`), each task is pinned to one node, and workers only
+        route (architecture v2)."""
+        if placement not in ('workers', 'nodes'):
+            raise ValueError(f'unknown placement {placement!r}')
+        self.envs, self.signing_key, self.limits, self.placement = envs, signing_key, limits, placement
         self.rng = rng or random.SystemRandom()
         self.db = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False, timeout=30)
         self.db.executescript(SCHEMA)
+        if 'node' not in {r[1] for r in self.db.execute('PRAGMA table_info(tasks)')}:
+            self.db.execute('ALTER TABLE tasks ADD COLUMN node TEXT')      # databases created before nodes
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='planner_machines'").fetchone():
+            # databases from before the inventory: the planner's own machines move into `machines`
+            self.db.executescript(
+                'BEGIN; INSERT OR IGNORE INTO machines (provider, machine_id, name, origin, state, price_per_hour, '
+                "slots, created_at) SELECT provider, machine_id, name, 'planner', 'running', price_per_hour, slots, "
+                'created_at FROM planner_machines; DROP TABLE planner_machines; COMMIT;')
         self._mu = threading.RLock()       # one connection shared by many request threads
 
     # ------------------------------------------------------------ transactions
@@ -159,6 +192,20 @@ class Store:
                         'last_seen=excluded.last_seen',
                         (worker_id, url, int(capacity), json.dumps(sorted(images)), json.dumps(sorted(env_ids)), now))
 
+    # ------------------------------------------------------------ cluster nodes (placement='nodes')
+    def sync_nodes(self, nodes, now: float | None = None) -> None:
+        """Record the usable nodes from one cluster read (coordinator.nodes.k8s_nodes). A node that stops
+        appearing is kept until node_ttl, then its running tasks are voided as node_lost."""
+        now = time.time() if now is None else now
+        with self._tx() as cur:
+            for n in nodes:
+                cur.execute('INSERT INTO nodes VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET '
+                            'slots=excluded.slots, images=excluded.images, last_seen=excluded.last_seen',
+                            (n.name, int(n.slots), json.dumps(sorted(n.images)), now))
+            cur.execute('DELETE FROM nodes WHERE last_seen < ? AND name NOT IN '
+                        "(SELECT node FROM tasks WHERE state='running' AND node IS NOT NULL)",
+                        (now - 10 * self.limits.node_ttl,))
+
     # ------------------------------------------------------------ ending / reaping
     def _end_task(self, cur, task_id: str, state: str, reason: str, now: float) -> None:
         row = cur.execute("SELECT epoch, env_id, task FROM tasks WHERE task_id=? AND state='running'",
@@ -203,6 +250,12 @@ class Store:
             "WHERE t.state='running' AND (w.worker_id IS NULL OR w.last_seen < ?)", (now - lim.worker_ttl,))]
         for tid in lost:
             self._end_task(cur, tid, 'void', 'worker_lost', now)
+        if self.placement == 'nodes':
+            gone = [r[0] for r in cur.execute(
+                "SELECT t.task_id FROM tasks t LEFT JOIN nodes n ON n.name = t.node "
+                "WHERE t.state='running' AND (n.name IS NULL OR n.last_seen < ?)", (now - lim.node_ttl,))]
+            for tid in gone:
+                self._end_task(cur, tid, 'void', 'node_lost', now)
         for (tid,) in cur.execute("SELECT task_id FROM tasks WHERE state='running'").fetchall():
             self._maybe_done(cur, tid, now)
         cur.execute('DELETE FROM demand WHERE at < ?', (now - lim.demand_window,))
@@ -243,10 +296,24 @@ class Store:
                 workers.append({'id': wid, 'url': url, 'cap': cap, 'free': cap - used.get(wid, 0),
                                 'images': set(json.loads(images))})
         budget = sum(w['cap'] for w in workers)
+        fits = [w for w in workers if w['free'] >= slots]
+        in_flight = sum(used.values())
+        nodes, node_fits = [], []
+        if self.placement == 'nodes':
+            # capacity and image caches come from cluster nodes; the worker (executor) only routes
+            nused = dict(cur.execute("SELECT node, SUM(slots) FROM tasks WHERE state='running' AND node IS NOT NULL "
+                                     'GROUP BY node').fetchall())
+            for name, nslots, images in cur.execute('SELECT name, slots, images FROM nodes WHERE last_seen >= ?',
+                                                    (now - lim.node_ttl,)):
+                nodes.append({'name': name, 'cap': nslots, 'free': nslots - nused.get(name, 0),
+                              'images': set(json.loads(images))})
+            budget = min(budget, sum(n['cap'] for n in nodes))
+            node_fits = [n for n in nodes if n['free'] >= slots]
+            if not node_fits:
+                fits = []
         if lim.max_containers:
             budget = min(budget, lim.max_containers)
-        fits = [w for w in workers if w['free'] >= slots]
-        if not fits or sum(used.values()) + slots > (lim.max_containers or float('inf')):
+        if not fits or in_flight + slots > (lim.max_containers or float('inf')):
             self._note_demand(cur, epoch, hotkey, now)
             return CapacityError('capacity_exhausted', 'no free environment capacity, retry later')
 
@@ -266,16 +333,21 @@ class Store:
         free = [t for t in env.task_ids() if t not in taken]
         if not free:
             raise QuotaError('pool_exhausted', 'no task left for this hotkey in this epoch')
-        cached = set().union(*(w['images'] for w in fits))
+        places = node_fits if self.placement == 'nodes' else fits
+        cached = set().union(*(p['images'] for p in places))
         hot = [t for t in free if env.image_of(t) in cached]
         task = self.rng.choice(hot or free)
         image = env.image_of(task)
         worker = max(fits, key=lambda w: (image in w['images'], w['free'], w['id']))
+        node = None
+        if self.placement == 'nodes':
+            node = max(node_fits, key=lambda n: (image in n['images'], n['free'], n['name']))['name']
 
         task_id = secrets.token_hex(12)
         cur.execute("INSERT INTO pool VALUES (?, ?, ?, 'assigned', ?)", (epoch, env_id, task, task_id))
-        cur.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, NULL, NULL)",
-                    (task_id, epoch, hotkey, env_id, task, worker['id'], slots, now, now))
+        cur.execute('INSERT INTO tasks (task_id, epoch, hotkey, env_id, task, worker_id, slots, state, started_at, '
+                    "last_seen, node) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)",
+                    (task_id, epoch, hotkey, env_id, task, worker['id'], slots, now, now, node))
         cur.execute('DELETE FROM demand WHERE epoch=? AND hotkey=?', (epoch, hotkey))
         return {'task_id': task_id, 'env_id': env_id, 'task': task, 'worker_url': worker['url'],
                 'group_size': slots}
@@ -342,8 +414,10 @@ class Store:
     def worker_task_spec(self, worker_id: str, task_id: str) -> dict:
         with self._tx() as cur:
             env_id, task = self._worker_task(cur, worker_id, task_id)
+            node = cur.execute('SELECT node FROM tasks WHERE task_id=?', (task_id,)).fetchone()[0]
         env = self._env(env_id)
-        return {'env_id': env_id, 'task': task, 'group_size': env.group_size, 'spec': env.public_spec(task)}
+        return {'env_id': env_id, 'task': task, 'group_size': env.group_size, 'spec': env.public_spec(task),
+                'node': node}
 
     def worker_grade_inputs(self, worker_id: str, session_id: str) -> dict:
         with self._tx() as cur:
@@ -385,7 +459,94 @@ class Store:
             else:
                 self._maybe_done(cur, task_id, now)
 
+    # ------------------------------------------------------------ machine inventory
+    def machines(self, *, live: bool = True, provider: str | None = None, origin: str | None = None) -> list[dict]:
+        """Every machine we know of (survives restarts). live=True: only creating / running / orphaned ones;
+        live=False also returns the history (deleted, gone)."""
+        q, args = f'SELECT {", ".join(_MACHINE_COLS)} FROM machines WHERE 1=1', []
+        if live:
+            q += f' AND state IN ({", ".join("?" * len(LIVE_MACHINE_STATES))})'
+            args += LIVE_MACHINE_STATES
+        for col, v in (('provider', provider), ('origin', origin)):
+            if v is not None:
+                q += f' AND {col} = ?'
+                args.append(v)
+        with self._tx() as cur:
+            rows = cur.execute(q + ' ORDER BY created_at, provider, machine_id', args).fetchall()
+        return [dict(zip(_MACHINE_COLS, r, strict=True)) for r in rows]
+
+    def machine_created(self, provider: str, machine_id: str, name: str, kind: str, price_per_hour: float,
+                        slots: int, now: float) -> None:
+        """The planner asked `provider` for a machine and got `machine_id` (recorded before the slow boot)."""
+        with self._tx() as cur:
+            cur.execute('INSERT OR REPLACE INTO machines (provider, machine_id, name, origin, state, kind, '
+                        "price_per_hour, slots, created_at, last_seen) VALUES (?, ?, ?, 'planner', 'creating', ?, ?, "
+                        '?, ?, ?)', (provider, machine_id, name, kind, price_per_hour, slots, now, now))
+
+    def machine_set_state(self, provider: str, machine_id: str, state: str, now: float, note: str | None = None):
+        ended = state not in LIVE_MACHINE_STATES
+        with self._tx() as cur:
+            cur.execute('UPDATE machines SET state = ?, ended_at = ?, note = COALESCE(?, note) '
+                        'WHERE provider = ? AND machine_id = ?',
+                        (state, now if ended else None, note, provider, machine_id))
+
+    def machine_note(self, provider: str, machine_id: str, note: str) -> None:
+        with self._tx() as cur:
+            cur.execute('UPDATE machines SET note = ? WHERE provider = ? AND machine_id = ?',
+                        (note, provider, machine_id))
+
+    def machine_seen(self, provider: str, m, now: float, origin: str = 'unmanaged') -> bool:
+        """Record that `provider` lists machine `m` (a providers.machine.Machine). A machine we did not know is
+        added with `origin` (static or unmanaged); a known one gets its last_seen, provider state and addresses
+        refreshed, and is never re-labelled. Returns True when the machine is new to the inventory."""
+        with self._tx() as cur:
+            row = cur.execute('SELECT state FROM machines WHERE provider = ? AND machine_id = ?',
+                              (provider, m.id)).fetchone()
+            if row is None or row[0] == 'gone':        # gone and back (e.g. a stopped VM resumed): count it again
+                cur.execute('INSERT OR REPLACE INTO machines (provider, machine_id, name, origin, state, '
+                            'provider_state, kind, price_per_hour, public_ipv4, public_ipv6, created_at, last_seen, '
+                            "note) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (provider, m.id, m.name, origin, m.state, m.kind, m.price_per_hour, m.public_ipv4,
+                             m.public_ipv6, m.created_at or now, now,
+                             '' if origin == 'static' else 'not created by the planner; never deleted automatically'))
+                return True
+            # the name is never overwritten: boat may report its own name, and ours is also the k3s node name
+            cur.execute('UPDATE machines SET last_seen = ?, provider_state = ?, '
+                        'kind = CASE WHEN ? != \'\' THEN ? ELSE kind END, '
+                        'price_per_hour = COALESCE(price_per_hour, ?), '
+                        'public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6) '
+                        'WHERE provider = ? AND machine_id = ?',
+                        (now, m.state, m.kind, m.kind, m.price_per_hour, m.public_ipv4, m.public_ipv6,
+                         provider, m.id))
+            return False
+
+    def machines_missing(self, provider: str, listed_ids, now: float) -> list[dict]:
+        """Machines we do not own (static / unmanaged) that `provider` no longer lists are marked gone. The planner's
+        own machines are never marked gone here: a list that misses one (paging bug, renamed machine) must not make
+        the planner forget a machine that may still bill; the planner's own delete path ends those."""
+        listed = set(listed_ids)
+        gone = [r for r in self.machines(provider=provider)
+                if r['origin'] != 'planner' and r['machine_id'] not in listed]
+        for r in gone:
+            self.machine_set_state(provider, r['machine_id'], 'gone', now)
+        return gone
+
     # ------------------------------------------------------------ stats
+    def capacity_snapshot(self, now: float | None = None) -> dict:
+        """What the capacity planner needs: hotkeys waiting for capacity, slots in use, and per-node slots."""
+        now = time.time() if now is None else now
+        lim = self.limits
+        with self._tx() as cur:
+            waiting = cur.execute('SELECT COUNT(DISTINCT hotkey) FROM demand WHERE at >= ?',
+                                  (now - lim.demand_window,)).fetchone()[0]
+            used = cur.execute("SELECT COALESCE(SUM(slots), 0) FROM tasks WHERE state='running'").fetchone()[0]
+            nused = dict(cur.execute("SELECT node, SUM(slots) FROM tasks WHERE state='running' AND node IS NOT NULL "
+                                     'GROUP BY node').fetchall())
+            nodes = {n: {'slots': s, 'used': nused.get(n, 0)} for n, s in cur.execute(
+                'SELECT name, slots FROM nodes WHERE last_seen >= ?', (now - lim.node_ttl,))}
+        group = max((e.group_size for e in self.envs.values()), default=8)
+        return {'waiting': waiting, 'used': used, 'nodes': nodes, 'group_size': group}
+
     def stats(self, epoch: str | None = None) -> dict:
         with self._tx() as cur:
             q = "SELECT state, COUNT(*), COALESCE(SUM(slots), 0) FROM tasks" + (' WHERE epoch=?' if epoch else '') + \

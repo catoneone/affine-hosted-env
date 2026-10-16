@@ -30,6 +30,7 @@ from ..envs import SetupError
 from ..receipt import TrajectoryHasher, sign_receipt
 from ..render import TemplateRenderer
 from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox
+from ..providers.sandbox.k8s import K8sSandbox
 from ..toolcall import parse_tool_calls, split_reasoning
 from .gateway_client import GatewayRejected, GatewayUnavailable, WorkerGatewayClient
 
@@ -52,7 +53,7 @@ class EnvRuntime:
     max_steps: int = 100
     max_seconds: int = 4 * 3600
     min_room: int = 1024             # stop when less than this much context remains (same as the EXP-014 harness)
-    sandbox: str = 'docker'          # docker / local (local is for tests only)
+    sandbox: str = 'docker'          # docker / k8s / local (local is for tests only)
     sandbox_opts: dict = field(default_factory=dict)
 
 
@@ -90,8 +91,9 @@ class Worker:
     def __init__(self, *, worker_id: str, key: SigningKey, gateway: WorkerGatewayClient, gateway_pub: VerifyKey,
                  runtimes: dict[str, EnvRuntime], public_url: str, capacity: int = 16, idle_ttl: int = 15 * 60,
                  retention: int = 3600, log_dir: str | None = None, image_cache: ImageCache | None = None,
-                 max_threads: int = 64, scratch: str | None = None):
+                 max_threads: int = 64, scratch: str | None = None, k8s_api: tuple | None = None):
         self.worker_id, self.key, self.gw, self.gateway_pub = worker_id, key, gateway, gateway_pub
+        self.k8s_api = k8s_api          # (CoreV1Api, NetworkingV1Api); created on first k8s sandbox if None
         self.key_id = key_id(key.verify_key)
         self.runtimes, self.public_url, self.capacity = runtimes, public_url, capacity
         self.idle_ttl, self.retention = idle_ttl, retention
@@ -259,13 +261,30 @@ class Worker:
         self._spec_cache[task_id] = (now, spec)
         return spec
 
-    def _sandbox_factory(self, rt: EnvRuntime):
+    def _sandbox_factory(self, rt: EnvRuntime, node: str | None = None):
+        """node: the cluster node the coordinator reserved for this task (k8s only)."""
         opts = dict(rt.sandbox_opts)
         if rt.sandbox == 'docker':
             return lambda image, cwd: DockerSandbox(image, cwd, **opts)
         if rt.sandbox == 'local':
             return lambda image, cwd: LocalSandbox(image, cwd, base_dir=self.scratch)
+        if rt.sandbox == 'k8s':
+            core, net = self._kube()
+            if node:
+                opts['node_name'] = node
+            return lambda image, cwd: K8sSandbox(image, cwd, api=core, networking_api=net, **opts)
         raise ValueError(f'unknown sandbox {rt.sandbox!r}')
+
+    def _kube(self):
+        """One Kubernetes client pair shared by every k8s sandbox (in-cluster config, else kubeconfig)."""
+        if self.k8s_api is None:
+            from kubernetes import client, config
+            try:
+                config.load_incluster_config()
+            except config.ConfigException:
+                config.load_kube_config()
+            self.k8s_api = (client.CoreV1Api(), client.NetworkingV1Api())
+        return self.k8s_api
 
     def _do_start(self, s: RolloutSession) -> dict:
         c, rt = s.claims, s.rt
@@ -282,7 +301,7 @@ class Worker:
             if rt.sandbox == 'docker':
                 self.images.acquire(spec['spec']['image'])
                 s.image = spec['spec']['image']
-            s.envsess = rt.env.open(spec['spec'], self._sandbox_factory(rt))
+            s.envsess = rt.env.open(spec['spec'], self._sandbox_factory(rt, node=spec.get('node')))
             s.envsess.setup()
             ids = rt.renderer.prompt(s.envsess.initial_messages(), s.envsess.tools)
             if len(ids) + rt.min_room > rt.max_context:

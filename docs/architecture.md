@@ -61,9 +61,12 @@ Two separate interfaces, because a machine and a sandbox are different products:
 | `SandboxProvider` | one isolated container per rollout: `start`, `execute`, `copy_text_to`, `cleanup` | `k8s` (default), `docker` (single-host dev), `local` (tests); later vendor sandboxes such as Targon Sandbox (template-based, cannot run arbitrary task images) |
 | `MachineProvider` | whole machines: create, list, delete, spec, price, limits; a boot script that joins the cluster | `boat`, `targon` (VM), `static` (machines registered by hand) |
 
-The `k8s` sandbox: one Pod per rollout, `runtimeClassName: gvisor`, a default-deny NetworkPolicy, CPU and memory
-limits, no service-account token, and the same environment repair as `DockerSandbox` (`ENV_PROBE`). Without that
-repair Go tasks cannot find their module cache and try to download it.
+The `k8s` sandbox: one Pod per rollout, CPU and memory limits, no service-account token, and the same environment
+repair as `DockerSandbox` (`ENV_PROBE`). Without that repair Go tasks cannot find their module cache and try to
+download it. Offline sandboxes are denied the network twice: the `gvisor-nonet` RuntimeClass (runsc
+`--network=none`, loopback only, checked after start; a sandbox with any other interface is refused) and a
+default-deny NetworkPolicy. The policy alone is not enough: it is enforced asynchronously, and on a freshly joined
+node the first Pod reached the internet (EXP-018).
 
 ## Cluster
 - k3s. The control plane runs on a stable dual-stack host. Avoid a boat sandbox for this role: it was IPv6-only
@@ -72,8 +75,8 @@ repair Go tasks cannot find their module cache and try to download it.
 - Nodes only need outbound access: the k3s agent tunnels kubelet traffic over its own connection.
 - Pod network: flannel `wireguard-native` (encrypted, 25 s keepalive from each node), so only the control plane
   opens a UDP port.
-- gVisor: `runsc` from the gVisor apt repository plus a containerd drop-in (`config-v3.toml.d/runsc.toml`), and a
-  `RuntimeClass` named `gvisor`.
+- gVisor: `runsc` from the gVisor apt repository plus a containerd drop-in (`config-v3.toml.d/runsc.toml`) with two
+  runtimes, `runsc` and `runsc-nonet` (`--network=none`), and RuntimeClasses `gvisor` and `gvisor-nonet`.
 - Boot scripts re-apply firewall rules on every boot, because boat snapshots do not keep them.
 
 ## Measured (EXP-017, 2026-10-15)
@@ -84,7 +87,8 @@ repair Go tasks cannot find their module cache and try to download it.
 | Task image Pod | 422 MB Xiaomi image pulled in 13 s, Pod Ready in 15 s; under 1 s once cached |
 | Exec latency | persistent client through the API server: p50 27-42 ms (runc), +10-30 ms with gVisor, 184 ms cross-region |
 | gVisor grading | Go task 002119: same test verdicts as runc, 27.5 s vs 23.9 s (+15%) |
-| Isolation | default-deny NetworkPolicy blocks egress for runc and gVisor Pods |
+| Isolation | default-deny NetworkPolicy blocks egress for runc and gVisor Pods, but asynchronously: on a node that had just joined, the first Pod reached the internet (EXP-018). With `gvisor-nonet` the sandbox has loopback only (`Network is unreachable` for the internet, Service and Pod CIDRs), including the first Pod on a fresh node; a Pod with any other interface is refused at start (EXP-018) |
+| Offline grading | Go task 002119 under `gvisor-nonet` with ENV_PROBE: 32.4 s on 2 cores, same 9 FAILs as with network, no module downloads (EXP-018) |
 | Targon VM | AMD SEV-SNP guest; joins as a node; as control plane it needs two workarounds (advertised address plus local hairpin forwarder, WireGuard port equal to the public mapping) |
 
 ## Migration plan
@@ -94,12 +98,28 @@ Each step is one PR with tests green:
    core), `providers/sandbox/` (today's docker and local sandboxes). Behavior unchanged.
 2. **Gateway** (done). Rate limits (`gateway/ratelimit.py`) and data-plane routing to an in-process executor
    (`hosted-env server`); the split mode with a separate executor process still works.
-3. **`k8s` SandboxProvider.** Kubernetes Python client as an optional extra; unit tests against a fake API; an
-   opt-in live test against a kubeconfig.
-4. **Coordinator capacity from Kubernetes.** Node allocatable resources and cached images replace the worker
-   heartbeat registry.
-5. **MachineProviders.** `boat`, `targon`, `static`, plus the node boot script (k3s agent, WireGuard, gVisor,
-   firewall); then the capacity planner.
+3. **`k8s` SandboxProvider** (done). `providers/sandbox/k8s.py`; Kubernetes Python client as the `k8s` extra;
+   unit tests against a fake API (`tests/test_k8s_sandbox.py`); an opt-in live test against a kubeconfig
+   (`tests/test_k8s_live.py`). Select it per env with `sandbox = "k8s"`.
+4. **Coordinator capacity from Kubernetes** (done). `coordinator/nodes.py` reads node allocatable resources and
+   cached images; `Store(placement='nodes')` reserves each task's group on one node and voids tasks of lost nodes;
+   the gateway syncs nodes every 10 s; the executor passes the node to the Pod as `nodeName`. Enabled by
+   `[placement] kind = "k8s"`.
+5. **MachineProviders** (done, against fakes). `providers/machine/`: interface, `static`, `boat`, `targon`, and the
+   node boot script (`bootstrap.py`: firewall, gVisor, WireGuard port, pinned k3s agent). `coordinator/planner.py`
+   turns waiting demand into machines and deletes idle ones, bounded by `max_machines`, `max_hourly_usd` and
+   `max_create_per_round`, and runs in dry-run mode unless told otherwise. It runs inside the server process
+   (`[machines]` in the config, a background round every `interval` seconds, plans logged when they change) and
+   never deletes a machine it did not create.
+   Machine inventory: every machine is kept in the Store's `machines` table, with history. The planner records
+   its machines as soon as the provider assigns an id (before the slow boot, so a crash mid-create cannot forget a
+   billed machine); a failed create is cleaned up by the provider, which deletes only the machine it was creating,
+   and if that delete fails the machine is marked `orphaned` and the planner retries it every round. Every
+   `inventory_interval` seconds (read only, also in dry-run) each provider is listed: `hosted-env-` machines the
+   planner did not create (the control plane, leftovers) are recorded as `unmanaged` and logged, never deleted;
+   ones that disappear become `gone`. A provider list that misses one of the planner's own machines never makes it
+   forget the machine. `hosted-env machines --config <file> [--all] [--refresh]` prints the inventory with hours
+   and an estimated cost at list prices.
 6. **Live P0** on a small cluster. Needs a decision on the control-plane host.
 
 ## Open

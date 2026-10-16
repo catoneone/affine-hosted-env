@@ -26,6 +26,42 @@ infra_error_policy = "void"
 hotkey_control = [5, 20]
 hotkey_data = [200, 400]
 
+# Kubernetes placement (architecture v2): capacity and image caches come from cluster nodes, each task's group is
+# reserved on one node, and the envs below should use sandbox = "k8s". Needs the `k8s` extra.
+# [placement]
+# kind = "k8s"
+# kubeconfig = "/path/to/kubeconfig"      # omit to use in-cluster config or ~/.kube/config
+# cpus = "1"                              # one standard sandbox slot; match sandbox_opts
+# memory = "2g"
+# reserve_cpu = "500m"                    # left for system pods on every node
+# reserve_memory = "1Gi"
+# include_control_plane = false           # true only for a single-node dev cluster: sandboxes would share the control plane
+
+# Capacity planner (architecture v2): rents and deletes whole machines that join the cluster as nodes. Needs
+# [placement] kind = "k8s". dry_run = true (the default) only logs plans; every cap defaults to 0, which means
+# nothing is ever created. Raise the caps and set dry_run = false only after reading the logged plans for a while.
+# [machines]
+# dry_run = true
+# interval = 30                           # seconds between rounds
+# max_machines = 0                        # machines the planner may own at once
+# max_hourly_usd = 0.0                    # summed hourly price of those machines
+# max_create_per_round = 2
+# min_machines = 0                        # never shrink below this
+# idle_grace = 600                        # an empty node is deleted after this many seconds (nobody waiting)
+# join_timeout = 1800                     # a machine that never joins is deleted after this
+# inventory_interval = 300                # seconds between provider listings for the inventory (read only)
+#                                         # `hosted-env machines --config <this file>` prints the inventory
+# server_url = "https://<control plane public IP>:<API port>"
+# join_token_file = "k3s.token"           # the cluster's join token (secret)
+# wireguard_port = 20000                  # cluster-wide flannel WireGuard port (the control plane's public UDP port)
+# [machines.providers.boat]
+# token_file = "boat.token"
+# [machines.providers.targon]
+# token_file = "targon.token"
+# ssh_key_uid = "shk-..."                 # SSH key registered with Targon; the boot script is run over SSH
+# ssh_key = "control-plane"               # matching private key
+# known_hosts = "known_hosts"
+
 [envs.mimo_swe]                           # coordinator (task pool) and executor (runtime) settings in one table
 kind = "mimo_swe"
 tasks = "tasks.jsonl"

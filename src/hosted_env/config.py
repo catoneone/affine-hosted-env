@@ -35,7 +35,33 @@ def _envs(cfg: dict, base: Path, keys=('tasks',)) -> dict:
 def _store(cfg: dict, base: Path, key):
     from .coordinator.store import Limits, Store
     envs = {e: make_env(e, c) for e, c in _envs(cfg, base).items()}
-    return Store(_abs(base, cfg.get('db', 'gateway.db')), envs, key, Limits(**(cfg.get('limits') or {})))
+    placement = 'nodes' if (cfg.get('placement') or {}).get('kind') == 'k8s' else 'workers'
+    return Store(_abs(base, cfg.get('db', 'gateway.db')), envs, key, Limits(**(cfg.get('limits') or {})),
+                 placement=placement)
+
+
+def _node_source(cfg: dict):
+    """[placement] kind = "k8s": read nodes from the cluster (in-cluster config, else kubeconfig). Other keys
+    (cpus, memory, reserve_cpu, reserve_memory, include_control_plane) size one standard sandbox slot."""
+    pcfg = dict(cfg.get('placement') or {})
+    if pcfg.pop('kind', None) != 'k8s':
+        return None
+    kubeconfig = pcfg.pop('kubeconfig', None)
+
+    def read():
+        from kubernetes import client, config
+
+        from .coordinator.nodes import k8s_nodes
+        if kubeconfig:
+            api = client.CoreV1Api(config.new_client_from_config(config_file=kubeconfig))
+        else:
+            try:
+                config.load_incluster_config()
+            except config.ConfigException:
+                config.load_kube_config()
+            api = client.CoreV1Api()
+        return k8s_nodes(api, **pcfg)
+    return read
 
 
 def _limiter(cfg: dict):
@@ -43,13 +69,81 @@ def _limiter(cfg: dict):
     return RateLimiter(RateLimits.from_config(cfg.get('rate_limits')))
 
 
+_PLANNER_LIMITS = ('max_machines', 'max_hourly_usd', 'max_create_per_round', 'min_machines', 'idle_grace',
+                   'join_timeout')
+
+
+def _planner(cfg: dict, base: Path, store):
+    """[machines]: the capacity planner rents and deletes whole machines that join the cluster as nodes.
+    Off unless the table exists; dry_run defaults to true (plans are logged, no provider is called), and every
+    spending cap defaults to 0 (nothing is ever created). Needs [placement] kind = "k8s".
+    Returns (planner, interval) or (None, 0)."""
+    mcfg = dict(cfg.get('machines') or {})
+    if not mcfg:
+        return None, 0
+    pcfg = cfg.get('placement') or {}
+    if pcfg.get('kind') != 'k8s':
+        raise ValueError('[machines] needs [placement] kind = "k8s": new machines join the cluster as nodes')
+    from .coordinator.planner import Planner, PlannerLimits
+    from .providers.machine import BoatProvider, TargonProvider, ssh_boot_runner
+    from .providers.machine.bootstrap import render_boot_script
+    providers = {}
+    for name, p in (mcfg.get('providers') or {}).items():
+        p = dict(p)
+        if name == 'boat':
+            # boat may ignore our names: the ids recorded in the inventory are how its machines stay ours
+            owned = [r['machine_id'] for r in store.machines(provider='boat', origin='planner')]
+            providers[name] = BoatProvider.from_token_file(_abs(base, p['token_file']), owned_ids=owned)
+        elif name == 'targon':
+            runner = ssh_boot_runner(_abs(base, p['ssh_key']), _abs(base, p['known_hosts']))
+            providers[name] = TargonProvider.from_token_file(_abs(base, p['token_file']), ssh_key_uid=p['ssh_key_uid'],
+                                                             boot_runner=runner, org=p.get('org'))
+        else:
+            raise ValueError(f'unknown machine provider {name!r} (boat, targon)')
+    server_url, token_file = mcfg['server_url'], _abs(base, mcfg['join_token_file'])
+    wireguard_port, gvisor = mcfg.get('wireguard_port'), bool(mcfg.get('gvisor', True))
+
+    def boot_script(provider: str, spec) -> str:
+        with open(token_file) as f:                        # read per machine; never kept in the config dict
+            token = f.read().strip()
+        return render_boot_script(server_url=server_url, join_token=token, node_name=spec.name,
+                                  labels={'hosted-env/provider': provider}, wireguard_port=wireguard_port,
+                                  gvisor=gvisor)
+    slot = {k: pcfg[k] for k in ('cpus', 'memory', 'reserve_cpu', 'reserve_memory') if k in pcfg}
+    planner = Planner(providers, PlannerLimits(**{k: mcfg[k] for k in _PLANNER_LIMITS if k in mcfg}), boot_script,
+                      dry_run=bool(mcfg.get('dry_run', True)), ledger=store,
+                      inventory_interval=float(mcfg.get('inventory_interval', 300)), **slot)
+    return planner, float(mcfg.get('interval', 30))
+
+
+def machine_inventory(path: str, *, refresh: bool = False) -> tuple[list[dict], dict | None]:
+    """`hosted-env machines`: every machine in the inventory (history included) from the config's database.
+    refresh=True first lists every [machines] provider once (read only: nothing is created or deleted)."""
+    from nacl.signing import SigningKey
+
+    from .coordinator.store import Store
+    cfg, base = _load(path)
+    # this Store is only used for its machines table: no envs, and a throwaway key instead of the gateway's
+    store = Store(_abs(base, cfg.get('db', 'gateway.db')), {}, SigningKey.generate())
+    report = None
+    if refresh:
+        planner, _ = _planner(cfg, base, store)
+        if planner is None:
+            raise ValueError('--refresh needs a [machines] table with providers')
+        report = planner.reconcile()
+    return store.machines(live=False), report
+
+
 def build_gateway_app(path: str):
     from .gateway.app import Roster, create_gateway_app
     cfg, base = _load(path)
     key = load_key_file(_abs(base, cfg['key_file']))
     workers = {w: verify_key_from_hex(h) for w, h in (cfg.get('workers') or {}).items()}
-    return create_gateway_app(_store(cfg, base, key), Roster(_abs(base, cfg['roster'])), workers, key.verify_key,
-                              limiter=_limiter(cfg))
+    store = _store(cfg, base, key)
+    planner, interval = _planner(cfg, base, store)
+    return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), workers, key.verify_key,
+                              limiter=_limiter(cfg), node_source=_node_source(cfg), planner=planner,
+                              planner_interval=interval)
 
 
 def _runtimes(cfg: dict, base: Path) -> dict:
@@ -109,5 +203,7 @@ def build_server_app(path: str):
         raise ValueError('the executor receipt key must differ from the gateway session key')
     worker = _executor(wcfg, base, wkey, InProcessGatewayClient(store, wcfg['worker_id']), gkey.verify_key,
                        cfg['public_url'], _runtimes(cfg, base))
+    planner, interval = _planner(cfg, base, store)
     return create_gateway_app(store, Roster(_abs(base, cfg['roster'])), {wcfg['worker_id']: wkey.verify_key},
-                              gkey.verify_key, limiter=_limiter(cfg), executor=worker)
+                              gkey.verify_key, limiter=_limiter(cfg), executor=worker, node_source=_node_source(cfg),
+                              planner=planner, planner_interval=interval)
