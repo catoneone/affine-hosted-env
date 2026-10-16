@@ -23,14 +23,19 @@ def _pod(phase='Running', ready=True, waiting=None):
 
 
 class FakeCore:
-    def __init__(self, pods=None):
-        self.created, self.deleted = [], []
+    def __init__(self, pods=None, lingering=0):
+        self.created, self.deleted, self.lingering = [], [], lingering
         self.pods = list(pods or [_pod('Pending', False), _pod()])
 
     def create_namespaced_pod(self, ns, body):
         self.created.append((ns, body))
 
     def read_namespaced_pod(self, name, ns):
+        if (name, ns) in self.deleted:
+            if self.lingering:                       # the kubelet is still tearing it down
+                self.lingering -= 1
+                return self.pods[-1]
+            raise ApiErr(404)
         return self.pods.pop(0) if len(self.pods) > 1 else self.pods[0]
 
     def delete_namespaced_pod(self, name, ns, grace_period_seconds=None):
@@ -241,3 +246,18 @@ def test_exec_never_uses_the_shared_client(monkeypatch):
     assert a is b and a is not c                                         # one exec client per thread
     assert all(x is not shared and x.api_client is not shared.api_client for x in used)
     assert a.api_client.configuration is cfg                             # same cluster and credentials
+
+
+def test_cleanup_waits_until_the_pod_is_gone(tmp_path):
+    """A deleted Pod keeps its CPU and memory on the node until the kubelet is done with it; the next sandbox on
+    that node (the grading container) was refused with OutOfmemory when cleanup returned right away (EXP-018)."""
+    api = FakeCore(lingering=3)
+    sb = make(tmp_path, api=api)
+    sb.start()
+    sb.cleanup()
+    assert api.lingering == 0 and api.deleted == [(sb.name, 'hosted-env')]   # polled until 404
+    stuck = FakeCore(lingering=10 ** 6)
+    sb = make(tmp_path, api=stuck, delete_timeout=0.05)
+    sb.start()
+    with pytest.raises(SandboxError, match='still exists'):
+        sb.cleanup()

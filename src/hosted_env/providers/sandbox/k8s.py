@@ -164,6 +164,7 @@ class K8sSandbox:
                  namespace: str = 'hosted-env', node_name: str | None = None, runtime_class: str | None = 'auto',
                  cpus: str = '1', memory: str = '2g', network: str = 'none', repair_env: bool = True,
                  offline_check: str = 'interfaces', start_timeout: float = 600, poll: float = 0.5,
+                 delete_timeout: float = 120,
                  labels: dict | None = None, **_ignored):
         """runtime_class 'auto': gvisor-nonet for network='none', gvisor otherwise.
         offline_check (network='none' only): 'interfaces' refuses a sandbox that has any interface besides lo;
@@ -187,6 +188,7 @@ class K8sSandbox:
         self.networking_api, self.network, self.offline_check = networking_api, network, offline_check
         self.exec_fn = exec_fn or ws_exec(api, namespace)
         self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env
+        self.delete_timeout = delete_timeout
         self.started, self.has_timeout = False, False
         self.env: dict[str, str] = {}
 
@@ -206,7 +208,9 @@ class K8sSandbox:
                 raise SandboxError(f'read pod failed: {str(e)[:300]}') from None
             if _ready(pod):
                 break
-            why = _reason(pod) or (f'pod {pod.status.phase}' if pod.status.phase in ('Failed', 'Succeeded') else None)
+            why = _reason(pod) or (f'pod {pod.status.phase}' + (f' ({pod.status.reason}: {pod.status.message})'
+                                                            if getattr(pod.status, 'reason', None) else '')
+                                   if pod.status.phase in ('Failed', 'Succeeded') else None)
             if why:
                 raise SandboxError(why)
             if time.monotonic() > deadline:
@@ -260,6 +264,9 @@ class K8sSandbox:
                 raise SandboxError(f'write {remote_path} failed: {out[-300:].decode("utf-8", "replace")}')
 
     def cleanup(self):
+        """Delete the Pod and wait until it is gone: a deleted Pod keeps its CPU and memory on the node until
+        the kubelet tears it down, and the next sandbox placed on that node (the grading container, the next
+        group) would be refused with OutOfmemory / OutOfcpu (EXP-018)."""
         if not self.started:
             return
         self.started = False
@@ -268,3 +275,13 @@ class K8sSandbox:
         except Exception as e:
             if getattr(e, 'status', None) != 404:
                 raise
+        deadline = time.monotonic() + self.delete_timeout
+        while time.monotonic() < deadline:
+            try:
+                self.api.read_namespaced_pod(self.name, self.ns)
+            except Exception as e:
+                if getattr(e, 'status', None) == 404:
+                    return
+                raise
+            time.sleep(self.poll)
+        raise SandboxError(f'pod {self.name} still exists {self.delete_timeout:.0f}s after delete')
