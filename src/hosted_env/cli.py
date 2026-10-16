@@ -160,6 +160,15 @@ def cmd_roster_sync(a):
         print(json.dumps(sync_once(a.out, network=a.network, netuid=a.netuid)))
 
 
+def cmd_pin_images(a):
+    from .images import pin_tasks
+    src = Path(a.tasks)
+    lines, stats = pin_tasks(src.read_text().splitlines())
+    dst = Path(a.out) if a.out else src
+    dst.write_text('\n'.join(lines) + '\n')
+    print(json.dumps({**stats, 'out': str(dst)}))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='hosted-env')
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -209,6 +218,11 @@ def main(argv=None):
     rs.add_argument('--netuid', type=int, default=120)
     rs.add_argument('--every', type=float, default=0, help='seconds between syncs; 0 = sync once and exit')
     rs.set_defaults(fn=cmd_roster_sync)
+    pi = sub.add_parser('pin-images', help='Rewrite a task file so every image is name@sha256:<digest> '
+                                          '(the tag is kept as image_tag); needs registry access')
+    pi.add_argument('tasks')
+    pi.add_argument('--out', help='write here instead of in place')
+    pi.set_defaults(fn=cmd_pin_images)
     a = p.parse_args(argv)
     a.fn(a)
 
