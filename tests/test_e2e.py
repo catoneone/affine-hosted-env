@@ -103,6 +103,7 @@ def test_group_end_to_end(stack):
     assert (c0['grader'], c0['grader_user'], c0['renderer']) == ('isolated-v2', 'root', 'char/v1/enable_thinking=false')
     assert len(c0['model_patch_sha256']) == len(c0['test_patch_sha256']) == len(c0['tokenizer_sha256']) == 64
     assert c0['image'] and c0['verifier_returncode'] == 0 and c0['started_at_ms'] <= c0['issued_at_ms']
+    assert len(c0['start_tree']) == 40
     assert b'a + b' in v['model_patches'][0] and v['model_patches'][1] == b''   # the fix, then the no-op rollout
 
     bad = copy.deepcopy(att)

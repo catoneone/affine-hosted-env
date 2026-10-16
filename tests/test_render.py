@@ -85,6 +85,11 @@ def test_tokenizer_digest_and_pin(tmp_path):
     """The digest covers the named tokenizer files only (not weights or configs), in a fixed order, and the
     worker refuses to start when the files differ from the pinned tokenizer_sha256."""
     from hosted_env.render import make_renderer, tokenizer_digest
+    for bad in (str(tmp_path), str(tmp_path / 'nope'), 'Qwen/Qwen3-8B'):     # nothing to commit to: refused
+        with pytest.raises(ValueError, match='not a local tokenizer directory'):
+            tokenizer_digest(bad)
+        with pytest.raises(ValueError, match='not a local tokenizer directory'):
+            make_renderer({'kind': 'hf', 'path': bad})
     (tmp_path / 'tokenizer.json').write_text('{"v": 1}')
     (tmp_path / 'chat_template.jinja').write_text('{{ messages }}')
     d = tokenizer_digest(str(tmp_path))

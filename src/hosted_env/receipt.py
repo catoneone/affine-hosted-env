@@ -37,11 +37,12 @@ RECEIPT_DOMAIN = b'affine-hosted-env-receipt-v2|'
 SOURCES = ('P', 'M', 'T')   # P=task prompt from the environment, M=model generated, T=tool output (environment generated)
 OUTCOMES = ('completed', 'unresolved', 'infra_error')
 RECEIPT_VERSION = 2
-_HEX64 = frozenset('0123456789abcdef')
+_HEX = frozenset('0123456789abcdef')
 # Field -> type. *_sha256 fields are lowercase hex SHA-256 or '' (not known: e.g. a rollout that never got graded);
-# verifier_returncode is None when no verifier ran.
+# start_tree is a 40-hex git tree id or ''; verifier_returncode is None when no verifier ran.
 CONTEXT_FIELDS = {
     'image': str,                   # name@sha256:... the rollout and its grading ran in
+    'start_tree': str,              # git tree the model started from (after setup); the patch applies to it
     'test_patch_sha256': str,       # of the hidden test patch text (UTF-8)
     'test_command_sha256': str,     # of the test command text (UTF-8)
     'grader': str,                  # grading semantics version, e.g. isolated-v2
@@ -132,7 +133,8 @@ def _context_problem(ctx: Mapping) -> str | None:
         v = ctx[k]
         if not isinstance(v, t) or isinstance(v, bool):
             return f'bad type for {k}'
-        if k.endswith('_sha256') and v and (len(v) != 64 or not set(v) <= _HEX64):
+        n = 64 if k.endswith('_sha256') else 40 if k == 'start_tree' else 0
+        if n and v and (len(v) != n or not set(v) <= _HEX):
             return f'bad digest for {k}'
     return None
 
@@ -147,10 +149,11 @@ def sign_receipt(worker_key: SigningKey, key_id: str, *, epoch: str, hotkey: str
     problem = _context_problem(context)
     if problem or set(context) != set(CONTEXT_FIELDS):
         raise ValueError(f'bad receipt context: {problem or "unknown fields"}')
+    if issued_at_ms is None:                    # never before the start, even if the wall clock stepped back
+        issued_at_ms = max(int(time.time() * 1000), context['started_at_ms'])
     payload = {**context, 'v': RECEIPT_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
                'nonce': nonce, 'trajectory_sha256': trajectory_sha256, 'n_tokens': n_tokens, 'outcome': outcome,
-               'reward': float(reward), 'key_id': key_id,
-               'issued_at_ms': int(time.time() * 1000) if issued_at_ms is None else issued_at_ms}
+               'reward': float(reward), 'key_id': key_id, 'issued_at_ms': issued_at_ms}
     body = canonical(payload)
     return {'payload': b64u(body), 'sig': b64u(sign(worker_key, RECEIPT_DOMAIN, body))}
 
@@ -188,8 +191,11 @@ def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, Verify
     if (claims.get('outcome') not in OUTCOMES or _context_problem(claims) or type(issued) is not int
             or started > issued):
         raise ReceiptError('malformed_receipt')
-    if any(claims.get(k) != v for k, v in (expect or {}).items()):
-        raise ReceiptError('context_mismatch')          # e.g. another image, test patch or tokenizer than expected
+    for k, v in (expect or {}).items():
+        if k not in CONTEXT_FIELDS:
+            raise ValueError(f'expect: {k!r} is not a receipt context field')     # the caller's mistake
+        if claims[k] != v or type(claims[k]) is not type(v):
+            raise ReceiptError('context_mismatch')      # e.g. another image, test patch or tokenizer than expected
     try:
         digest, n = trajectory_sha256(segments)
     except (ValueError, TypeError, KeyError):

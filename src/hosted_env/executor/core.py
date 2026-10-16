@@ -45,13 +45,22 @@ GRADE_LOG_FIELDS = ('grader', 'grader_user', 'lock_seconds', 'grade_detail', 've
 
 
 def _build_version() -> str:
-    """Package version plus the git commit the worker runs from, when it runs from a checkout (deploys do)."""
+    """Package version plus the git commit the worker runs from, when it runs from its own checkout (deploys do;
+    not a wheel inside some other repository), and '.dirty' when tracked files differ from that commit."""
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args):
+        return subprocess.run(['git', *args], capture_output=True, text=True, timeout=5, cwd=here)
     try:
-        sha = subprocess.run(['git', 'rev-parse', '--short=12', 'HEAD'], capture_output=True, text=True, timeout=5,
-                             cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip()
+        top = git('rev-parse', '--show-toplevel').stdout.strip()
+        mine = os.path.join(top, 'src', 'hosted_env', 'executor', 'core.py')
+        if not top or not os.path.isfile(mine) or not os.path.samefile(mine, __file__):
+            return __version__
+        sha = git('rev-parse', '--short=12', 'HEAD').stdout.strip()
+        dirty = git('status', '--porcelain', '--untracked-files=no').stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        sha = ''
-    return f'{__version__}+g{sha}' if sha else __version__
+        return __version__
+    return f'{__version__}+g{sha}{".dirty" if dirty else ""}' if sha else __version__
 
 
 def _sha256_text(text: str) -> str:
@@ -393,7 +402,9 @@ class Worker:
         r = s.rt.renderer
         spec = s.envsess.spec if s.envsess is not None else {}
         rc = grade.get('verifier_returncode')
-        return {'image': str(spec.get('image', '')), 'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
+        state = s.envsess.state if s.envsess is not None else {}
+        return {'image': str(spec.get('image', '')), 'start_tree': str(state.get('start_tree', '')),
+                'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
                 'test_command_sha256': _sha256_text(gi.get('test_command', '')),
                 'grader': str(grade.get('grader', '')), 'grader_user': str(grade.get('grader_user', '')),
                 'model_patch_sha256': str(grade.get('model_patch_sha256', '')),

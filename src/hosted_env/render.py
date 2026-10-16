@@ -26,8 +26,18 @@ TOKENIZER_FILES = ('added_tokens.json', 'chat_template.jinja', 'merges.txt', 'sp
                    'tokenizer.json', 'tokenizer.model', 'tokenizer_config.json', 'vocab.json')
 
 
+# At least one of these must be present, or the digest would commit to nothing (an empty or wrong directory, or a
+# hub repo id that from_pretrained would resolve elsewhere at no fixed revision).
+_CORE_TOKENIZER_FILES = (('tokenizer.json',), ('vocab.json', 'merges.txt'), ('tokenizer.model',))
+
+
 def tokenizer_digest(path: str) -> str:
-    """SHA-256 over 'name NUL sha256(content) LF' for each TOKENIZER_FILES entry present in `path`, in name order."""
+    """SHA-256 over b'hosted-env-tokenizer-v1\\n' then 'name NUL sha256(content) LF' for each TOKENIZER_FILES entry
+    present in the local directory `path`, in that (name) order. Raises ValueError when `path` is not a directory
+    holding a tokenizer (tokenizer.json, vocab.json + merges.txt, or tokenizer.model)."""
+    if not os.path.isdir(path) or not any(all(os.path.isfile(os.path.join(path, f)) for f in core)
+                                          for core in _CORE_TOKENIZER_FILES):
+        raise ValueError(f'not a local tokenizer directory: {path!r}')
     h = hashlib.sha256(b'hosted-env-tokenizer-v1\n')
     for name in TOKENIZER_FILES:
         f = os.path.join(path, name)
@@ -40,7 +50,9 @@ def tokenizer_digest(path: str) -> str:
 def _sha256_text(text) -> str:
     if not text:
         return ''
-    raw = text if isinstance(text, str) else json.dumps(text, sort_keys=True)     # a dict of named templates
+    # a dict of named templates: compact JSON with sorted keys, non-ASCII kept (UTF-8)
+    raw = text if isinstance(text, str) else json.dumps(text, sort_keys=True, separators=(',', ':'),
+                                                        ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 _DUMMY = [{'role': 'user', 'content': 'x'},
@@ -114,13 +126,16 @@ class HFRenderer(TemplateRenderer):
 
     def __init__(self, path: str, *, enable_thinking: bool | None = None, turn_end: str = '<|im_end|>',
                  extra_stops: Sequence[str] = ('<|endoftext|>',)):
+        digest = tokenizer_digest(path)            # first: a local tokenizer directory, never a hub id
+        import tokenizers
         import transformers
         from transformers import AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(path)
         self.enable_thinking = enable_thinking
         think = '' if enable_thinking is None else f'/enable_thinking={str(enable_thinking).lower()}'
-        self.identity = {'renderer': f'hf/transformers-{transformers.__version__}{think}',
-                         'tokenizer_sha256': tokenizer_digest(path),
+        self.identity = {'renderer': f'hf/transformers-{transformers.__version__}/tokenizers-{tokenizers.__version__}'
+                                     f'{think}',
+                         'tokenizer_sha256': digest,
                          'chat_template_sha256': _sha256_text(self.tok.chat_template)}
         self._lock = threading.Lock()          # HF fast tokenizer occasionally raises "Already borrowed" on concurrent encodes
         self.vocab_size = len(self.tok)

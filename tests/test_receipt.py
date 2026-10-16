@@ -14,7 +14,8 @@ from hosted_env.verify import GROUP_ATTACHMENT_VERSION, verify_group
 ID = dict(epoch='e000001', hotkey='5Hotkey0', env_id='mimo_swe', task='002119', nonce=3)
 SEGS = [('P', [151644, 8948, 198]), ('M', [40, 1184, 311, 1349]), ('T', [27, 14172, 9, 29]),
         ('M', [785, 5046, 151645])]
-CTX = {'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64, 'test_patch_sha256': 'a' * 64,
+CTX = {'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64, 'start_tree': '9' * 40,
+       'test_patch_sha256': 'a' * 64,
        'test_command_sha256': 'b' * 64, 'grader': 'isolated-v2', 'grader_user': 'nobody',
        'model_patch_sha256': 'd' * 64, 'verifier_returncode': 0, 'model_id': 'XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B',
        'model_revision': '2367e865', 'tokenizer_sha256': 'e' * 64, 'chat_template_sha256': 'f' * 64,
@@ -46,7 +47,8 @@ def test_context_is_complete_and_typed():
     wk = SigningKey.generate()
     for bad in ({k: v for k, v in CTX.items() if k != 'image'}, {**CTX, 'extra': 'x'},
                 {**CTX, 'verifier_returncode': '0'}, {**CTX, 'started_at_ms': True},
-                {**CTX, 'tokenizer_sha256': 'E' * 64}, {**CTX, 'model_patch_sha256': 'abc'}):
+                {**CTX, 'tokenizer_sha256': 'E' * 64}, {**CTX, 'model_patch_sha256': 'abc'},
+                {**CTX, 'start_tree': '9' * 64}):
         with pytest.raises(ValueError, match='bad receipt context'):
             _sign(wk, ctx=bad)
     _sign(wk, ctx={**CTX, 'verifier_returncode': None, 'model_patch_sha256': ''})   # an ungraded rollout
@@ -60,6 +62,10 @@ def test_expect_pins_context(setup):
                  ('tokenizer_sha256', '1' * 64), ('grader', 'isolated-v1')):
         with pytest.raises(ReceiptError, match='context_mismatch'):
             verify_receipt(r, SEGS, keys, **ID, expect={k: v})
+    with pytest.raises(ReceiptError, match='context_mismatch'):              # type-strict: 0 is not False
+        verify_receipt(r, SEGS, keys, **ID, expect={'verifier_returncode': False})
+    with pytest.raises(ValueError, match='not a receipt context field'):     # a typo must not pass silently
+        verify_receipt(r, SEGS, keys, **ID, expect={'tokenizer_sha': 'e' * 64})
 
 
 def test_v1_and_hand_made_payloads_are_rejected(setup):
