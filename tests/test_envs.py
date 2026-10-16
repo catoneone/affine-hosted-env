@@ -164,6 +164,32 @@ def test_protected_test_infrastructure_is_reset_whatever_its_name(tmp_path):
     assert sorted(g['reverted_paths']) == sorted(files)
 
 
+def test_protected_file_renamed_away_is_put_back(tmp_path):
+    # git diff records a 100% rename (conftest.py -> notes.txt); git apply --numstat would name only notes.txt
+    prep = 'printf "import os\\n# fixtures the hidden tests rely on\\n" > conftest.py'
+    g, _ = graded(tmp_path, 'mv conftest.py notes.txt', 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
+                  image_prep=prep)
+    assert 'rename from conftest.py' in g['model_patch']
+    assert g['reward'] == 1.0 and g['reverted_paths'] == ['conftest.py']
+
+
+def test_crafted_patch_on_an_ignored_file_scores_0_not_infra_error(tmp_path):
+    """A hunk on a git-ignored file that exists on disk applies in the worktree but not to the start tree. A real
+    tree-to-tree diff cannot contain it, so the model's own git produced it: graded 0, never a voided rollout."""
+    import subprocess
+    env, task = make_task(tmp_path)
+    subprocess.run(['bash', '-c', 'printf ".env\\n" > .gitignore && printf "SECRET=1\\n" > .env'],
+                   cwd=env.public_spec(task)['image'], check=True)
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    crafted = (b'diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-SECRET=1\n+SECRET=2\n')
+    env.capture_patch = lambda _s: (crafted, '')                      # what a replaced git binary could send
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert g['reward'] == 0.0 and g['grade_detail'].startswith('model_patch_does_not_apply: ')
+    assert '.env' in g['grade_detail']
+
+
 def test_patch_problems_are_the_models_own_zero(tmp_path):
     g, _ = graded(tmp_path, 'head -c 2500000 /dev/urandom | base64 > big.txt')
     assert (g['reward'], g['grade_detail'], g['model_patch']) == (0.0, 'model_patch_too_large', '')
@@ -271,7 +297,7 @@ class _StubRootSandbox:
     chown only logs, setpriv drops nothing but makes the stub id report 65534, chmod logs and really runs unless
     `fake_chmod` is set. The /tmp paths the env uses are mapped under `tmp`."""
 
-    def __init__(self, tmp, home, setpriv_rc=None, fake_chmod=False):
+    def __init__(self, tmp, home, setpriv_rc=None, fake_chmod=False, no_setpriv=False):
         import os
         self.tmp, self.log, stub = str(tmp), tmp / 'calls.log', tmp / 'bin'
         stub.mkdir()
@@ -283,10 +309,14 @@ class _StubRootSandbox:
                         'while [ "$1" != -- ]; do shift; done; shift\nFAKE_UID=65534 exec "$@"'),
             'id': 'echo "${FAKE_UID:-0}"',
         }
+        if no_setpriv:                     # a real setpriv may be on the host (Linux CI): keep only what is needed
+            del scripts['setpriv']
+            for tool in ('base64', 'rm', 'dirname'):
+                os.symlink(shutil.which(tool), stub / tool)
         for name, body in scripts.items():
             (stub / name).write_text('#!/bin/sh\n' + body + '\n')
             (stub / name).chmod(0o755)
-        self.env = {'PATH': f'{stub}:/usr/bin:/bin', 'HOME': str(home)}
+        self.env = {'PATH': str(stub) if no_setpriv else f'{stub}:/usr/bin:/bin', 'HOME': str(home)}
         self.log.write_text('')
         os.makedirs(home, exist_ok=True)
 
@@ -299,7 +329,7 @@ class _StubRootSandbox:
 
     def execute(self, command, cwd=None, timeout=None, raw=False, login=True):
         import subprocess
-        p = subprocess.run(['bash', '-c', self._map(command)], cwd=cwd, env=self.env, capture_output=True,
+        p = subprocess.run([shutil.which('bash'), '-c', self._map(command)], cwd=cwd, env=self.env, capture_output=True,
                            text=True, timeout=60)
         return {'returncode': p.returncode, 'output': p.stdout + p.stderr, 'reason': ''}
 
@@ -356,18 +386,33 @@ def test_lock_down_refuses_unsafe_paths_and_symlinked_dirs(tmp_path):
     outside.mkdir()
     os.symlink(outside, os.path.join(repo, 'linked'))
     env, sb = SweEnv('swe', {}), _StubRootSandbox(tmp_path, tmp_path / 'home')
-    for bad, why in ((b'linked/test_b.py', 'symlink in a test path: linked'), (b'../escape.py', 'unsafe test path'),
-                     (b'/etc/passwd', 'unsafe test path'), (b'tests/../../escape.py', 'unsafe test path')):
+    (outside / 'sub').mkdir()
+    for bad, why in ((b'linked/test_b.py', 'symlink in a test path: linked'),
+                     (b'linked/sub/test_b.py', 'symlink in a test path: linked'),     # deeper dirs are not touched
+                     (b'../escape.py', 'unsafe test path'), (b'/etc/passwd', 'unsafe test path'),
+                     (b'tests/../../escape.py', 'unsafe test path')):
         with pytest.raises(GradeError, match=why):
             env._lock_down(sb, repo, [b'tests/test_a.py', bad])
-    assert not any(str(outside) in c or c.endswith('-- linked') for c in sb.calls())
+    assert not any(str(outside) in c or 'linked' in c for c in sb.calls())
+    assert (outside / 'sub').stat().st_mode & 0o7777 != 0o1777
 
 
 def test_lock_down_fails_loudly_when_the_drop_does_not_work(tmp_path):
     for case, kw, why in (('a', {'setpriv_rc': 127}, 'cannot drop privileges to 65534'),   # e.g. no CAP_SETUID
+                          ('c', {'no_setpriv': True}, 'setpriv not found'),
                           ('b', {'fake_chmod': True}, 'test file still writable after the drop: tests/test_a.py')):
         (tmp_path / case).mkdir()
         repo = _lock_repo(tmp_path / case)
         with pytest.raises(GradeError, match=why):
             SweEnv('swe', {})._lock_down(_StubRootSandbox(tmp_path / case, tmp_path / case / 'home', **kw),
                                          repo, [b'tests/test_a.py'])
+
+
+def test_grader_user_must_be_root_or_nobody(tmp_path):
+    env, task = make_task(tmp_path)
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    env.cfg['grader_user'] = 'nobdy'
+    with pytest.raises(GradeError, match='grader_user must be "root" or "nobody"'):
+        s.grade(env.grade_inputs(task))
+    s.close()
