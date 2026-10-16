@@ -261,3 +261,47 @@ def test_cleanup_waits_until_the_pod_is_gone(tmp_path):
     sb.start()
     with pytest.raises(SandboxError, match='still exists'):
         sb.cleanup()
+
+
+def test_exec_retries_a_failed_handshake_only(monkeypatch):
+    """A 5xx WebSocket handshake means the command never ran: retried. Anything else is not."""
+    kubernetes = pytest.importorskip('kubernetes')
+    stream_mod = pytest.importorskip('kubernetes.stream')
+    from kubernetes.client.rest import ApiException
+
+    from hosted_env.providers.sandbox import k8s
+    monkeypatch.setattr(k8s, 'HANDSHAKE_BACKOFF', 0)
+    cfg = kubernetes.client.Configuration()
+    cfg.host = 'https://cp.test:6443'
+    shared = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(cfg))
+    calls = []
+
+    class Resp:
+        returncode = 0
+
+        def is_open(self):
+            return False
+
+        def close(self):
+            pass
+
+    def flaky(n_fail, err):
+        def fake(method, pod, ns, **kw):
+            calls.append(1)
+            if len(calls) <= n_fail:
+                raise err
+            return Resp()
+        return fake
+    handshake = ApiException(status=0, reason='Handshake status 500 Internal Server Error -+-+- {...}')
+    monkeypatch.setattr(stream_mod, 'stream', flaky(2, handshake))
+    assert k8s.ws_exec(shared, 'hosted-env')('p', ['true'], 5) == (b'', 0, False) and len(calls) == 3
+    calls.clear()
+    monkeypatch.setattr(stream_mod, 'stream', flaky(10, handshake))
+    with pytest.raises(SandboxError, match='Handshake status 500'):
+        k8s.ws_exec(shared, 'hosted-env')('p', ['true'], 5)
+    assert len(calls) == k8s.HANDSHAKE_RETRIES + 1
+    calls.clear()
+    monkeypatch.setattr(stream_mod, 'stream', flaky(10, ApiException(status=403, reason='Forbidden')))
+    with pytest.raises(SandboxError, match='403'):
+        k8s.ws_exec(shared, 'hosted-env')('p', ['true'], 5)
+    assert len(calls) == 1

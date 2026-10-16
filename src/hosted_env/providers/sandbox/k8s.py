@@ -28,6 +28,7 @@ MANAGED_BY = {'app.kubernetes.io/managed-by': 'hosted-env'}
 NETWORK_LABEL = 'hosted-env/network'
 CONTAINER = 'task'
 WRITE_CHUNK = 48 * 1024          # bytes of file content per exec when writing files (base64 grows it by 4/3)
+HANDSHAKE_RETRIES, HANDSHAKE_BACKOFF = 3, 1.0     # exec WebSocket handshakes answered with 5xx (see ws_exec)
 
 # exec_fn(pod, argv, timeout) -> (output bytes with stdout and stderr merged, returncode, timed_out)
 ExecFn = Callable[[str, list[str], float], tuple[bytes, int, bool]]
@@ -134,13 +135,22 @@ def ws_exec(api, namespace: str) -> ExecFn:
         return a
 
     def run(pod: str, argv: list[str], timeout: float) -> tuple[bytes, int, bool]:
-        try:
-            resp = stream(exec_api().connect_get_namespaced_pod_exec, pod, namespace, container=CONTAINER,
-                          command=argv, stdin=False, stdout=True, stderr=True, tty=False, _preload_content=False)
-        except ApiException as e:
-            if e.status == 404:
-                raise SandboxError('pod is gone') from None
-            raise SandboxError(f'exec failed: {e.status} {e.reason}') from None
+        # A failed WebSocket handshake means the command never started, so retrying is safe. On boat nodes the
+        # API server reaches the kubelet through the node's own outbound tunnel, and about 1 in 70 rollouts saw
+        # a handshake answered with 500 (EXP-018): retry those a few times before calling it an infra error.
+        for attempt in range(HANDSHAKE_RETRIES + 1):
+            try:
+                resp = stream(exec_api().connect_get_namespaced_pod_exec, pod, namespace, container=CONTAINER,
+                              command=argv, stdin=False, stdout=True, stderr=True, tty=False,
+                              _preload_content=False)
+                break
+            except ApiException as e:
+                if e.status == 404:
+                    raise SandboxError('pod is gone') from None
+                transient = e.status == 0 and 'Handshake status 5' in str(e.reason)
+                if not transient or attempt == HANDSHAKE_RETRIES:
+                    raise SandboxError(f'exec failed: {e.status} {e.reason}') from None
+                time.sleep(HANDSHAKE_BACKOFF * (attempt + 1))
         buf, deadline, timed_out = bytearray(), time.monotonic() + timeout, False
         try:
             while resp.is_open():
