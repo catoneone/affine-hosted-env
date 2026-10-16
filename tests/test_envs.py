@@ -8,7 +8,7 @@ from conftest import make_swe_tasks
 
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, GradeError, truncate_middle
-from hosted_env.envs.swe import future_commits, patch_touched_files, protected_paths, reset_test_files_cmd
+from hosted_env.envs.swe import future_commits, protected_paths
 from hosted_env.providers.sandbox import LocalSandbox
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
 
@@ -57,15 +57,6 @@ def test_tool_schema_matches_official():
     f = BASH_TOOL['function']
     assert f['name'] == 'bash' and f['parameters']['required'] == ['command']
     assert 'default 60, max 300' in f['description']
-
-
-def test_reset_cmd_covers_added_and_renamed_files():
-    patch = ('diff --git a/tests/test_x.py b/tests/test_x.py\nnew file mode 100644\n'
-             'diff --git a/old.sh b/mimo_test_command.sh\nrename from old.sh\n')
-    assert patch_touched_files(patch) == ['tests/test_x.py', 'old.sh', 'mimo_test_command.sh']
-    cmd = reset_test_files_cmd(patch, 'f' * 40)
-    assert 'git cat-file -e ' + 'f' * 40 in cmd and 'mimo_test_command.sh' in cmd
-    assert reset_test_files_cmd('', 'f' * 40) is None
 
 
 # ---------------------------------------------------------------- end to end on a local git repo
@@ -416,3 +407,17 @@ def test_grader_user_must_be_root_or_nobody(tmp_path):
     with pytest.raises(GradeError, match='grader_user must be "root" or "nobody"'):
         s.grade(env.grade_inputs(task))
     s.close()
+
+
+@pytest.mark.parametrize('shape', [
+    'mkdir mimo_test_command.sh && printf "exit 0\\n" > mimo_test_command.sh/x',   # a dir at the grading script
+    'mkdir -p tests/test_calc.py && printf "x\\n" > tests/test_calc.py/x',          # a dir at a hidden test
+    'printf "x\\n" > tests',                                                     # a file where tests/ goes
+    'mkdir elsewhere && ln -s elsewhere tests',                                   # a symlink where tests/ goes
+])
+def test_model_cannot_block_the_test_patch(tmp_path, shape):
+    """Each of these used to make the trusted test patch fail to apply (reset_tests_failed or
+    apply_test_patch_failed), an infra error the model could trigger at will to void a rollout. The task's
+    test_command and its scripts have fixed, known names (every mimo task runs `bash mimo_test_command.sh`)."""
+    g, _ = graded(tmp_path, shape, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')
+    assert g['reward'] == 1.0

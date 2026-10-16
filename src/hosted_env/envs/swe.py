@@ -18,34 +18,6 @@ import time
 
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
 
-
-def patch_touched_files(patch: str) -> list[str]:
-    files = []
-    for line in patch.split('\n'):
-        m = re.match(r'^diff --git a/(.+?) b/(.+)$', line)
-        if m:
-            for fp in m.groups():
-                if fp not in files:
-                    files.append(fp)
-    return files
-
-
-def reset_test_files_cmd(test_patch: str, base: str) -> str | None:
-    touched = patch_touched_files(test_patch)
-    if not (touched and base):
-        return None
-    return ('while IFS= read -r tf; do\n'
-            '  [ -z "$tf" ] && continue\n'
-            f'  if git cat-file -e {base}:"$tf" 2>/dev/null; then\n'
-            f'    git checkout {base} -- "$tf" 2>/dev/null || true\n'
-            '  else\n'
-            '    git rm -f --cached "$tf" >/dev/null 2>&1 || true\n'
-            '    rm -f "$tf"\n'
-            '  fi\n'
-            "done <<'EOF_RESET_TEST_FILES'\n"
-            + '\n'.join(touched) + '\nEOF_RESET_TEST_FILES\n')
-
-
 _RESIDUE_SCRUB_GLOBAL = (
     "rm -f /tmp/fail.log /tmp/pass.log /tmp/patch.diff /tmp/test_patch.diff /tmp/*.log 2>/dev/null; "
     "rm -rf /tmp/claude-0 /tmp/claude-* /tmp/testem-* /tmp/puppeteer_dev_chrome_profile-* 2>/dev/null; "
@@ -302,7 +274,7 @@ class SweEnv(DockerTaskEnv):
                         login=False)
         if ap['returncode'] != 0:
             sb.execute(f'rm -f {TREE_INDEX_REMOTE}', timeout=60, login=False)
-            return None, ap['output'][-300:]
+            return None, ap['output'][-300:] or f'git apply --cached exited {ap["returncode"]}'
         r = sb.execute(f'set -o pipefail; {idx} git diff --cached --no-renames --no-ext-diff --name-only -z {start} '
                        f'2>/dev/null | base64 | tr -d "\\n"; rc=$?; rm -f {TREE_INDEX_REMOTE}; exit $rc', cwd=repo,
                        timeout=300, login=False)
@@ -322,6 +294,31 @@ class SweEnv(DockerTaskEnv):
                        f'done < {RESET_LIST_REMOTE}; rm -f {RESET_LIST_REMOTE}', cwd=repo, timeout=300, login=False)
         if r['returncode'] != 0:
             raise GradeError('reset_protected_failed: ' + r['output'][-300:])
+
+    def _reset_test_paths(self, sb, repo: str, base: str, paths: list[bytes]) -> None:
+        """Before the test patch goes in: every path it touches is put back to the base commit, or removed when
+        the base does not have it, whatever the model left there. That includes a directory at a file's path
+        (mimo_test_command.sh/x) and a leading component turned into a file or a symlink (tests -> elsewhere):
+        the first such component is removed, then the path itself (rm -rf), so the trusted test patch always
+        applies and the model cannot turn its own rollout into an infra error."""
+        if not paths:
+            return
+        self._put_bytes(sb, b''.join(p + b'\0' for p in paths), RESET_LIST_REMOTE)
+        r = sb.execute(f'''while IFS= read -r -d "" f; do
+  case "/$f/" in //*|*/../*) echo "unsafe test path: $f"; exit 4;; esac
+  a=; rest=$f
+  while :; do                                   # top-down: stop at the first component that is not a real dir
+    c=${{rest%%/*}}; a=${{a:+$a/}}$c
+    [ "$rest" = "$c" ] && break
+    rest=${{rest#*/}}
+    if [ -L "$a" ] || {{ [ -e "$a" ] && [ ! -d "$a" ]; }}; then rm -f -- "$a" || exit 1; break; fi
+  done
+  rm -rf -- "$f" || exit 1
+  if git cat-file -e {base}:"$f" 2>/dev/null; then git checkout -q {base} -- "$f" || exit 1
+  else git rm -rf -q --cached --ignore-unmatch -- "$f" >/dev/null || exit 1; fi
+done < {RESET_LIST_REMOTE}; rm -f {RESET_LIST_REMOTE}''', cwd=repo, timeout=300, login=False)
+        if r['returncode'] != 0:
+            raise GradeError('reset_tests_failed: ' + r['output'][-300:])
 
     def _lock_down(self, sb, repo: str, test_paths: list[bytes]) -> float:
         """Before the hidden tests run as GRADER_UID. The repo and the image's HOME become the grader's, so tests
@@ -409,18 +406,19 @@ fi
                 if touched is not None:
                     ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
                                     timeout=300, login=False)
-                    why = '' if ap['returncode'] == 0 else ap['output'][-300:]
+                    why = '' if ap['returncode'] == 0 else (ap['output'][-300:] or f'exit {ap["returncode"]}')
                 sb.execute(f'rm -f {MODEL_PATCH_REMOTE}', timeout=60, login=False)
                 if touched is None or why:                  # same start tree, so only the patch can be at fault
                     return {**res, 'grade_detail': 'model_patch_does_not_apply: ' + why}
                 prot = protected_paths([p.decode('utf-8', 'surrogateescape') for p in touched])
                 reverted = sorted(set(prot))
                 self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])
-            reset_cmd = reset_test_files_cmd(gi['test_patch'], base)
-            if reset_cmd and sb.execute(reset_cmd, cwd=repo, timeout=300, login=False)['returncode'] != 0:
-                raise GradeError('reset_tests_failed')
             sb.copy_text_to(gi['test_patch'], TEST_PATCH_REMOTE)
-            test_paths = self._patch_paths(sb, repo, TEST_PATCH_REMOTE) if grader == 'nobody' else []
+            test_paths = self._changed_paths(sb, repo, base, TEST_PATCH_REMOTE)[0] if base else None
+            if test_paths is None:                          # does not apply to the base commit: take git's parse
+                test_paths = self._patch_paths(sb, repo, TEST_PATCH_REMOTE)
+            if base:
+                self._reset_test_paths(sb, repo, base, test_paths)
             ap = sb.execute(f'git apply --verbose {TEST_PATCH_REMOTE}', cwd=repo, timeout=300, login=False)
             sb.execute(f'rm -f {TEST_PATCH_REMOTE}', timeout=60, login=False)
             if ap['returncode'] != 0:
