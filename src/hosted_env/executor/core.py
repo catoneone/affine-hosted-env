@@ -15,15 +15,18 @@ the same result (safe for network retries), and non-consecutive seqs are rejecte
 from __future__ import annotations
 
 import concurrent.futures as cf
+import hashlib
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 
 from nacl.signing import SigningKey, VerifyKey
 
+from .. import __version__
 from ..auth import AuthError, verify_token
 from ..common import canonical, key_id, sha256_hex
 from ..envs import SetupError
@@ -39,6 +42,29 @@ log = logging.getLogger('hosted_env.executor')
 # (model_patch and test_output are too large for the log)
 GRADE_LOG_FIELDS = ('grader', 'grader_user', 'lock_seconds', 'grade_detail', 'verifier_returncode',
                     'verifier_reason', 'test_seconds')
+
+
+def _build_version() -> str:
+    """Package version plus the git commit the worker runs from, when it runs from its own checkout (deploys do;
+    not a wheel inside some other repository), and '.dirty' when tracked files differ from that commit."""
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args):
+        return subprocess.run(['git', *args], capture_output=True, text=True, timeout=5, cwd=here)
+    try:
+        top = git('rev-parse', '--show-toplevel').stdout.strip()
+        mine = os.path.join(top, 'src', 'hosted_env', 'executor', 'core.py')
+        if not top or not os.path.isfile(mine) or not os.path.samefile(mine, __file__):
+            return __version__
+        sha = git('rev-parse', '--short=12', 'HEAD').stdout.strip()
+        dirty = git('status', '--porcelain', '--untracked-files=no').stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return __version__
+    return f'{__version__}+g{sha}{".dirty" if dirty else ""}' if sha else __version__
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest() if text else ''
 
 
 class WorkerError(Exception):
@@ -99,6 +125,7 @@ class Worker:
         self.worker_id, self.key, self.gw, self.gateway_pub = worker_id, key, gateway, gateway_pub
         self.k8s_api = k8s_api          # (CoreV1Api, NetworkingV1Api); created on first k8s sandbox if None
         self.key_id = key_id(key.verify_key)
+        self.build_version = _build_version()
         self.runtimes, self.public_url, self.capacity = runtimes, public_url, capacity
         self.idle_ttl, self.retention = idle_ttl, retention
         self.images = image_cache or ImageCache()
@@ -370,9 +397,24 @@ class Worker:
         s.last_activity = time.time()
         return {'status': 'ok', 'seq': seq, 'done': False, 'tool_tokens': delta}
 
+    def _receipt_context(self, s: RolloutSession, gi: dict, grade: dict) -> dict:
+        """receipt.CONTEXT_FIELDS for this rollout. Grading fields are empty ('' / None) when it was not graded."""
+        r = s.rt.renderer
+        spec = s.envsess.spec if s.envsess is not None else {}
+        rc = grade.get('verifier_returncode')
+        state = s.envsess.state if s.envsess is not None else {}
+        return {'image': str(spec.get('image', '')), 'start_tree': str(state.get('start_tree', '')),
+                'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
+                'test_command_sha256': _sha256_text(gi.get('test_command', '')),
+                'grader': str(grade.get('grader', '')), 'grader_user': str(grade.get('grader_user', '')),
+                'model_patch_sha256': str(grade.get('model_patch_sha256', '')),
+                'verifier_returncode': rc if type(rc) is int else None,
+                'model_id': r.model_id, 'model_revision': r.model_revision, **r.identity,
+                'executor_version': self.build_version, 'started_at_ms': int(s.started * 1000)}
+
     def _finish(self, s: RolloutSession, seq: int, outcome: str, detail: str) -> dict:
         """Grade -> sign receipt -> report to gateway -> return."""
-        reward, grade = 0.0, {}
+        reward, grade, gi = 0.0, {}, {}
         if outcome != 'infra_error':
             try:
                 gi = self.gw.grade_inputs(s.sid)
@@ -383,7 +425,8 @@ class Worker:
         c = s.claims
         receipt = sign_receipt(self.key, self.key_id, epoch=c['epoch'], hotkey=c['hotkey'], env_id=c['env_id'],
                                task=c['task'], nonce=c['nonce'], trajectory_sha256=s.hasher.hexdigest(),
-                               n_tokens=s.hasher.n_tokens, outcome=outcome, reward=reward)
+                               n_tokens=s.hasher.n_tokens, outcome=outcome, reward=reward,
+                               context=self._receipt_context(s, gi, grade))
         self._log({'sid': s.sid, 'event': 'finish', 'task': c['task'], 'nonce': c['nonce'], 'outcome': outcome,
                    'detail': detail, 'reward': reward, 'steps': s.steps, 'n_tokens': s.hasher.n_tokens,
                    'wall_seconds': round(time.time() - s.started, 1), **s.stats,
@@ -394,7 +437,8 @@ class Worker:
         except GatewayUnavailable:
             log.error('could not report close for %s', s.sid)
         res = {'status': 'ok', 'seq': seq, 'done': True, 'outcome': outcome, 'reward': reward, 'detail': detail,
-               'steps': s.steps, 'receipt': receipt}
+               'steps': s.steps, 'receipt': receipt,
+               'model_patch': grade.get('model_patch_b64', '')}     # base64; its sha256 is in the receipt
         s.final = res
         s.last_activity = time.time()
         return res

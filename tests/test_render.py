@@ -79,3 +79,27 @@ def test_hf_renderer(name, thinking):
     assert TOOL_A['content'] in delta and delta.rstrip().endswith(('assistant', '<think>', '</think>'))
     if name == 'mimo':
         assert delta.startswith('<|im_start|>tool\n')
+
+
+def test_tokenizer_digest_and_pin(tmp_path):
+    """The digest covers the named tokenizer files only (not weights or configs), in a fixed order, and the
+    worker refuses to start when the files differ from the pinned tokenizer_sha256."""
+    from hosted_env.render import make_renderer, tokenizer_digest
+    for bad in (str(tmp_path), str(tmp_path / 'nope'), 'Qwen/Qwen3-8B'):     # nothing to commit to: refused
+        with pytest.raises(ValueError, match='not a local tokenizer directory'):
+            tokenizer_digest(bad)
+        with pytest.raises(ValueError, match='not a local tokenizer directory'):
+            make_renderer({'kind': 'hf', 'path': bad})
+    (tmp_path / 'tokenizer.json').write_text('{"v": 1}')
+    (tmp_path / 'chat_template.jinja').write_text('{{ messages }}')
+    d = tokenizer_digest(str(tmp_path))
+    (tmp_path / 'config.json').write_text('{}')                        # not a tokenizer file: same digest
+    (tmp_path / 'model-00001.safetensors').write_bytes(b'\0' * 8)
+    assert tokenizer_digest(str(tmp_path)) == d
+    (tmp_path / 'tokenizer.json').write_text('{"v": 2}')
+    assert tokenizer_digest(str(tmp_path)) != d
+    r = make_renderer({'kind': 'char', 'model_id': 'm/x', 'revision': 'abc'})
+    assert (r.model_id, r.model_revision) == ('m/x', 'abc') and len(r.identity['tokenizer_sha256']) == 64
+    make_renderer({'kind': 'char', 'tokenizer_sha256': r.identity['tokenizer_sha256']})
+    with pytest.raises(ValueError, match='do not match tokenizer_sha256'):
+        make_renderer({'kind': 'char', 'tokenizer_sha256': '0' * 64})

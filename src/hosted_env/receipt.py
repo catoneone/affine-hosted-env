@@ -11,6 +11,12 @@
   hash from the uploaded tokens, then use the outcome / reward from the receipt. Model tokens are still verified
   with the sampling proof as before.
 - The source tags double as the loss mask: only M segments are trained on (`loss_mask`).
+- v2 also binds what the reward is a function of (CONTEXT_FIELDS), so a verifier can replay the grading offline
+  and tie the tokens to a tokenizer: the task (image digest, test patch, test command), the grading (grader
+  version and user, the model's patch, the verifier's exit code), the model side (model id and revision as the
+  worker is configured, tokenizer and chat-template hashes, renderer) and the worker build, with times in
+  milliseconds. The model id is the worker's configuration, not a proof: which model produced the M tokens is
+  still shown by the sampling proof, and trajectory_sha256 ties both to the same tokens.
 
 This module depends only on PyNaCl and the standard library and can be copied upstream as-is.
 """
@@ -27,10 +33,30 @@ from nacl.signing import SigningKey, VerifyKey
 from .common import b64u, canonical, sign, unb64u, verify
 
 TRAJ_DOMAIN = b'affine-hosted-env-trajectory-v1'
-RECEIPT_DOMAIN = b'affine-hosted-env-receipt-v1|'
+RECEIPT_DOMAIN = b'affine-hosted-env-receipt-v2|'
 SOURCES = ('P', 'M', 'T')   # P=task prompt from the environment, M=model generated, T=tool output (environment generated)
 OUTCOMES = ('completed', 'unresolved', 'infra_error')
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
+_HEX = frozenset('0123456789abcdef')
+# Field -> type. *_sha256 fields are lowercase hex SHA-256 or '' (not known: e.g. a rollout that never got graded);
+# start_tree is a 40-hex git tree id or ''; verifier_returncode is None when no verifier ran.
+CONTEXT_FIELDS = {
+    'image': str,                   # name@sha256:... the rollout and its grading ran in
+    'start_tree': str,              # git tree the model started from (after setup); the patch applies to it
+    'test_patch_sha256': str,       # of the hidden test patch text (UTF-8)
+    'test_command_sha256': str,     # of the test command text (UTF-8)
+    'grader': str,                  # grading semantics version, e.g. isolated-v2
+    'grader_user': str,             # who the hidden tests ran as: nobody or root
+    'model_patch_sha256': str,      # of the model's patch bytes as graded (the attachment carries the patch)
+    'verifier_returncode': (int, type(None)),
+    'model_id': str,                # as configured on the worker
+    'model_revision': str,
+    'tokenizer_sha256': str,        # of the tokenizer files the worker rendered with (render.tokenizer_digest)
+    'chat_template_sha256': str,
+    'renderer': str,                # renderer kind and library version
+    'executor_version': str,
+    'started_at_ms': int,
+}
 
 
 class ReceiptError(Exception):
@@ -98,17 +124,36 @@ def loss_mask(segments) -> list[int]:
     return [1 if src == 'M' else 0 for src, ids in as_segments(segments) for _ in ids]
 
 
+def _context_problem(ctx: Mapping) -> str | None:
+    if not isinstance(ctx, Mapping):
+        return 'context is not a mapping'
+    for k, t in CONTEXT_FIELDS.items():
+        if k not in ctx:
+            return f'missing {k}'
+        v = ctx[k]
+        if not isinstance(v, t) or isinstance(v, bool):
+            return f'bad type for {k}'
+        n = 64 if k.endswith('_sha256') else 40 if k == 'start_tree' else 0
+        if n and v and (len(v) != n or not set(v) <= _HEX):
+            return f'bad digest for {k}'
+    return None
+
+
 def sign_receipt(worker_key: SigningKey, key_id: str, *, epoch: str, hotkey: str, env_id: str, task: str,
                  nonce: int, trajectory_sha256: str, n_tokens: int, outcome: str, reward: float,
-                 issued_at: int | None = None) -> dict:
+                 context: Mapping, issued_at_ms: int | None = None) -> dict:
     """Worker side: issued after the rollout ends and is graded. trajectory_sha256 / n_tokens come from the
-    worker's TrajectoryHasher."""
+    worker's TrajectoryHasher; context holds exactly the CONTEXT_FIELDS."""
     if outcome not in OUTCOMES:
         raise ValueError('bad outcome')
-    payload = {'v': RECEIPT_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
+    problem = _context_problem(context)
+    if problem or set(context) != set(CONTEXT_FIELDS):
+        raise ValueError(f'bad receipt context: {problem or "unknown fields"}')
+    if issued_at_ms is None:                    # never before the start, even if the wall clock stepped back
+        issued_at_ms = max(int(time.time() * 1000), context['started_at_ms'])
+    payload = {**context, 'v': RECEIPT_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
                'nonce': nonce, 'trajectory_sha256': trajectory_sha256, 'n_tokens': n_tokens, 'outcome': outcome,
-               'reward': float(reward), 'key_id': key_id,
-               'issued_at': int(time.time()) if issued_at is None else issued_at}
+               'reward': float(reward), 'key_id': key_id, 'issued_at_ms': issued_at_ms}
     body = canonical(payload)
     return {'payload': b64u(body), 'sig': b64u(sign(worker_key, RECEIPT_DOMAIN, body))}
 
@@ -122,10 +167,12 @@ def read_receipt(receipt: Mapping) -> dict:
 
 
 def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, VerifyKey], *, epoch: str, hotkey: str,
-                   env_id: str, task: str, nonce: int) -> dict:
+                   env_id: str, task: str, nonce: int, expect: Mapping | None = None) -> dict:
     """Validator / trainer side. segments is the [(source, token ids)] of this rollout as uploaded by the miner;
-    trusted_keys are the worker public keys {key_id: VerifyKey} from this epoch's opening. Returns the receipt
-    contents (including outcome and reward) on success, otherwise raises ReceiptError."""
+    trusted_keys are the worker public keys {key_id: VerifyKey} from this epoch's opening. expect optionally pins
+    context fields to the values the verifier knows (the task's image and test hashes from its own copy of the
+    task pool, the tokenizer it trains with). Returns the receipt contents (including outcome and reward) on
+    success, otherwise raises ReceiptError."""
     try:
         body, sig = unb64u(receipt['payload']), unb64u(receipt['sig'])
         claims = json.loads(body)
@@ -140,8 +187,15 @@ def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, Verify
                 'nonce': nonce}
     if any(claims.get(k) != v or type(claims.get(k)) is not type(v) for k, v in expected.items()):
         raise ReceiptError('identity_mismatch')         # another task, another nonce, someone else's receipt
-    if claims.get('outcome') not in OUTCOMES:
+    issued, started = claims.get('issued_at_ms'), claims.get('started_at_ms')
+    if (claims.get('outcome') not in OUTCOMES or _context_problem(claims) or type(issued) is not int
+            or started > issued):
         raise ReceiptError('malformed_receipt')
+    for k, v in (expect or {}).items():
+        if k not in CONTEXT_FIELDS:
+            raise ValueError(f'expect: {k!r} is not a receipt context field')     # the caller's mistake
+        if claims[k] != v or type(claims[k]) is not type(v):
+            raise ReceiptError('context_mismatch')      # e.g. another image, test patch or tokenizer than expected
     try:
         digest, n = trajectory_sha256(segments)
     except (ValueError, TypeError, KeyError):

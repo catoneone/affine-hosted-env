@@ -141,14 +141,16 @@ class WorkerClient:
 
 
 def run_rollout(worker: WorkerClient, token: str, sampler: Sampler, *, nonce: int = 0) -> dict:
-    """Run one rollout to completion; returns {nonce, segments, receipt, outcome, reward, detail, steps}.
+    """Run one rollout to completion; returns {nonce, segments, receipt, model_patch, outcome, reward, detail,
+    steps}. model_patch is the graded patch, base64 (the attachment carries it so verifiers can re-grade).
     outcome 'voided' means the gateway voided the whole task while this rollout ran (a sibling hit an infra
     error): there is no receipt and nothing to upload."""
     segs: list[dict] = []
     try:
         r = worker.start(token)
         if r.get('done'):                              # infra error already during setup
-            return {'nonce': nonce, 'segments': [], 'receipt': r.get('receipt'), 'outcome': r['outcome'],
+            return {'nonce': nonce, 'segments': [], 'receipt': r.get('receipt'),
+                    'model_patch': r.get('model_patch', ''), 'outcome': r['outcome'],
                     'reward': r.get('reward', 0.0), 'detail': r.get('detail'), 'steps': 0}
         ctx = list(r['prompt_tokens'])
         segs = [{'src': 'P', 'ids': list(r['prompt_tokens'])}]
@@ -162,7 +164,8 @@ def run_rollout(worker: WorkerClient, token: str, sampler: Sampler, *, nonce: in
             segs.append({'src': 'M', 'ids': out})
             ctx += out
             if r['done']:
-                return {'nonce': nonce, 'segments': segs, 'receipt': r['receipt'], 'outcome': r['outcome'],
+                return {'nonce': nonce, 'segments': segs, 'receipt': r['receipt'],
+                        'model_patch': r.get('model_patch', ''), 'outcome': r['outcome'],
                         'reward': r['reward'], 'detail': r.get('detail'), 'steps': r.get('steps', seq)}
             segs.append({'src': 'T', 'ids': list(r['tool_tokens'])})
             ctx += r['tool_tokens']
@@ -170,7 +173,8 @@ def run_rollout(worker: WorkerClient, token: str, sampler: Sampler, *, nonce: in
     except ApiError as e:
         if e.status != 410:
             raise
-        return {'nonce': nonce, 'segments': segs, 'receipt': None, 'outcome': 'voided', 'reward': 0.0,
+        return {'nonce': nonce, 'segments': segs, 'receipt': None, 'model_patch': '', 'outcome': 'voided',
+                'reward': 0.0,
                 'detail': f'{e.code} {e.detail}'.strip(), 'steps': 0}
 
 
@@ -195,7 +199,8 @@ def run_task(gateway: GatewayClient, epoch: str, env_id: str, sampler: Sampler, 
     voided = any(x['outcome'] in ('voided', 'infra_error') for x in results)
     attachment = None if voided else {
         'version': GROUP_ATTACHMENT_VERSION, 'env_id': t['env_id'], 'task': t['task'],
-        'rollouts': [{'nonce': x['nonce'], 'segments': x['segments'], 'receipt': x['receipt']}
+        'rollouts': [{'nonce': x['nonce'], 'segments': x['segments'], 'receipt': x['receipt'],
+                      'model_patch': x['model_patch']}
                      for x in sorted(results, key=lambda x: x['nonce'])]}
     return {'task': t, 'rollouts': results, 'attachment': attachment, 'voided': voided}
 
