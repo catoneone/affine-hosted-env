@@ -22,7 +22,7 @@ from collections.abc import Mapping
 
 from nacl.signing import VerifyKey
 
-from .receipt import ReceiptError, as_segments, loss_mask, verify_receipt
+from .receipt import ReceiptError, as_segments, check_expect, loss_mask, verify_receipt
 
 GROUP_ATTACHMENT_VERSION = 'hosted-env-group-v2'
 MAX_MODEL_PATCH_BYTES = 2_000_000          # the worker never grades a larger patch (envs.swe.MAX_MODEL_PATCH_BYTES)
@@ -48,6 +48,7 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
     """On success returns {'claims': [receipt contents ordered by nonce], 'loss_masks': [...], 'segments': [...],
     'model_patches': [patch bytes ...]}. expect is passed to every verify_receipt (e.g. the task's image and
     test hashes from the verifier's own task pool, its tokenizer_sha256)."""
+    check_expect(expect)
     if not isinstance(attachment, Mapping) or attachment.get('version') != GROUP_ATTACHMENT_VERSION:
         raise ReceiptError('bad_attachment_version')
     if attachment.get('env_id') != env_id or attachment.get('task') != task:

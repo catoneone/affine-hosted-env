@@ -64,8 +64,10 @@ def test_expect_pins_context(setup):
             verify_receipt(r, SEGS, keys, **ID, expect={k: v})
     with pytest.raises(ReceiptError, match='context_mismatch'):              # type-strict: 0 is not False
         verify_receipt(r, SEGS, keys, **ID, expect={'verifier_returncode': False})
-    with pytest.raises(ValueError, match='not a receipt context field'):     # a typo must not pass silently
+    with pytest.raises(ValueError, match='not receipt context fields'):      # a typo must not pass silently,
         verify_receipt(r, SEGS, keys, **ID, expect={'tokenizer_sha': 'e' * 64})
+    with pytest.raises(ValueError, match='not receipt context fields'):      # even on a receipt that fails anyway
+        verify_receipt({}, SEGS, keys, **ID, expect={'tokenizer_sha': 'e' * 64})
 
 
 def test_v1_and_hand_made_payloads_are_rejected(setup):

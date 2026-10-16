@@ -90,6 +90,12 @@ def test_tokenizer_digest_and_pin(tmp_path):
             tokenizer_digest(bad)
         with pytest.raises(ValueError, match='not a local tokenizer directory'):
             make_renderer({'kind': 'hf', 'path': bad})
+    unnamed = tmp_path / 'unnamed'                  # the class would come from config.json, outside the digest
+    unnamed.mkdir()
+    (unnamed / 'tokenizer.json').write_text('{}')
+    (unnamed / 'tokenizer_config.json').write_text('{"model_max_length": 8}')
+    with pytest.raises(ValueError, match='must name tokenizer_class'):
+        make_renderer({'kind': 'hf', 'path': str(unnamed)})
     (tmp_path / 'tokenizer.json').write_text('{"v": 1}')
     (tmp_path / 'chat_template.jinja').write_text('{{ messages }}')
     d = tokenizer_digest(str(tmp_path))

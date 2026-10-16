@@ -57,10 +57,11 @@ def _build_version() -> str:
         if not top or not os.path.isfile(mine) or not os.path.samefile(mine, __file__):
             return __version__
         sha = git('rev-parse', '--short=12', 'HEAD').stdout.strip()
-        dirty = git('status', '--porcelain', '--untracked-files=no').stdout.strip()
+        st = git('status', '--porcelain', '--untracked-files=no')
     except (OSError, subprocess.SubprocessError):
         return __version__
-    return f'{__version__}+g{sha}{".dirty" if dirty else ""}' if sha else __version__
+    mark = '.unknown' if st.returncode != 0 else '.dirty' if st.stdout.strip() else ''   # never claim clean unchecked
+    return f'{__version__}+g{sha}{mark}' if sha else __version__
 
 
 def _sha256_text(text: str) -> str:

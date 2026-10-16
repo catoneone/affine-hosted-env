@@ -47,7 +47,8 @@ CONTEXT_FIELDS = {
     'test_command_sha256': str,     # of the test command text (UTF-8)
     'grader': str,                  # grading semantics version, e.g. isolated-v2
     'grader_user': str,             # who the hidden tests ran as: nobody or root
-    'model_patch_sha256': str,      # of the model's patch bytes as graded (the attachment carries the patch)
+    'model_patch_sha256': str,      # of the model's patch bytes as captured, before the grader put protected test
+                                    # infrastructure back (a re-grader applies the same rule); the attachment has it
     'verifier_returncode': (int, type(None)),
     'model_id': str,                # as configured on the worker
     'model_revision': str,
@@ -166,6 +167,14 @@ def read_receipt(receipt: Mapping) -> dict:
         raise ReceiptError('malformed_receipt') from None
 
 
+def check_expect(expect: Mapping | None) -> None:
+    """The verifier's own `expect` names only context fields: a typo raises ValueError up front, whatever the
+    receipts look like."""
+    bad = sorted(set(expect or {}) - set(CONTEXT_FIELDS))
+    if bad:
+        raise ValueError(f'expect: not receipt context fields: {bad}')
+
+
 def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, VerifyKey], *, epoch: str, hotkey: str,
                    env_id: str, task: str, nonce: int, expect: Mapping | None = None) -> dict:
     """Validator / trainer side. segments is the [(source, token ids)] of this rollout as uploaded by the miner;
@@ -173,6 +182,7 @@ def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, Verify
     context fields to the values the verifier knows (the task's image and test hashes from its own copy of the
     task pool, the tokenizer it trains with). Returns the receipt contents (including outcome and reward) on
     success, otherwise raises ReceiptError."""
+    check_expect(expect)
     try:
         body, sig = unb64u(receipt['payload']), unb64u(receipt['sig'])
         claims = json.loads(body)
@@ -192,8 +202,6 @@ def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, Verify
             or started > issued):
         raise ReceiptError('malformed_receipt')
     for k, v in (expect or {}).items():
-        if k not in CONTEXT_FIELDS:
-            raise ValueError(f'expect: {k!r} is not a receipt context field')     # the caller's mistake
         if claims[k] != v or type(claims[k]) is not type(v):
             raise ReceiptError('context_mismatch')      # e.g. another image, test patch or tokenizer than expected
     try:
