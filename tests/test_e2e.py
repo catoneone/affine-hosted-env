@@ -58,7 +58,7 @@ class Server:
 @pytest.fixture
 def stack(tmp_path):
     path, ids = make_swe_tasks(tmp_path, n=2)
-    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False}
+    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}
     gkey, wkey = SigningKey.generate(), SigningKey.generate()
     miners = {'5H0': SigningKey.generate(), '5H1': SigningKey.generate()}
     roster = tmp_path / 'roster.json'
@@ -171,7 +171,7 @@ def test_single_process_group_and_data_plane_limit(tmp_path):
             return wait
 
     path, ids = make_swe_tasks(tmp_path, n=1)
-    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False}
+    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}
     gkey, wkey, miner = SigningKey.generate(), SigningKey.generate(), SigningKey.generate()
     roster = tmp_path / 'roster.json'
     roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {'5H0': {'uid': 0,

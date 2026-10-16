@@ -4,14 +4,16 @@ aligned with mimoagent opensource_code.py).
 - setup: truncate git history to the base commit (class-C images carry upstream remotes/origin/*; cleaned in place
   following the official strip implementation), restore environment variables lost from the image (in
   DockerSandbox), optional anti_hack_cleanup (enabled in mini-bash.yaml).
-- Grading: capture the model's changes -> restore the paths touched by test_patch to the base commit -> git apply
-  test_patch -> run test_command; exit code 0 scores 1; a patch that does not apply is an infra error; test files
-  are restored both before and after grading.
+- Grading (SweEnv.grade), in a fresh container of the same image: apply the model's diff from the start tree, put
+  protected test infrastructure back, apply test_patch, lock the test files and run test_command as nobody (cfg
+  grader_user = "root" opts out); exit code 0 scores 1. A test patch that does not apply, or a runtime that
+  cannot drop privileges, is an infra error (GradeError), never a reward of 0.
 """
 from __future__ import annotations
 
 import base64
 import re
+import shlex
 import time
 
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
@@ -134,8 +136,19 @@ TEST_PATCH_REMOTE = '/tmp/_hosted_env_test.patch'
 MODEL_PATCH_REMOTE = '/tmp/_hosted_env_model.patch'
 RESET_LIST_REMOTE = '/tmp/_hosted_env_reset.list'
 TREE_INDEX_REMOTE = '/tmp/_hosted_env_tree.index'
+LOCK_LIST_REMOTE = '/tmp/_hosted_env_lock.list'
+GRADER_UID = 65534                     # nobody: the hidden tests run without root (cfg grader_user = "root" to opt out)
+# no_new_privs: setuid-root binaries in the image (sudo, su, ...) cannot hand root back to the code under test
+DROP_PRIVS = f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups --no-new-privs --'
 MAX_MODEL_PATCH_BYTES = 2_000_000
-GRADER_VERSION = 'isolated-v1'
+GRADER_VERSION = 'isolated-v2'         # v1: isolated container, tests as root; v2: tests as GRADER_UID unless opted out
+
+
+def as_grader(command: str) -> str:
+    """Run `command` as GRADER_UID with no supplementary groups, no way to regain privileges, and no profile or rc
+    file. HOME stays the image's (its caches and toolchains: Go module cache, nvm, cargo, ...), which _lock_down
+    hands to the grader."""
+    return f'{DROP_PRIVS} env USER=nobody LOGNAME=nobody bash --noprofile --norc -c {shlex.quote(command)}'
 
 # Test infrastructure the model's patch must not change: anything here that the patch touches is put back to the
 # base commit in the grading container before the hidden tests run (the test_patch files are handled separately).
@@ -256,7 +269,7 @@ class SweEnv(DockerTaskEnv):
         r = sb.execute(f'set -o pipefail; git apply --numstat -z {path} | base64 | tr -d "\\n"', cwd=repo,
                        timeout=120, login=False)
         if r['returncode'] != 0:
-            raise GradeError('cannot list model patch paths: ' + r['output'][-300:])
+            raise GradeError(f'cannot list the paths of {path}: ' + r['output'][-300:])
         items, out, i = base64.b64decode(r['output'].strip()).split(b'\0'), [], 0
         while i < len(items):
             fields = items[i].split(b'\t')
@@ -281,6 +294,60 @@ class SweEnv(DockerTaskEnv):
                        f'done < {RESET_LIST_REMOTE}; rm -f {RESET_LIST_REMOTE}', cwd=repo, timeout=300, login=False)
         if r['returncode'] != 0:
             raise GradeError('reset_protected_failed: ' + r['output'][-300:])
+
+    def _lock_down(self, sb, repo: str, test_paths: list[bytes]) -> float:
+        """Before the hidden tests run as GRADER_UID. The repo and the image's HOME become the grader's, so tests
+        write caches and scratch files exactly where they would as root (pytest cache, rollup temp configs, the
+        Go build cache, nvm/cargo toolchains). The test infrastructure stays root's: every file of the test patch
+        (`test_paths`, as git parses the patch) is root-owned and read-only, and each directory holding one, up to
+        the repo root, is root-owned with mode 1777 (like /tmp); so are the repo's ancestors inside HOME. What this
+        guarantees: the grader cannot modify, replace, rename or delete the existing test files and grading scripts
+        (nor the repo itself) while they run. What it does not: it can still create new files next to them (a
+        conftest.py in a directory pytest has not collected yet) and change everything else in the repo, and the
+        code under test can still end its own test process with exit 0. Before returning, the drop is tried for
+        real, so a runtime that cannot drop privileges is a GradeError rather than a reward of 0 for every
+        rollout. Returns the seconds it took. (EXP-018 parity runs: a read-only repo root broke pytest with -W
+        error and rollup; a changed HOME hid the Go module cache.)"""
+        t0 = time.time()
+        self._put_bytes(sb, b''.join(p + b'\0' for p in test_paths), LOCK_LIST_REMOTE)
+        r = sb.execute(f'''set -e
+command -v setpriv >/dev/null || {{ echo "setpriv not found: cannot drop privileges"; exit 3; }}
+repo=$(pwd -P)
+chown -R {GRADER_UID}:{GRADER_UID} .
+h="${{HOME:-/root}}"
+if [ -d "$h" ]; then h=$(cd "$h" && pwd -P); else h=/; fi
+if [ "$h" != / ]; then
+  chown -R {GRADER_UID}:{GRADER_UID} "$h"
+  d=$(dirname -- "$repo")
+  while [ "$d" != / ]; do
+    case "$d/" in "$h"/*) chown -h 0:0 -- "$d"; chmod 1777 -- "$d";; esac
+    d=$(dirname -- "$d")
+  done
+fi
+probe=
+while IFS= read -r -d "" f; do
+  case "/$f/" in //*|*/../*) echo "unsafe test path: $f"; exit 4;; esac
+  d=$(dirname -- "$f")
+  while [ "$d" != . ]; do
+    if [ -L "$d" ]; then echo "symlink in a test path: $d"; exit 4; fi
+    if [ -d "$d" ]; then chown -h 0:0 -- "$d"; chmod 1777 -- "$d"; fi
+    d=$(dirname -- "$d")
+  done
+  [ -e "$f" ] || [ -L "$f" ] || continue
+  chown -h 0:0 -- "$f"
+  if [ ! -L "$f" ]; then chmod a-w -- "$f"; [ -n "$probe" ] || [ ! -f "$f" ] || probe=$f; fi
+done < {LOCK_LIST_REMOTE}
+rm -f {LOCK_LIST_REMOTE}
+chown 0:0 .; chmod 1777 .
+{DROP_PRIVS} sh -c 'test "$(id -u)" = {GRADER_UID} && test "$(id -g)" = {GRADER_UID}' \\
+  || {{ echo "cannot drop privileges to {GRADER_UID} in this runtime"; exit 3; }}
+if [ -n "$probe" ]; then
+  {DROP_PRIVS} sh -c 'test ! -w "$1"' _ "$probe" || {{ echo "test file still writable after the drop: $probe"; exit 3; }}
+fi
+''', cwd=repo, timeout=900, login=False)
+        if r['returncode'] != 0:
+            raise GradeError('cannot prepare non-root grading: ' + r['output'][-300:])
+        return round(time.time() - t0, 1)
 
     def grade(self, s: EnvSession, gi: dict) -> dict:
         repo = s.spec['cwd']
@@ -315,12 +382,18 @@ class SweEnv(DockerTaskEnv):
             if reset_cmd and sb.execute(reset_cmd, cwd=repo, timeout=300, login=False)['returncode'] != 0:
                 raise GradeError('reset_tests_failed')
             sb.copy_text_to(gi['test_patch'], TEST_PATCH_REMOTE)
+            grader = 'root' if self.cfg.get('grader_user', 'nobody') == 'root' else 'nobody'
+            test_paths = self._patch_paths(sb, repo, TEST_PATCH_REMOTE) if grader == 'nobody' else []
             ap = sb.execute(f'git apply --verbose {TEST_PATCH_REMOTE}', cwd=repo, timeout=300, login=False)
             sb.execute(f'rm -f {TEST_PATCH_REMOTE}', timeout=60, login=False)
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
+            test_cmd, res['grader_user'] = gi['test_command'], grader
+            if grader == 'nobody':
+                res['lock_seconds'] = self._lock_down(sb, repo, test_paths)
+                test_cmd = as_grader(test_cmd)
             t0 = time.time()
-            r = sb.execute(gi['test_command'], cwd=repo, timeout=gi['verifier_timeout'], login=False)
+            r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
             return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                     'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
                     'test_output': r['output'][-3000:], 'reverted_paths': reverted}

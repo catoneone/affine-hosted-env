@@ -7,7 +7,7 @@ import pytest
 from conftest import make_swe_tasks
 
 from hosted_env.envs import SweEnv
-from hosted_env.envs.base import BASH_TOOL, truncate_middle
+from hosted_env.envs.base import BASH_TOOL, GradeError, truncate_middle
 from hosted_env.envs.swe import future_commits, patch_touched_files, protected_paths, reset_test_files_cmd
 from hosted_env.providers.sandbox import LocalSandbox
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
@@ -72,7 +72,7 @@ def test_reset_cmd_covers_added_and_renamed_files():
 
 def make_task(tmp_path):
     path, ids = make_swe_tasks(tmp_path)
-    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False}), ids[0]
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}), ids[0]
 
 
 def open_local(env, task, tmp_path):
@@ -127,7 +127,8 @@ def graded(tmp_path, *cmds, in_place_check=False, image_prep=None):
 def test_honest_fix_scores_and_is_kept(tmp_path):
     g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
                   'printf "notes\\n" > NOTES.md', 'mkdir -p pkg && printf "x = 1\\n" > pkg/helper.py')
-    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v1' and g['reverted_paths'] == []
+    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v2' and g['reverted_paths'] == []
+    assert g['grader_user'] == 'root' and 'lock_seconds' not in g
     assert 'a + b' in g['model_patch'] and 'pkg/helper.py' in g['model_patch']
 
 
@@ -249,3 +250,124 @@ def test_local_sandbox_map_root_under_tmp(tmp_path):
     assert sb._map('/var/tmp/k $HOME/tmp/q') == '/var/tmp/k $HOME/tmp/q'
     sb.root = real_root
     sb.cleanup()
+
+
+def test_as_grader_drops_root_and_quotes_the_command():
+    import shlex
+
+    from hosted_env.envs.swe import GRADER_UID, as_grader
+    cmd = as_grader("bash /testbed/mimo_test_command.sh; echo 'it''s' \"$HOME\"")
+    argv = shlex.split(cmd)
+    assert argv[:6] == ['setpriv', f'--reuid={GRADER_UID}', f'--regid={GRADER_UID}', '--clear-groups',
+                        '--no-new-privs', '--']
+    assert argv[6:9] == ['env', 'USER=nobody', 'LOGNAME=nobody']                    # HOME stays the image's
+    assert argv[9:12] == ['bash', '--noprofile', '--norc'] and argv[12] == '-c'
+    assert argv[13] == "bash /testbed/mimo_test_command.sh; echo 'it''s' \"$HOME\""   # passed through intact
+    assert SweEnv('swe', {}).cfg.get('grader_user', 'nobody') == 'nobody'          # non-root is the default
+
+
+class _StubRootSandbox:
+    """Runs _lock_down's script with bash on the host, with chown, setpriv and id stubbed (the test is not root):
+    chown only logs, setpriv drops nothing but makes the stub id report 65534, chmod logs and really runs unless
+    `fake_chmod` is set. The /tmp paths the env uses are mapped under `tmp`."""
+
+    def __init__(self, tmp, home, setpriv_rc=None, fake_chmod=False):
+        import os
+        self.tmp, self.log, stub = str(tmp), tmp / 'calls.log', tmp / 'bin'
+        stub.mkdir()
+        scripts = {
+            'chown': f'echo chown "$@" >> {self.log}',
+            'chmod': f'echo chmod "$@" >> {self.log}' + ('' if fake_chmod else         # BSD chmod: no `--`
+                                                          '\nm=$1; shift; [ "$1" = -- ] && shift\nexec /bin/chmod "$m" "$@"'),
+            'setpriv': (f'exit {setpriv_rc}' if setpriv_rc is not None else
+                        'while [ "$1" != -- ]; do shift; done; shift\nFAKE_UID=65534 exec "$@"'),
+            'id': 'echo "${FAKE_UID:-0}"',
+        }
+        for name, body in scripts.items():
+            (stub / name).write_text('#!/bin/sh\n' + body + '\n')
+            (stub / name).chmod(0o755)
+        self.env = {'PATH': f'{stub}:/usr/bin:/bin', 'HOME': str(home)}
+        self.log.write_text('')
+        os.makedirs(home, exist_ok=True)
+
+    def _map(self, s):
+        return s.replace('/tmp/_hosted_env', self.tmp + '/_hosted_env')
+
+    def copy_text_to(self, text, path):
+        with open(self._map(path), 'w') as f:
+            f.write(text)
+
+    def execute(self, command, cwd=None, timeout=None, raw=False, login=True):
+        import subprocess
+        p = subprocess.run(['bash', '-c', self._map(command)], cwd=cwd, env=self.env, capture_output=True,
+                           text=True, timeout=60)
+        return {'returncode': p.returncode, 'output': p.stdout + p.stderr, 'reason': ''}
+
+    def calls(self):
+        return self.log.read_text().splitlines()
+
+
+def _lock_repo(tmp_path):
+    import os
+    repo = tmp_path / 'work' / 'repo'
+    (repo / 'tests').mkdir(parents=True)
+    (repo / 'src').mkdir()
+    (repo / 'tests' / 'test_a.py').write_text('def test_a(): pass\n')
+    (repo / 'mimo_test_command.sh').write_text('pytest tests\n')
+    (repo / 'src' / 'x.py').write_text('x = 1\n')
+    return os.path.realpath(repo)
+
+
+def test_lock_down_locks_the_test_files_and_proves_the_drop(tmp_path):
+    import os
+    repo = _lock_repo(tmp_path)
+    sb = _StubRootSandbox(tmp_path, tmp_path / 'home')
+    paths = [b'tests/test_a.py', b'mimo_test_command.sh', b'tests/deleted_by_the_patch.py']
+    took = SweEnv('swe', {})._lock_down(sb, repo, paths)
+    calls = sb.calls()
+    assert isinstance(took, float)
+    assert calls[0] == 'chown -R 65534:65534 .'                                     # repo, then HOME, to nobody
+    assert calls[1] == f'chown -R 65534:65534 {os.path.realpath(tmp_path / "home")}'
+    for c in ('chown -h 0:0 -- tests', 'chmod 1777 -- tests', 'chown -h 0:0 -- tests/test_a.py',
+              'chmod a-w -- tests/test_a.py', 'chmod a-w -- mimo_test_command.sh'):
+        assert c in calls
+    assert calls[-2:] == ['chown 0:0 .', 'chmod 1777 .']
+    assert not os.access(os.path.join(repo, 'tests', 'test_a.py'), os.W_OK)
+    assert os.access(os.path.join(repo, 'src', 'x.py'), os.W_OK)                     # the rest stays writable
+    assert not any('src' in c for c in calls[2:])
+    assert not os.path.exists(tmp_path / '_hosted_env_lock.list')
+
+
+def test_lock_down_keeps_the_repo_ancestors_inside_home_root_owned(tmp_path):
+    import os
+    repo = _lock_repo(tmp_path)
+    sb = _StubRootSandbox(tmp_path, tmp_path)                                         # HOME is above the repo
+    SweEnv('swe', {})._lock_down(sb, repo, [b'tests/test_a.py'])
+    calls, work, home = sb.calls(), os.path.dirname(repo), os.path.realpath(tmp_path)
+    for d in (work, home):                  # else the grader could rename the repo away and put a fake one there
+        assert f'chown -h 0:0 -- {d}' in calls and f'chmod 1777 -- {d}' in calls
+    assert f'chown -h 0:0 -- {os.path.dirname(home)}' not in calls
+
+
+def test_lock_down_refuses_unsafe_paths_and_symlinked_dirs(tmp_path):
+    import os
+    repo = _lock_repo(tmp_path)
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    os.symlink(outside, os.path.join(repo, 'linked'))
+    env, sb = SweEnv('swe', {}), _StubRootSandbox(tmp_path, tmp_path / 'home')
+    for bad, why in ((b'linked/test_b.py', 'symlink in a test path: linked'), (b'../escape.py', 'unsafe test path'),
+                     (b'/etc/passwd', 'unsafe test path'), (b'tests/../../escape.py', 'unsafe test path')):
+        with pytest.raises(GradeError, match=why):
+            env._lock_down(sb, repo, [b'tests/test_a.py', bad])
+    assert not any(str(outside) in c or c.endswith('-- linked') for c in sb.calls())
+
+
+def test_lock_down_fails_loudly_when_the_drop_does_not_work(tmp_path):
+    for case, kw, why in (('a', {'setpriv_rc': 127}, 'cannot drop privileges to 65534'),   # e.g. no CAP_SETUID
+                          ('b', {'fake_chmod': True}, 'test file still writable after the drop: tests/test_a.py')):
+        (tmp_path / case).mkdir()
+        repo = _lock_repo(tmp_path / case)
+        with pytest.raises(GradeError, match=why):
+            SweEnv('swe', {})._lock_down(_StubRootSandbox(tmp_path / case, tmp_path / case / 'home', **kw),
+                                         repo, [b'tests/test_a.py'])
