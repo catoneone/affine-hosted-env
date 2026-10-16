@@ -140,6 +140,7 @@ LOCK_LIST_REMOTE = '/tmp/_hosted_env_lock.list'
 GRADER_UID = 65534                     # nobody: the hidden tests run without root (cfg grader_user = "root" to opt out)
 # no_new_privs: setuid-root binaries in the image (sudo, su, ...) cannot hand root back to the code under test
 DROP_PRIVS = f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups --no-new-privs --'
+GRADER_BASH = 'bash --noprofile --norc -c'   # the drop probes run under exactly what the test command runs under
 MAX_MODEL_PATCH_BYTES = 2_000_000
 GRADER_VERSION = 'isolated-v2'         # v1: isolated container, tests as root; v2: tests as GRADER_UID unless opted out
 
@@ -148,7 +149,7 @@ def as_grader(command: str) -> str:
     """Run `command` as GRADER_UID with no supplementary groups, no way to regain privileges, and no profile or rc
     file. HOME stays the image's (its caches and toolchains: Go module cache, nvm, cargo, ...), which _lock_down
     hands to the grader."""
-    return f'{DROP_PRIVS} env USER=nobody LOGNAME=nobody bash --noprofile --norc -c {shlex.quote(command)}'
+    return f'{DROP_PRIVS} env USER=nobody LOGNAME=nobody {GRADER_BASH} {shlex.quote(command)}'
 
 # Test infrastructure the model's patch must not change: anything here that the patch touches is put back to the
 # base commit in the grading container before the hidden tests run (the test_patch files are handled separately).
@@ -331,7 +332,7 @@ command -v setpriv >/dev/null || {{ echo "setpriv not found: cannot drop privile
 repo=$(pwd -P)
 chown -R {GRADER_UID}:{GRADER_UID} .
 h="${{HOME:-/root}}"
-if [ -d "$h" ]; then h=$(cd "$h" && pwd -P); else h=/; fi
+if [ -d "$h" ]; then h=$(CDPATH= cd -- "$h" && pwd -P); else h=/; fi
 if [ "$h" != / ]; then
   chown -R {GRADER_UID}:{GRADER_UID} "$h"
   d=$(dirname -- "$repo")
@@ -344,8 +345,12 @@ probe=
 while IFS= read -r -d "" f; do
   case "/$f/" in //*|*/../*) echo "unsafe test path: $f"; exit 4;; esac
   d=$(dirname -- "$f")
-  while [ "$d" != . ]; do
+  while [ "$d" != . ]; do                       # check the whole path first: change nothing below a symlink
     if [ -L "$d" ]; then echo "symlink in a test path: $d"; exit 4; fi
+    d=$(dirname -- "$d")
+  done
+  d=$(dirname -- "$f")
+  while [ "$d" != . ]; do
     if [ -d "$d" ]; then chown -h 0:0 -- "$d"; chmod 1777 -- "$d"; fi
     d=$(dirname -- "$d")
   done
@@ -355,10 +360,11 @@ while IFS= read -r -d "" f; do
 done < {LOCK_LIST_REMOTE}
 rm -f {LOCK_LIST_REMOTE}
 chown 0:0 .; chmod 1777 .
-{DROP_PRIVS} sh -c 'test "$(id -u)" = {GRADER_UID} && test "$(id -g)" = {GRADER_UID}' \\
+{DROP_PRIVS} {GRADER_BASH} 'test "$(id -u)" = {GRADER_UID} && test "$(id -g)" = {GRADER_UID}' \\
   || {{ echo "cannot drop privileges to {GRADER_UID} in this runtime"; exit 3; }}
 if [ -n "$probe" ]; then
-  {DROP_PRIVS} sh -c 'test ! -w "$1"' _ "$probe" || {{ echo "test file still writable after the drop: $probe"; exit 3; }}
+  {DROP_PRIVS} {GRADER_BASH} 'test ! -w "$1"' _ "$probe" \\
+    || {{ echo "test file still writable after the drop: $probe"; exit 3; }}
 fi
 ''', cwd=repo, timeout=900, login=False)
         if r['returncode'] != 0:
@@ -366,9 +372,12 @@ fi
         return round(time.time() - t0, 1)
 
     def grade(self, s: EnvSession, gi: dict) -> dict:
-        repo = s.spec['cwd']
+        repo, grader = s.spec['cwd'], self.cfg.get('grader_user', 'nobody')
+        if grader not in ('root', 'nobody'):                # a typo must not silently pick one of them
+            raise GradeError(f'grader_user must be "root" or "nobody", not {grader!r}')
         patch, problem = self.capture_patch(s)
-        res = {'model_patch': patch.decode('utf-8', 'replace'), 'reward': 0.0, 'grader': GRADER_VERSION}
+        res = {'model_patch': patch.decode('utf-8', 'replace'), 'reward': 0.0, 'grader': GRADER_VERSION,
+               'grader_user': grader}
         if problem:                                         # the model's own doing (deleted .git, huge diff): 0
             return {**res, 'grade_detail': problem}
         if s.factory is None:
@@ -399,13 +408,12 @@ fi
             if reset_cmd and sb.execute(reset_cmd, cwd=repo, timeout=300, login=False)['returncode'] != 0:
                 raise GradeError('reset_tests_failed')
             sb.copy_text_to(gi['test_patch'], TEST_PATCH_REMOTE)
-            grader = 'root' if self.cfg.get('grader_user', 'nobody') == 'root' else 'nobody'
             test_paths = self._patch_paths(sb, repo, TEST_PATCH_REMOTE) if grader == 'nobody' else []
             ap = sb.execute(f'git apply --verbose {TEST_PATCH_REMOTE}', cwd=repo, timeout=300, login=False)
             sb.execute(f'rm -f {TEST_PATCH_REMOTE}', timeout=60, login=False)
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
-            test_cmd, res['grader_user'] = gi['test_command'], grader
+            test_cmd = gi['test_command']
             if grader == 'nobody':
                 res['lock_seconds'] = self._lock_down(sb, repo, test_paths)
                 test_cmd = as_grader(test_cmd)

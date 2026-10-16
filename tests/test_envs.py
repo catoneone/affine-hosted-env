@@ -280,7 +280,7 @@ class _StubRootSandbox:
     chown only logs, setpriv drops nothing but makes the stub id report 65534, chmod logs and really runs unless
     `fake_chmod` is set. The /tmp paths the env uses are mapped under `tmp`."""
 
-    def __init__(self, tmp, home, setpriv_rc=None, fake_chmod=False):
+    def __init__(self, tmp, home, setpriv_rc=None, fake_chmod=False, no_setpriv=False):
         import os
         self.tmp, self.log, stub = str(tmp), tmp / 'calls.log', tmp / 'bin'
         stub.mkdir()
@@ -292,10 +292,14 @@ class _StubRootSandbox:
                         'while [ "$1" != -- ]; do shift; done; shift\nFAKE_UID=65534 exec "$@"'),
             'id': 'echo "${FAKE_UID:-0}"',
         }
+        if no_setpriv:                     # a real setpriv may be on the host (Linux CI): keep only what is needed
+            del scripts['setpriv']
+            for tool in ('base64', 'rm', 'dirname'):
+                os.symlink(shutil.which(tool), stub / tool)
         for name, body in scripts.items():
             (stub / name).write_text('#!/bin/sh\n' + body + '\n')
             (stub / name).chmod(0o755)
-        self.env = {'PATH': f'{stub}:/usr/bin:/bin', 'HOME': str(home)}
+        self.env = {'PATH': str(stub) if no_setpriv else f'{stub}:/usr/bin:/bin', 'HOME': str(home)}
         self.log.write_text('')
         os.makedirs(home, exist_ok=True)
 
@@ -308,7 +312,7 @@ class _StubRootSandbox:
 
     def execute(self, command, cwd=None, timeout=None, raw=False, login=True):
         import subprocess
-        p = subprocess.run(['bash', '-c', self._map(command)], cwd=cwd, env=self.env, capture_output=True,
+        p = subprocess.run([shutil.which('bash'), '-c', self._map(command)], cwd=cwd, env=self.env, capture_output=True,
                            text=True, timeout=60)
         return {'returncode': p.returncode, 'output': p.stdout + p.stderr, 'reason': ''}
 
@@ -365,18 +369,33 @@ def test_lock_down_refuses_unsafe_paths_and_symlinked_dirs(tmp_path):
     outside.mkdir()
     os.symlink(outside, os.path.join(repo, 'linked'))
     env, sb = SweEnv('swe', {}), _StubRootSandbox(tmp_path, tmp_path / 'home')
-    for bad, why in ((b'linked/test_b.py', 'symlink in a test path: linked'), (b'../escape.py', 'unsafe test path'),
-                     (b'/etc/passwd', 'unsafe test path'), (b'tests/../../escape.py', 'unsafe test path')):
+    (outside / 'sub').mkdir()
+    for bad, why in ((b'linked/test_b.py', 'symlink in a test path: linked'),
+                     (b'linked/sub/test_b.py', 'symlink in a test path: linked'),     # deeper dirs are not touched
+                     (b'../escape.py', 'unsafe test path'), (b'/etc/passwd', 'unsafe test path'),
+                     (b'tests/../../escape.py', 'unsafe test path')):
         with pytest.raises(GradeError, match=why):
             env._lock_down(sb, repo, [b'tests/test_a.py', bad])
-    assert not any(str(outside) in c or c.endswith('-- linked') for c in sb.calls())
+    assert not any(str(outside) in c or 'linked' in c for c in sb.calls())
+    assert (outside / 'sub').stat().st_mode & 0o7777 != 0o1777
 
 
 def test_lock_down_fails_loudly_when_the_drop_does_not_work(tmp_path):
     for case, kw, why in (('a', {'setpriv_rc': 127}, 'cannot drop privileges to 65534'),   # e.g. no CAP_SETUID
+                          ('c', {'no_setpriv': True}, 'setpriv not found'),
                           ('b', {'fake_chmod': True}, 'test file still writable after the drop: tests/test_a.py')):
         (tmp_path / case).mkdir()
         repo = _lock_repo(tmp_path / case)
         with pytest.raises(GradeError, match=why):
             SweEnv('swe', {})._lock_down(_StubRootSandbox(tmp_path / case, tmp_path / case / 'home', **kw),
                                          repo, [b'tests/test_a.py'])
+
+
+def test_grader_user_must_be_root_or_nobody(tmp_path):
+    env, task = make_task(tmp_path)
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    env.cfg['grader_user'] = 'nobdy'
+    with pytest.raises(GradeError, match='grader_user must be "root" or "nobody"'):
+        s.grade(env.grade_inputs(task))
+    s.close()
