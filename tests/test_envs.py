@@ -424,8 +424,8 @@ def test_model_cannot_block_the_test_patch(tmp_path, shape):
 
 
 def _rich_task(tmp_path):
-    """A base with existing tests and a `fixtures` file, and a test patch that modifies, renames and deletes
-    test files and turns `fixtures` into a directory."""
+    """A base with existing tests, a `fixtures` file and a `docs` directory, and a test patch that modifies,
+    renames and deletes test files, turns `fixtures` into a directory and `docs` into a symlink."""
     import json
 
     from conftest import _run
@@ -436,10 +436,13 @@ def _rich_task(tmp_path):
     (tpl / 'tests' / 'helper.py').write_text('OLD = 1\n')
     (tpl / 'tests' / 'obsolete.py').write_text('assert True\n')
     (tpl / 'tests' / 'test_old.py').write_text('print(0)\n')
+    (tpl / 'docs').mkdir()
+    (tpl / 'docs' / 'x.txt').write_text('x\n')
     _run('git init -q -b master && git add -A && git commit -qm base', tpl)
     tp = tmp_path / 'tp'
     shutil.copytree(tpl, tp, symlinks=True)
-    _run('git rm -q fixtures tests/obsolete.py && git mv tests/helper.py tests/helpers.py', tp)
+    _run('git rm -q fixtures tests/obsolete.py && git rm -rq docs && git mv tests/helper.py tests/helpers.py', tp)
+    os.symlink('tests', tp / 'docs')
     (tp / 'fixtures').mkdir()
     (tp / 'fixtures' / 'data.txt').write_text('5\n')
     (tp / 'tests' / 'test_old.py').write_text(
@@ -475,3 +478,19 @@ def test_test_patch_that_modifies_renames_deletes_and_retypes(tmp_path, shape):
     s.close()
     assert g['reward'] == 1.0, g.get('test_output') or g.get('grade_detail')
     assert sorted(os.listdir(canary)) == ['keep']                           # nothing outside the repo touched
+
+
+def test_lock_list_is_what_the_test_patch_leaves_behind(tmp_path):
+    """Not the paths it deletes: with docs/x.txt in the list, the symlink check refused docs (a dir the test
+    patch turns into a symlink) and every honest rollout of such a task was an infra error."""
+    env, task = _rich_task(tmp_path)
+    env.cfg['grader_user'] = 'nobody'
+    locked = []
+    env._lock_down = lambda sb, repo, paths: locked.extend(paths) or 0.0
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    g = s.grade(env.grade_inputs(task))             # the test command itself cannot drop privileges on this host
+    s.close()
+    assert g['grader_user'] == 'nobody' and g['lock_seconds'] == 0.0
+    assert sorted(locked) == [b'docs', b'fixtures/data.txt', b'mimo_test_command.sh', b'tests/helpers.py',
+                              b'tests/test_old.py']
