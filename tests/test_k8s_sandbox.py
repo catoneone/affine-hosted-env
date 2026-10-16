@@ -1,6 +1,7 @@
 """providers/sandbox/k8s.py with a fake Kubernetes API. exec_fn runs the generated argv on this machine, so the
 command wrapping (cd, env, timeout) is exercised for real; only the Pod lifecycle is faked."""
 import subprocess
+import threading
 from types import SimpleNamespace as NS
 
 import pytest
@@ -203,3 +204,40 @@ def test_offline_check_fails_closed(tmp_path):
     assert sb.execute('echo ok')['output'].strip() == 'ok'
     sb2 = make(tmp_path, exec_fn=offline_exec(WITH_ETH0), network='bridge')           # not offline: not checked
     sb2.start()
+
+
+def test_exec_never_uses_the_shared_client(monkeypatch):
+    """kubernetes.stream.stream swaps `request` on the client it is given; on the shared client a concurrent Pod
+    create / delete went out over the exec WebSocket (EXP-018). Exec must get a per-thread client of its own."""
+    kubernetes = pytest.importorskip('kubernetes')
+    stream_mod = pytest.importorskip('kubernetes.stream')
+
+    from hosted_env.providers.sandbox.k8s import ws_exec
+    cfg = kubernetes.client.Configuration()
+    cfg.host = 'https://cp.test:6443'
+    shared = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(cfg))
+    used = []
+
+    class Resp:
+        returncode = 0
+
+        def is_open(self):
+            return False
+
+        def close(self):
+            pass
+
+    def fake_stream(method, pod, ns, **kw):
+        used.append(method.__self__)
+        return Resp()
+    monkeypatch.setattr(stream_mod, 'stream', fake_stream)
+    run = ws_exec(shared, 'hosted-env')
+    assert run('p', ['true'], 5) == (b'', 0, False)
+    run('p', ['true'], 5)
+    t = threading.Thread(target=run, args=('p', ['true'], 5))
+    t.start()
+    t.join()
+    a, b, c = used
+    assert a is b and a is not c                                         # one exec client per thread
+    assert all(x is not shared and x.api_client is not shared.api_client for x in used)
+    assert a.api_client.configuration is cfg                             # same cluster and credentials

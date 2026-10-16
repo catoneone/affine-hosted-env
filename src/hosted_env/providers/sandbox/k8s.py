@@ -16,6 +16,7 @@ API object and an `exec_fn`.
 from __future__ import annotations
 
 import base64
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -114,14 +115,28 @@ def _ready(pod) -> bool:
 
 
 def ws_exec(api, namespace: str) -> ExecFn:
-    """exec_fn backed by the Kubernetes exec API (needs the `kubernetes` package)."""
+    """exec_fn backed by the Kubernetes exec API (needs the `kubernetes` package).
+
+    `kubernetes.stream.stream` swaps `request` on the ApiClient it is handed for the duration of the call, which is
+    not thread-safe: on the client shared with ordinary calls, a concurrent Pod create / delete was sent over the
+    exec WebSocket and failed (EXP-018, two rollouts at once). So exec never uses the shared client: each thread
+    gets its own client built from the same configuration, used for exec only."""
+    from kubernetes import client as k8s_client
     from kubernetes.client.rest import ApiException
     from kubernetes.stream import stream
 
+    local = threading.local()
+
+    def exec_api():
+        a = getattr(local, 'api', None)
+        if a is None:
+            a = local.api = k8s_client.CoreV1Api(k8s_client.ApiClient(api.api_client.configuration))
+        return a
+
     def run(pod: str, argv: list[str], timeout: float) -> tuple[bytes, int, bool]:
         try:
-            resp = stream(api.connect_get_namespaced_pod_exec, pod, namespace, container=CONTAINER, command=argv,
-                          stdin=False, stdout=True, stderr=True, tty=False, _preload_content=False)
+            resp = stream(exec_api().connect_get_namespaced_pod_exec, pod, namespace, container=CONTAINER,
+                          command=argv, stdin=False, stdout=True, stderr=True, tty=False, _preload_content=False)
         except ApiException as e:
             if e.status == 404:
                 raise SandboxError('pod is gone') from None
