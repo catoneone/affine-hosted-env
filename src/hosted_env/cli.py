@@ -66,10 +66,11 @@ def cmd_mine(a):
     for _ in range(a.tasks):
         res = run_task(gw, epoch, a.env, sampler, concurrency=a.concurrency, max_wait=a.max_wait)
         t = res['task']
-        (out / f'{t["env_id"]}-{t["task"]}.json').write_text(json.dumps(res['attachment']))
-        print(json.dumps({'task': t['task'], 'results': [{k: x[k] for k in ('nonce', 'outcome', 'reward', 'detail',
-                                                                           'steps')} for x in res['rollouts']]}),
-              flush=True)
+        if res['attachment'] is not None:                # a voided task (infra error) has nothing to upload
+            (out / f'{t["env_id"]}-{t["task"]}.json').write_text(json.dumps(res['attachment']))
+        print(json.dumps({'task': t['task'], 'voided': res['voided'],
+                          'results': [{k: x[k] for k in ('nonce', 'outcome', 'reward', 'detail', 'steps')}
+                                      for x in res['rollouts']]}), flush=True)
 
 
 def cmd_verify(a):
