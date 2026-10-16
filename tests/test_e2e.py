@@ -115,7 +115,8 @@ def test_group_end_to_end(stack):
     assert t2['task'] != res['task']['task']
     log = (stack['tmp'] / 'logs' / 'exec-w1.jsonl').read_text().splitlines()
     assert sum(json.loads(x)['event'] == 'finish' for x in log) == 8
-
+    fin = [json.loads(x) for x in log if json.loads(x)['event'] == 'finish']   # how each rollout was graded
+    assert all(f['grader'] == 'isolated-v2' and f['grader_user'] == 'root' for f in fin)
 
 def test_smoke_replies_end_to_end(stack):
     """The EXP-014 smoke script: timeout, malformed call, unknown tool, truncation, submit, over the full HTTP path."""
