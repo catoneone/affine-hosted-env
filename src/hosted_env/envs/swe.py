@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import re
+import shlex
 import time
 
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
@@ -134,6 +135,15 @@ TEST_PATCH_REMOTE = '/tmp/_hosted_env_test.patch'
 MODEL_PATCH_REMOTE = '/tmp/_hosted_env_model.patch'
 RESET_LIST_REMOTE = '/tmp/_hosted_env_reset.list'
 TREE_INDEX_REMOTE = '/tmp/_hosted_env_tree.index'
+LOCK_LIST_REMOTE = '/tmp/_hosted_env_lock.list'
+GRADER_UID = 65534                     # nobody: the hidden tests run without root (cfg grader_user = "root" to opt out)
+GRADER_HOME = '/tmp/hosted-env-grader'
+
+
+def as_grader(command: str) -> str:
+    """Run `command` as GRADER_UID with no supplementary groups, a fresh HOME and no profile or rc file."""
+    return (f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups -- '
+            f'env HOME={GRADER_HOME} USER=nobody LOGNAME=nobody bash --noprofile --norc -c {shlex.quote(command)}')
 MAX_MODEL_PATCH_BYTES = 2_000_000
 GRADER_VERSION = 'isolated-v1'
 
@@ -282,6 +292,36 @@ class SweEnv(DockerTaskEnv):
         if r['returncode'] != 0:
             raise GradeError('reset_protected_failed: ' + r['output'][-300:])
 
+    def _lock_down(self, sb, repo: str, test_patch: str) -> float:
+        """Before the hidden tests run as GRADER_UID: the repo becomes the grader's (tests may write caches and
+        scratch files), but the test infrastructure (every file of the test patch and each directory holding one,
+        up to the repo root) stays root's and read-only for the grader, so code under test cannot rewrite the
+        tests or the grading script while they run. Tools the image installed under /root (nvm, pipx, cargo, ...)
+        are made readable. Returns the seconds it took."""
+        t0 = time.time()
+        files = [f.encode('utf-8', 'surrogateescape') for f in patch_touched_files(test_patch)]
+        self._put_bytes(sb, b'\0'.join(files) + (b'\0' if files else b''), LOCK_LIST_REMOTE)
+        r = sb.execute(f'''set -e
+command -v setpriv >/dev/null || {{ echo "setpriv not found: cannot drop privileges"; exit 3; }}
+chown -R {GRADER_UID}:{GRADER_UID} .
+while IFS= read -r -d "" f; do
+  [ -e "$f" ] || continue
+  chown -h 0:0 -- "$f"; [ -L "$f" ] || chmod a-w -- "$f"
+  d=$(dirname -- "$f")
+  while [ "$d" != "." ] && [ "$d" != "/" ]; do chown 0:0 -- "$d"; chmod 755 -- "$d"; d=$(dirname -- "$d"); done
+done < {LOCK_LIST_REMOTE}
+rm -f {LOCK_LIST_REMOTE}
+chown 0:0 .; chmod 755 .
+chmod o+x /root 2>/dev/null || true
+for d in /root/.nvm /root/.local /root/.cargo /root/.rustup /root/go /root/.pyenv /root/.bun /root/.deno; do
+  [ -d "$d" ] && chmod -R o+rX "$d" || true
+done
+rm -rf {GRADER_HOME} && mkdir -p {GRADER_HOME} && chown {GRADER_UID}:{GRADER_UID} {GRADER_HOME}
+''', cwd=repo, timeout=900, login=False)
+        if r['returncode'] != 0:
+            raise GradeError('cannot prepare non-root grading: ' + r['output'][-300:])
+        return round(time.time() - t0, 1)
+
     def grade(self, s: EnvSession, gi: dict) -> dict:
         repo = s.spec['cwd']
         patch, problem = self.capture_patch(s)
@@ -320,7 +360,13 @@ class SweEnv(DockerTaskEnv):
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
             t0 = time.time()
-            r = sb.execute(gi['test_command'], cwd=repo, timeout=gi['verifier_timeout'], login=False)
+            test_cmd, grader = gi['test_command'], self.cfg.get('grader_user', 'nobody')
+            if grader != 'root':
+                lock_s = self._lock_down(sb, repo, gi['test_patch'])
+                test_cmd = as_grader(test_cmd)
+                res['grader_user'], res['lock_seconds'] = GRADER_UID, lock_s
+                t0 = time.time()
+            r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
             return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                     'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
                     'test_output': r['output'][-3000:], 'reverted_paths': reverted}

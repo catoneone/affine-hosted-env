@@ -72,7 +72,7 @@ def test_reset_cmd_covers_added_and_renamed_files():
 
 def make_task(tmp_path):
     path, ids = make_swe_tasks(tmp_path)
-    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False}), ids[0]
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}), ids[0]
 
 
 def open_local(env, task, tmp_path):
@@ -249,3 +249,16 @@ def test_local_sandbox_map_root_under_tmp(tmp_path):
     assert sb._map('/var/tmp/k $HOME/tmp/q') == '/var/tmp/k $HOME/tmp/q'
     sb.root = real_root
     sb.cleanup()
+
+
+def test_as_grader_drops_root_and_quotes_the_command():
+    import shlex
+
+    from hosted_env.envs.swe import GRADER_HOME, GRADER_UID, as_grader
+    cmd = as_grader("bash /testbed/mimo_test_command.sh; echo 'it''s' \"$HOME\"")
+    argv = shlex.split(cmd)
+    assert argv[:5] == ['setpriv', f'--reuid={GRADER_UID}', f'--regid={GRADER_UID}', '--clear-groups', '--']
+    assert argv[5:9] == ['env', f'HOME={GRADER_HOME}', 'USER=nobody', 'LOGNAME=nobody']
+    assert argv[9:12] == ['bash', '--noprofile', '--norc'] and argv[12] == '-c'
+    assert argv[13] == "bash /testbed/mimo_test_command.sh; echo 'it''s' \"$HOME\""   # passed through intact
+    assert SweEnv('swe', {}).cfg.get('grader_user', 'nobody') == 'nobody'          # non-root is the default
