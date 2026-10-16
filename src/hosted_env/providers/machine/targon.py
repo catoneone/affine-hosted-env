@@ -19,7 +19,8 @@ from collections.abc import Callable
 
 import httpx
 
-from .base import NAME_PREFIX, BootScript, Machine, MachineError, MachineSpec, Offer, resolve_boot_script
+from .base import (NAME_PREFIX, BootScript, Machine, MachineError, MachineSpec, Offer, create_then_boot,
+                   resolve_boot_script)
 
 API = 'https://api.targon.com/tha/v3'
 _STATE = {'registered': 'pending', 'provisioning': 'pending', 'running': 'running', 'error': 'error',
@@ -131,7 +132,7 @@ class TargonProvider:
         w = self._req('GET', f'/orgs/{self.org}/workloads/{machine_id}')
         return self._machine(w, self._req('GET', f'/orgs/{self.org}/workloads/{machine_id}/state'))
 
-    def create(self, spec: MachineSpec, boot_script: BootScript) -> Machine:
+    def create(self, spec: MachineSpec, boot_script: BootScript, on_created=None) -> Machine:
         if len(spec.name) > 32:
             raise MachineError(f'targon workload names are at most 32 characters: {spec.name!r}')
         ports = [{'port': int(p.split('/')[0]), 'protocol': (p.split('/')[1] if '/' in p else 'tcp').upper()}
@@ -141,14 +142,7 @@ class TargonProvider:
         if ports:
             body['ports'] = ports
         uid = self._req('POST', f'/orgs/{self.org}/workloads', json=body)['uid']
-        try:
-            return self._deploy_and_boot(uid, boot_script)
-        except Exception:
-            try:                                  # a half-created machine still bills: remove it, then report
-                self.delete(uid)
-            except MachineError:
-                pass
-            raise
+        return create_then_boot(self, uid, lambda: self._deploy_and_boot(uid, boot_script), on_created)
 
     def _deploy_and_boot(self, uid: str, boot_script: BootScript) -> Machine:
         self._req('POST', f'/orgs/{self.org}/workloads/{uid}/deploy')

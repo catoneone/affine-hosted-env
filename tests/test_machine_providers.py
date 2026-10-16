@@ -103,12 +103,38 @@ def test_boat_create_runs_boot_script_and_lists_own(tmp_path):
 
 
 def test_boat_create_times_out_when_never_ready():
-    from hosted_env.providers.machine import MachineError
+    from hosted_env.providers.machine import CreateFailed
     from hosted_env.providers.machine.boat import BoatProvider
-    p = BoatProvider('tok', http=FakeBoat(ready_after=10 ** 9).http, ready_timeout=0, poll=0)
-    with pytest.raises(MachineError, match='did not become ready'):
-        p.create(MachineSpec('small', 'hosted-env-n2'), '')
-    assert p.list() == []                                               # the provider deleted what it created
+    fb, ids = FakeBoat(ready_after=10 ** 9), []
+    p = BoatProvider('tok', http=fb.http, ready_timeout=0, poll=0)
+    with pytest.raises(CreateFailed, match='did not become ready') as e:
+        p.create(MachineSpec('small', 'hosted-env-n2'), '', on_created=ids.append)
+    assert ids == [e.value.machine_id] and e.value.cleaned is True       # the id was reported before the boot
+    assert p.list() == [] and fb.sandboxes == {}                         # the provider deleted what it created
+
+
+def test_boat_failed_cleanup_is_reported_not_swallowed():
+    import httpx
+
+    from hosted_env.providers.machine import CreateFailed
+    from hosted_env.providers.machine.boat import BoatProvider
+    fb = FakeBoat(ready_after=10 ** 9)
+    fb.sandboxes['bx_other'] = {'id': 'bx_other', 'name': 'hosted-env-cp1', 'type': 'large', 'state': 'idle',
+                                'ip': '2001:db8::9', 'polls': 0}
+    handle = fb.handle
+
+    def no_delete(request):
+        if request.method == 'DELETE':
+            fb.reqs.append(request)
+            return httpx.Response(500, json={'code': 'internal'})
+        return handle(request)
+    fb.http = httpx.Client(base_url='https://boat.test/api/v1', transport=httpx.MockTransport(no_delete))
+    p = BoatProvider('tok', http=fb.http, ready_timeout=0, poll=0)
+    with pytest.raises(CreateFailed) as e:
+        p.create(MachineSpec('small', 'hosted-env-n3'), '')
+    assert e.value.cleaned is False and e.value.machine_id in fb.sandboxes
+    deletes = [r.url.path for r in fb.reqs if r.method == 'DELETE']
+    assert deletes == [f'/api/v1/sandboxes/{e.value.machine_id}']     # only the machine it was creating
 
 
 # ---------------------------------------------------------------- targon (fake HTTP)
@@ -197,19 +223,20 @@ def test_targon_create_maps_ports_and_runs_boot(tmp_path):
 
 
 def test_targon_never_running_fails_without_boot():
-    from hosted_env.providers.machine import MachineError
+    from hosted_env.providers.machine import CreateFailed, MachineError
     from hosted_env.providers.machine.targon import TargonProvider
-    booted = []
+    booted, ids = [], []
     p = TargonProvider('tok', ssh_key_uid='k', boot_runner=lambda m, s: booted.append(m), org='al-1',
                        http=FakeTargon(ready_after=10 ** 9).http, ready_timeout=0, poll=0)
-    with pytest.raises(MachineError, match='did not start'):
-        p.create(MachineSpec('cpu-small-amd', 'hosted-env-tg2'), '')
+    with pytest.raises(CreateFailed, match='did not start') as e:
+        p.create(MachineSpec('cpu-small-amd', 'hosted-env-tg2'), '', on_created=ids.append)
+    assert ids == [e.value.machine_id] and e.value.cleaned is True
     assert booted == [] and p.list() == []                               # the provider deleted what it created
 
     def bad_ssh(m, s):
         raise MachineError('ssh refused')
     p2 = TargonProvider('tok', ssh_key_uid='k', boot_runner=bad_ssh, org='al-1', http=FakeTargon().http, poll=0)
-    with pytest.raises(MachineError, match='ssh refused'):
+    with pytest.raises(CreateFailed, match='ssh refused'):
         p2.create(MachineSpec('cpu-small-amd', 'hosted-env-tg4'), '')
     assert p2.list() == []
 

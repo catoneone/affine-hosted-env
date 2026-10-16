@@ -91,7 +91,9 @@ def _planner(cfg: dict, base: Path, store):
     for name, p in (mcfg.get('providers') or {}).items():
         p = dict(p)
         if name == 'boat':
-            providers[name] = BoatProvider.from_token_file(_abs(base, p['token_file']))
+            # boat may ignore our names: the ids recorded in the inventory are how its machines stay ours
+            owned = [r['machine_id'] for r in store.machines(provider='boat', origin='planner')]
+            providers[name] = BoatProvider.from_token_file(_abs(base, p['token_file']), owned_ids=owned)
         elif name == 'targon':
             runner = ssh_boot_runner(_abs(base, p['ssh_key']), _abs(base, p['known_hosts']))
             providers[name] = TargonProvider.from_token_file(_abs(base, p['token_file']), ssh_key_uid=p['ssh_key_uid'],
@@ -109,8 +111,27 @@ def _planner(cfg: dict, base: Path, store):
                                   gvisor=gvisor)
     slot = {k: pcfg[k] for k in ('cpus', 'memory', 'reserve_cpu', 'reserve_memory') if k in pcfg}
     planner = Planner(providers, PlannerLimits(**{k: mcfg[k] for k in _PLANNER_LIMITS if k in mcfg}), boot_script,
-                      dry_run=bool(mcfg.get('dry_run', True)), ledger=store, **slot)
+                      dry_run=bool(mcfg.get('dry_run', True)), ledger=store,
+                      inventory_interval=float(mcfg.get('inventory_interval', 300)), **slot)
     return planner, float(mcfg.get('interval', 30))
+
+
+def machine_inventory(path: str, *, refresh: bool = False) -> tuple[list[dict], dict | None]:
+    """`hosted-env machines`: every machine in the inventory (history included) from the config's database.
+    refresh=True first lists every [machines] provider once (read only: nothing is created or deleted)."""
+    from nacl.signing import SigningKey
+
+    from .coordinator.store import Store
+    cfg, base = _load(path)
+    # this Store is only used for its machines table: no envs, and a throwaway key instead of the gateway's
+    store = Store(_abs(base, cfg.get('db', 'gateway.db')), {}, SigningKey.generate())
+    report = None
+    if refresh:
+        planner, _ = _planner(cfg, base, store)
+        if planner is None:
+            raise ValueError('--refresh needs a [machines] table with providers')
+        report = planner.reconcile()
+    return store.machines(live=False), report
 
 
 def build_gateway_app(path: str):

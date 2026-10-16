@@ -49,6 +49,8 @@ hotkey_data = [200, 400]
 # min_machines = 0                        # never shrink below this
 # idle_grace = 600                        # an empty node is deleted after this many seconds (nobody waiting)
 # join_timeout = 1800                     # a machine that never joins is deleted after this
+# inventory_interval = 300                # seconds between provider listings for the inventory (read only)
+#                                         # `hosted-env machines --config <this file>` prints the inventory
 # server_url = "https://<control plane public IP>:<API port>"
 # join_token_file = "k3s.token"           # the cluster's join token (secret)
 # wireguard_port = 20000                  # cluster-wide flannel WireGuard port (the control plane's public UDP port)

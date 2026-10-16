@@ -4,12 +4,16 @@ from test_nodes import node_store
 
 from hosted_env.coordinator.nodes import NodeInfo
 from hosted_env.coordinator.planner import Planner, PlannerLimits
-from hosted_env.providers.machine import Machine, MachineError, MachineSpec, Offer
+from hosted_env.providers.machine import CreateFailed, Machine, MachineError, MachineSpec, Offer
 
 
 class FakeProvider:
-    def __init__(self, name, offers, fail_create=False):
-        self.name, self._offers, self.fail_create = name, offers, fail_create
+    """create() follows the provider contract: report the id, boot, and on failure delete only that machine
+    (cleanup_fails=True: that delete fails too and the machine stays)."""
+
+    def __init__(self, name, offers, fail_create=False, cleanup_fails=False, during_boot=None):
+        self.name, self._offers, self.fail_create, self.cleanup_fails = name, offers, fail_create, cleanup_fails
+        self.during_boot = during_boot
         self.machines, self.created, self.deleted = {}, [], []
 
     def offers(self):
@@ -18,16 +22,24 @@ class FakeProvider:
     def list(self):
         return list(self.machines.values())
 
-    def create(self, spec, boot_script):
+    def create(self, spec, boot_script, on_created=None):
         self.created.append((spec, boot_script))
         mid = f'{self.name}-{len(self.created)}'
         self.machines[mid] = Machine(mid, self.name, spec.name, 'running', spec.kind)
+        if on_created:
+            on_created(mid)
+        if self.during_boot:
+            self.during_boot(mid)
         if self.fail_create:
-            raise MachineError('boot failed')
+            if not self.cleanup_fails:
+                self.delete(mid)
+            raise CreateFailed('boot failed', machine_id=mid, cleaned=not self.cleanup_fails)
         return self.machines[mid]
 
     def delete(self, mid):
         self.deleted.append(mid)
+        if self.cleanup_fails and self.fail_create:
+            raise MachineError('delete refused')
         self.machines.pop(mid, None)
 
 
@@ -111,7 +123,151 @@ def test_never_joined_is_deleted_and_failed_create_touches_nothing_else():
     p2 = planner(PlannerLimits(max_machines=2, max_hourly_usd=2, max_create_per_round=1), providers={'boat': bad})
     [(a, r)] = p2.step(snap(waiting=1))
     assert r.startswith('failed') and p2.owned == {}
-    assert bad.deleted == [] and 'cp' in bad.machines                   # cleanup is the provider's job, not ours
+    assert bad.deleted == ['boat-1'] and 'cp' in bad.machines           # the provider deletes only its own create
+
+
+def test_failed_cleanup_becomes_orphaned_and_is_retried(tmp_path):
+    st = node_store(tmp_path)
+    bad = FakeProvider('boat', [Offer('large', 8, 16, 125, 0.072)], fail_create=True, cleanup_fails=True)
+    bad.machines['cp'] = Machine('cp', 'boat', 'hosted-env-cp1', 'running', 'large')
+    lim = PlannerLimits(max_machines=1, max_hourly_usd=1, max_create_per_round=1)
+    p = Planner({'boat': bad}, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=Clock(), ledger=st)
+    [(a, r)] = p.step(snap(waiting=1))
+    assert 'cleanup failed' in r and p.owned[a.name].state == 'orphaned'
+    [row] = st.machines(origin='planner')
+    assert (row['machine_id'], row['state']) == ('boat-1', 'orphaned') and 'cleanup failed' in row['note']
+    acts = p.plan(snap(waiting=1))                                       # max_machines is spent: no new create
+    assert [(x.kind, x.machine_id) for x in acts] == [('delete', 'boat-1')]
+    bad.cleanup_fails = False                                            # the provider recovers
+    [(a, r)] = p.step(snap(waiting=0))
+    assert r == 'deleted' and p.owned == {} and 'cp' in bad.machines
+    assert st.machines(origin='planner') == []
+    [hist] = [x for x in st.machines(live=False) if x['machine_id'] == 'boat-1']
+    assert hist['state'] == 'deleted' and hist['ended_at'] is not None
+
+
+def test_machine_is_recorded_before_boot_and_survives_a_crash(tmp_path):
+    st = node_store(tmp_path)
+    seen = []
+
+    class Crash(BaseException):
+        pass
+
+    def crash(mid):                                                      # the process dies during the boot
+        seen.append([(r['machine_id'], r['state']) for r in st.machines()])
+        raise Crash
+    prov = FakeProvider('boat', [Offer('large', 8, 16, 125, 0.072)], during_boot=crash)
+    lim = PlannerLimits(max_machines=1, max_hourly_usd=1, max_create_per_round=1, join_timeout=100)
+    p = Planner({'boat': prov}, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=Clock(), ledger=st)
+    with pytest.raises(Crash):
+        p.step(snap(waiting=1))
+    assert seen == [[('boat-1', 'creating')]]
+    prov.during_boot = None
+    clock = Clock()
+    p2 = Planner({'boat': prov}, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=clock, ledger=st)
+    [o] = p2.owned.values()
+    assert (o.machine_id, o.state) == ('boat-1', 'creating')
+    assert p2.plan(snap(waiting=1)) == []                                # it counts against max_machines
+    clock.t += 101
+    [(a, r)] = p2.step(snap(waiting=0))
+    assert (a.reason, r) == ('never joined the cluster', 'deleted') and prov.machines == {}
+
+
+def test_inventory_records_unmanaged_and_gone_machines(tmp_path):
+    st = node_store(tmp_path)
+    prov = FakeProvider('targon', [Offer('cpu-small-amd', 4, 52, 384, 0.15)])
+    prov.machines['wrk-cp'] = Machine('wrk-cp', 'targon', 'hosted-env-cp1', 'running', 'cpu-small-amd',
+                                      public_ipv4='160.0.0.1', price_per_hour=0.15)
+    clock = Clock()
+    lim = PlannerLimits(max_machines=1, max_hourly_usd=1, max_create_per_round=1, idle_grace=0)
+    p = Planner({'targon': prov}, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=clock, ledger=st,
+                inventory_interval=60)
+    [(a, r)] = p.step(snap(waiting=1))                                   # lists first, then creates
+    assert r == 'created targon-1' and p.inventory_last['new'] == [('targon', 'wrk-cp', 'hosted-env-cp1')]
+    rows = {x['machine_id']: x for x in st.machines()}
+    assert (rows['wrk-cp']['origin'], rows['wrk-cp']['public_ipv4']) == ('unmanaged', '160.0.0.1')
+    assert (rows['targon-1']['origin'], rows['targon-1']['state']) == ('planner', 'running')
+    assert 'wrk-cp' not in {o.machine_id for o in p.owned.values()}      # counted, never the planner's to delete
+    p.step(snap(nodes={a.name: {'slots': 3, 'used': 3}}))
+    assert p.inventory_last['at'] == 1000.0                              # not listed again before 60 s
+    del prov.machines['wrk-cp']                                          # someone deleted the control plane
+    hidden = prov.machines.pop('targon-1')                               # and a list misses our own machine
+    clock.t += 61
+    assert p.step(snap(nodes={a.name: {'slots': 3, 'used': 3}})) == []
+    assert p.inventory_last['gone'] == [('targon', 'wrk-cp', 'hosted-env-cp1')]
+    states = {x['machine_id']: x['state'] for x in st.machines(live=False)}
+    assert states == {'wrk-cp': 'gone', 'targon-1': 'running'}           # ours is never forgotten by a list
+    prov.machines['targon-1'] = hidden
+    [(a2, r2)] = p.step(snap(nodes={a.name: {'slots': 3, 'used': 0}}))
+    assert (a2.kind, r2) == ('delete', 'deleted')
+
+
+def test_inventory_lists_even_in_dry_run_and_skips_a_failing_provider(tmp_path):
+    st = node_store(tmp_path)
+
+    class Down(FakeProvider):
+        def list(self):
+            raise MachineError('targon GET /orgs: ConnectError')
+    up = FakeProvider('boat', [Offer('large', 8, 16, 125, 0.072)])
+    up.machines['bx_9'] = Machine('bx_9', 'boat', 'hosted-env-old', 'running', 'large')
+    down = Down('targon', [])
+    p = Planner({'boat': up, 'targon': down}, PlannerLimits(max_machines=1, max_hourly_usd=1),
+                boot_script=lambda pn, spec: '', clock=Clock(), ledger=st)
+    assert p.dry_run is True
+    p.step(snap(waiting=1))
+    assert p.inventory_last['errors'] == {'targon': 'targon GET /orgs: ConnectError'}
+    assert [x['machine_id'] for x in st.machines()] == ['bx_9'] and up.created == [] and up.deleted == []
+
+
+def test_old_planner_ledger_is_migrated(tmp_path):
+    import sqlite3
+    db = tmp_path / 'old.db'
+    con = sqlite3.connect(db)
+    con.execute('CREATE TABLE planner_machines (name TEXT PRIMARY KEY, provider TEXT NOT NULL, machine_id TEXT '
+                'NOT NULL, price_per_hour REAL NOT NULL, slots INTEGER NOT NULL, created_at REAL NOT NULL)')
+    con.execute("INSERT INTO planner_machines VALUES ('hosted-env-boat-a1', 'boat', 'bx_1', 0.072, 7, 500.0)")
+    con.commit()
+    con.close()
+    from nacl.signing import SigningKey
+
+    from hosted_env.coordinator.store import Store
+    st = Store(str(db), {}, SigningKey.generate())
+    [r] = st.machines()
+    assert (r['name'], r['machine_id'], r['origin'], r['state'], r['slots']) == ('hosted-env-boat-a1', 'bx_1',
+                                                                                'planner', 'running', 7)
+    tables = {t for (t,) in st.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert 'planner_machines' not in tables
+    assert Store(str(db), {}, SigningKey.generate()).machines() == st.machines()   # idempotent
+
+
+def test_cli_machines_prints_the_inventory(tmp_path, capsys):
+    import json
+
+    from nacl.signing import SigningKey
+
+    from hosted_env.cli import main
+    from hosted_env.coordinator.store import Store
+    st = Store(str(tmp_path / 'g.db'), {}, SigningKey.generate())
+    st.machine_created('boat', 'bx_1', 'hosted-env-boat-a1', 'large', 0.072, 7, now=1000.0)
+    st.machine_set_state('boat', 'bx_1', 'deleted', now=1000.0 + 7200, note='idle for 600s')
+    st.machine_created('boat', 'bx_2', 'hosted-env-boat-b2', 'large', 0.072, 7, now=2000.0)
+    st.machine_seen('targon', Machine('wrk-cp', 'targon', 'hosted-env-cp1', 'running', 'cpu-small-amd',
+                                      public_ipv4='160.0.0.1', price_per_hour=0.15), now=3000.0)
+    cfg = tmp_path / 'server.toml'
+    cfg.write_text('db = "g.db"\n')
+    main(['machines', '--config', str(cfg), '--json'])
+    out = json.loads(capsys.readouterr().out)
+    assert sorted(r['machine_id'] for r in out['machines']) == ['bx_2', 'wrk-cp']       # live only by default
+    main(['machines', '--config', str(cfg), '--all', '--json'])
+    rows = {r['machine_id']: r for r in json.loads(capsys.readouterr().out)['machines']}
+    assert rows['bx_1']['hours'] == 2.0 and rows['bx_1']['est_cost_usd'] == 0.144
+    main(['machines', '--config', str(cfg)])
+    text = capsys.readouterr().out
+    assert 'hosted-env-cp1' in text and 'unmanaged' in text and 'bx_1' not in text.split('\n\n')[0]
+    assert 'live: 2 machines (planner 1, unmanaged 1), $0.222/h' in text
+    assert 'planner, all time: 2 machines' in text
+    with pytest.raises(ValueError, match='--refresh'):
+        main(['machines', '--config', str(cfg), '--refresh'])
 
 
 def test_owned_machines_survive_a_restart(tmp_path):
@@ -121,11 +277,13 @@ def test_owned_machines_survive_a_restart(tmp_path):
     p = Planner(provs, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=Clock(), ledger=st)
     p.step(snap(waiting=1))
     [name] = p.owned
-    assert st.planner_machines()[0]['name'] == name and st.planner_machines()[0]['slots'] == 7
+    [row] = st.machines(origin='planner')
+    assert (row['name'], row['slots'], row['state']) == (name, 7, 'running')
     p2 = Planner(provs, lim, boot_script=lambda pn, spec: '', dry_run=False, clock=Clock(), ledger=st)
     assert p2.owned[name].machine_id == 'boat-1'                        # remembered, so still deletable
     [(a, r)] = p2.step(snap(nodes={name: {'slots': 7, 'used': 0}}))
-    assert (a.kind, r) == ('delete', 'deleted') and st.planner_machines() == [] and provs['boat'].machines == {}
+    assert (a.kind, r) == ('delete', 'deleted') and st.machines() == [] and provs['boat'].machines == {}
+    assert [x['state'] for x in st.machines(live=False)] == ['deleted']   # history is kept
 
 
 def test_store_capacity_snapshot(tmp_path):

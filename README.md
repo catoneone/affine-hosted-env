@@ -50,6 +50,8 @@ port, for both the control plane and `/v1/start` / `/v1/turn`.
 hosted-env keygen keys/gateway.key        # signs session tokens
 hosted-env keygen keys/executor.key       # signs receipts (must be a different key)
 hosted-env server --config examples/server.toml            # default 127.0.0.1:8780
+hosted-env machines --config examples/server.toml          # machine inventory: what runs where, hours, est. cost
+                                                           # --all adds history, --refresh lists the providers now
 ```
 
 Split mode (a separate executor process that reaches the gateway over HTTP):

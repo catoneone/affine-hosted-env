@@ -105,10 +105,24 @@ CREATE TABLE IF NOT EXISTS demand (epoch TEXT NOT NULL, hotkey TEXT NOT NULL, at
     PRIMARY KEY (epoch, hotkey));
 CREATE TABLE IF NOT EXISTS nodes (
     name TEXT PRIMARY KEY, slots INTEGER NOT NULL, images TEXT NOT NULL, last_seen REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS planner_machines (
-    name TEXT PRIMARY KEY, provider TEXT NOT NULL, machine_id TEXT NOT NULL, price_per_hour REAL NOT NULL,
-    slots INTEGER NOT NULL, created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS machines (
+    provider TEXT NOT NULL, machine_id TEXT NOT NULL, name TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('planner', 'static', 'unmanaged')),
+    state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'orphaned', 'deleted', 'gone')),
+    provider_state TEXT, kind TEXT NOT NULL DEFAULT '', price_per_hour REAL, slots INTEGER NOT NULL DEFAULT 0,
+    public_ipv4 TEXT, public_ipv6 TEXT, created_at REAL NOT NULL, last_seen REAL, ended_at REAL,
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (provider, machine_id));
+CREATE INDEX IF NOT EXISTS machines_state ON machines (state);
 '''
+
+# Machine inventory states. Live: creating (the planner asked for it, the boot is not done or was interrupted),
+# running (it exists), orphaned (the planner's create failed and the provider could not delete it; the planner
+# retries the delete). Ended: deleted (by the planner, or cleaned up after a failed create), gone (a machine the
+# planner does not own stopped being listed by its provider).
+LIVE_MACHINE_STATES = ('creating', 'running', 'orphaned')
+_MACHINE_COLS = ('provider', 'machine_id', 'name', 'origin', 'state', 'provider_state', 'kind', 'price_per_hour',
+                 'slots', 'public_ipv4', 'public_ipv6', 'created_at', 'last_seen', 'ended_at', 'note')
 
 
 class Store:
@@ -125,6 +139,12 @@ class Store:
         self.db.executescript(SCHEMA)
         if 'node' not in {r[1] for r in self.db.execute('PRAGMA table_info(tasks)')}:
             self.db.execute('ALTER TABLE tasks ADD COLUMN node TEXT')      # databases created before nodes
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='planner_machines'").fetchone():
+            # databases from before the inventory: the planner's own machines move into `machines`
+            self.db.executescript(
+                'BEGIN; INSERT OR IGNORE INTO machines (provider, machine_id, name, origin, state, price_per_hour, '
+                "slots, created_at) SELECT provider, machine_id, name, 'planner', 'running', price_per_hour, slots, "
+                'created_at FROM planner_machines; DROP TABLE planner_machines; COMMIT;')
         self._mu = threading.RLock()       # one connection shared by many request threads
 
     # ------------------------------------------------------------ transactions
@@ -439,25 +459,77 @@ class Store:
             else:
                 self._maybe_done(cur, task_id, now)
 
-    # ------------------------------------------------------------ capacity planner ledger
-    def planner_machines(self) -> list[dict]:
-        """Machines the capacity planner created and has not deleted (survives restarts)."""
+    # ------------------------------------------------------------ machine inventory
+    def machines(self, *, live: bool = True, provider: str | None = None, origin: str | None = None) -> list[dict]:
+        """Every machine we know of (survives restarts). live=True: only creating / running / orphaned ones;
+        live=False also returns the history (deleted, gone)."""
+        q, args = f'SELECT {", ".join(_MACHINE_COLS)} FROM machines WHERE 1=1', []
+        if live:
+            q += f' AND state IN ({", ".join("?" * len(LIVE_MACHINE_STATES))})'
+            args += LIVE_MACHINE_STATES
+        for col, v in (('provider', provider), ('origin', origin)):
+            if v is not None:
+                q += f' AND {col} = ?'
+                args.append(v)
         with self._tx() as cur:
-            rows = cur.execute('SELECT name, provider, machine_id, price_per_hour, slots, created_at '
-                               'FROM planner_machines').fetchall()
-        keys = ('name', 'provider', 'machine_id', 'price_per_hour', 'slots', 'created_at')
-        return [dict(zip(keys, r, strict=True)) for r in rows]
+            rows = cur.execute(q + ' ORDER BY created_at, provider, machine_id', args).fetchall()
+        return [dict(zip(_MACHINE_COLS, r, strict=True)) for r in rows]
 
-    def planner_machine_put(self, provider: str, machine_id: str, name: str, price_per_hour: float, slots: int,
-                            created_at: float) -> None:
+    def machine_created(self, provider: str, machine_id: str, name: str, kind: str, price_per_hour: float,
+                        slots: int, now: float) -> None:
+        """The planner asked `provider` for a machine and got `machine_id` (recorded before the slow boot)."""
         with self._tx() as cur:
-            cur.execute('INSERT OR REPLACE INTO planner_machines (name, provider, machine_id, price_per_hour, slots, '
-                        'created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                        (name, provider, machine_id, price_per_hour, slots, created_at))
+            cur.execute('INSERT OR REPLACE INTO machines (provider, machine_id, name, origin, state, kind, '
+                        "price_per_hour, slots, created_at, last_seen) VALUES (?, ?, ?, 'planner', 'creating', ?, ?, "
+                        '?, ?, ?)', (provider, machine_id, name, kind, price_per_hour, slots, now, now))
 
-    def planner_machine_drop(self, name: str) -> None:
+    def machine_set_state(self, provider: str, machine_id: str, state: str, now: float, note: str | None = None):
+        ended = state not in LIVE_MACHINE_STATES
         with self._tx() as cur:
-            cur.execute('DELETE FROM planner_machines WHERE name = ?', (name,))
+            cur.execute('UPDATE machines SET state = ?, ended_at = ?, note = COALESCE(?, note) '
+                        'WHERE provider = ? AND machine_id = ?',
+                        (state, now if ended else None, note, provider, machine_id))
+
+    def machine_note(self, provider: str, machine_id: str, note: str) -> None:
+        with self._tx() as cur:
+            cur.execute('UPDATE machines SET note = ? WHERE provider = ? AND machine_id = ?',
+                        (note, provider, machine_id))
+
+    def machine_seen(self, provider: str, m, now: float, origin: str = 'unmanaged') -> bool:
+        """Record that `provider` lists machine `m` (a providers.machine.Machine). A machine we did not know is
+        added with `origin` (static or unmanaged); a known one gets its last_seen, provider state and addresses
+        refreshed, and is never re-labelled. Returns True when the machine is new to the inventory."""
+        with self._tx() as cur:
+            row = cur.execute('SELECT state FROM machines WHERE provider = ? AND machine_id = ?',
+                              (provider, m.id)).fetchone()
+            if row is None or row[0] == 'gone':        # gone and back (e.g. a stopped VM resumed): count it again
+                cur.execute('INSERT OR REPLACE INTO machines (provider, machine_id, name, origin, state, '
+                            'provider_state, kind, price_per_hour, public_ipv4, public_ipv6, created_at, last_seen, '
+                            "note) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (provider, m.id, m.name, origin, m.state, m.kind, m.price_per_hour, m.public_ipv4,
+                             m.public_ipv6, m.created_at or now, now,
+                             '' if origin == 'static' else 'not created by the planner; never deleted automatically'))
+                return True
+            # the name is never overwritten: boat may report its own name, and ours is also the k3s node name
+            cur.execute('UPDATE machines SET last_seen = ?, provider_state = ?, '
+                        'kind = CASE WHEN ? != \'\' THEN ? ELSE kind END, '
+                        'price_per_hour = COALESCE(price_per_hour, ?), '
+                        'public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6) '
+                        'WHERE provider = ? AND machine_id = ?',
+                        (now, m.state, m.kind, m.kind, m.price_per_hour, m.public_ipv4, m.public_ipv6,
+                         provider, m.id))
+            return False
+
+    def machines_missing(self, provider: str, listed_ids, now: float) -> list[dict]:
+        """Machines we do not own (static / unmanaged) that `provider` no longer lists are marked gone. The planner's
+        own machines are never marked gone here: a list that misses one (paging bug, renamed machine) must not make
+        the planner forget a machine that may still bill; the planner's own delete path ends those."""
+        listed = set(listed_ids)
+        gone = [r for r in self.machines(provider=provider)
+                if r['origin'] != 'planner' and r['machine_id'] not in listed]
+        for r in gone:
+            self.machine_set_state(provider, r['machine_id'], 'gone', now)
+        return gone
 
     # ------------------------------------------------------------ stats
     def capacity_snapshot(self, now: float | None = None) -> dict:

@@ -109,9 +109,17 @@ Each step is one PR with tests green:
    node boot script (`bootstrap.py`: firewall, gVisor, WireGuard port, pinned k3s agent). `coordinator/planner.py`
    turns waiting demand into machines and deletes idle ones, bounded by `max_machines`, `max_hourly_usd` and
    `max_create_per_round`, and runs in dry-run mode unless told otherwise. It runs inside the server process
-   (`[machines]` in the config, a background round every `interval` seconds, plans logged when they change), keeps
-   the machines it owns in the coordinator Store so a restart does not orphan them, and never deletes a machine it
-   did not create; a failed create is cleaned up by the provider.
+   (`[machines]` in the config, a background round every `interval` seconds, plans logged when they change) and
+   never deletes a machine it did not create.
+   Machine inventory: every machine is kept in the Store's `machines` table, with history. The planner records
+   its machines as soon as the provider assigns an id (before the slow boot, so a crash mid-create cannot forget a
+   billed machine); a failed create is cleaned up by the provider, which deletes only the machine it was creating,
+   and if that delete fails the machine is marked `orphaned` and the planner retries it every round. Every
+   `inventory_interval` seconds (read only, also in dry-run) each provider is listed: `hosted-env-` machines the
+   planner did not create (the control plane, leftovers) are recorded as `unmanaged` and logged, never deleted;
+   ones that disappear become `gone`. A provider list that misses one of the planner's own machines never makes it
+   forget the machine. `hosted-env machines --config <file> [--all] [--refresh]` prints the inventory with hours
+   and an estimated cost at list prices.
 6. **Live P0** on a small cluster. Needs a decision on the control-plane host.
 
 ## Open

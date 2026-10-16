@@ -17,7 +17,8 @@ import uuid
 
 import httpx
 
-from .base import NAME_PREFIX, BootScript, Machine, MachineError, MachineSpec, Offer, resolve_boot_script
+from .base import (NAME_PREFIX, BootScript, Machine, MachineError, MachineSpec, Offer, create_then_boot,
+                   resolve_boot_script)
 
 API = 'https://boat.dev/api/v1'
 BOOT_PATH = '/home/user/hosted-env-boot.sh'
@@ -98,21 +99,14 @@ class BoatProvider:
     def get(self, machine_id: str) -> Machine:
         return self._machine(self._req('GET', f'/sandboxes/{machine_id}')['sandbox'])
 
-    def create(self, spec: MachineSpec, boot_script: BootScript) -> Machine:
+    def create(self, spec: MachineSpec, boot_script: BootScript, on_created=None) -> Machine:
         body = {'type': spec.kind, 'name': spec.name}
         if spec.ttl_seconds:
             body['ttlSeconds'] = int(spec.ttl_seconds)
         d = self._req('POST', '/sandboxes', json=body, headers={'Idempotency-Key': uuid.uuid4().hex})
         mid = d['sandbox']['id']
         self._owned.add(mid)
-        try:
-            return self._boot(mid, boot_script)
-        except Exception:
-            try:                                  # a half-created machine still bills: remove it, then report
-                self.delete(mid)
-            except MachineError:
-                pass
-            raise
+        return create_then_boot(self, mid, lambda: self._boot(mid, boot_script), on_created)
 
     def _boot(self, mid: str, boot_script: BootScript) -> Machine:
         deadline = time.monotonic() + self.ready_timeout

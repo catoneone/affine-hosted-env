@@ -21,7 +21,7 @@ class StaticProvider:
     def list(self) -> list[Machine]:
         return list(self._machines)
 
-    def create(self, spec, boot_script: str) -> Machine:
+    def create(self, spec, boot_script: str, on_created=None) -> Machine:
         raise NotSupported('static machines are registered by hand')
 
     def delete(self, machine_id: str) -> None:

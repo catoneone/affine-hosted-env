@@ -24,6 +24,16 @@ class NotSupported(MachineError):
     """The provider cannot do this (for example creating machines in the static provider)."""
 
 
+class CreateFailed(MachineError):
+    """`create` failed after the provider had already made a machine. The provider tried to delete that one machine
+    (and nothing else); `cleaned` says whether it succeeded. When it did not, the machine may still be billing and
+    the caller owns the retry."""
+
+    def __init__(self, message: str, *, machine_id: str, cleaned: bool):
+        super().__init__(message)
+        self.machine_id, self.cleaned = machine_id, cleaned
+
+
 @dataclass(frozen=True)
 class Offer:
     """A machine type the provider can create right now."""
@@ -75,10 +85,14 @@ class MachineProvider(Protocol):
     def list(self) -> list[Machine]:
         """Machines this provider created for hosted-env (name prefix), in any state but deleted."""
 
-    def create(self, spec: MachineSpec, boot_script: BootScript) -> Machine:
+    def create(self, spec: MachineSpec, boot_script: BootScript,
+               on_created: Callable[[str], None] | None = None) -> Machine:
         """Create and start one machine that runs `boot_script` once at first boot. Costs money.
-        On failure the provider deletes the machine it was creating before raising, so a failed create never
-        leaves a billed machine behind (and nothing else is touched).
+        `on_created(machine_id)` is called as soon as the provider has assigned an id, before the (slow) boot, so the
+        caller can record the machine even if this process dies mid-create.
+        If anything fails after that, the provider deletes the machine it was creating (nothing else) and raises
+        `CreateFailed`, whose `cleaned` says whether that delete worked. A failure before an id exists raises a
+        plain MachineError: no machine was made.
         `boot_script` may be a callable taking the running Machine, for scripts that need its public endpoints
         (Targon only reveals remapped ports once the VM runs)."""
 
@@ -91,3 +105,21 @@ BootScript = str | Callable[[Machine], str]
 
 def resolve_boot_script(script: BootScript, machine: Machine) -> str:
     return script(machine) if callable(script) else script
+
+
+def create_then_boot(provider, machine_id: str, boot: Callable[[], Machine],
+                     on_created: Callable[[str], None] | None) -> Machine:
+    """Shared tail of `create` once the provider has assigned `machine_id`: report it, boot, and on any failure
+    delete exactly that machine and raise CreateFailed."""
+    try:
+        if on_created is not None:
+            on_created(machine_id)
+        return boot()
+    except Exception as e:
+        try:                                  # a half-created machine still bills: remove it, then report
+            provider.delete(machine_id)
+            cleaned = True
+        except MachineError:
+            cleaned = False
+        msg = str(e) if isinstance(e, MachineError) else f'{type(e).__name__}: {e}'
+        raise CreateFailed(msg, machine_id=machine_id, cleaned=cleaned) from e
