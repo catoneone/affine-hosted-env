@@ -323,6 +323,11 @@ def test_finish_returns_a_gateway_signed_seal(tmp_path):
     assert (c['opened_at_ms'], c['finished_at_ms'], c['task_id']) == (int(NOW * 1000), int((NOW + 9.5) * 1000),
                                                                       t['task_id'])
     assert st.finish_task(EPOCH, '5H0', t['task_id'], now=NOW + 99) == seal
+    st.envs['env'].group_size = 3                  # a config change after the task was opened does not resize it
+    t2 = st.open_task(EPOCH, '5H1', 'env', now=NOW)
+    st.envs['env'].group_size = 8
+    assert len(verify_group_seal(st.finish_task(EPOCH, '5H1', t2['task_id'], now=NOW + 1), key.verify_key,
+                                 epoch=EPOCH, hotkey='5H1', env_id='env', task=t2['task'], group_size=3)['receipts']) == 3
     for kw, code in (({'hotkey': '5H1'}, 'seal_identity_mismatch'), ({'group_size': 3}, 'seal_identity_mismatch')):
         with pytest.raises(ReceiptError, match=code):
             verify_group_seal(seal, key.verify_key, **{**dict(epoch=EPOCH, hotkey='5H0', env_id='env',

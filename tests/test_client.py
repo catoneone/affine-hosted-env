@@ -60,3 +60,15 @@ def test_other_errors_still_raise():
     with pytest.raises(ApiError, match='unknown_hotkey'):
         run_task(FakeGateway(finish_error=ApiError(403, 'unknown_hotkey')), 'e1', 'swe', sampler(),
                  worker_factory=FakeWorker)
+
+
+def test_group_without_a_seal_is_not_uploaded():
+    """finish refused (404/409/410) after all rollouts completed: no seal, so the group could never verify."""
+    class NoSealWorker(FakeWorker):
+        def turn(self, token, seq, tokens):
+            return {'done': True, 'receipt': {'payload': 'x', 'sig': 'y'}, 'outcome': 'completed', 'reward': 0.0,
+                    'detail': 'submitted', 'steps': 1}
+    gw = FakeGateway(finish_error=ApiError(409, 'task_finished'))
+    res = run_task(gw, 'e1', 'swe', sampler(), worker_factory=NoSealWorker)
+    assert res['voided'] is True and res['attachment'] is None
+    assert [x['outcome'] for x in res['rollouts']] == ['completed'] * 3

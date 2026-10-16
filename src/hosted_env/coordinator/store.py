@@ -419,14 +419,14 @@ class Store:
             return self._seal(cur, task_id)
 
     def _seal(self, cur, task_id: str) -> dict | None:
-        epoch, hotkey, env_id, task, state, started, ended, seal = cur.execute(
-            'SELECT epoch, hotkey, env_id, task, state, started_at, ended_at, seal FROM tasks WHERE task_id=?',
+        epoch, hotkey, env_id, task, state, started, ended, seal, size = cur.execute(
+            'SELECT epoch, hotkey, env_id, task, state, started_at, ended_at, seal, slots FROM tasks WHERE task_id=?',
             (task_id,)).fetchone()
         if state != 'done':
             return None
         if seal:
             return json.loads(seal)
-        size = self._env(env_id).group_size
+        # size: the group size the task was opened with (its reserved slots), not today's env config
         got = dict(cur.execute('SELECT nonce, receipt_sha256 FROM sessions WHERE task_id=?', (task_id,)).fetchall())
         out = sign_group_seal(self.signing_key, epoch=epoch, hotkey=hotkey, env_id=env_id, task=task,
                               task_id=task_id, group_size=size, opened_at_ms=int(started * 1000),
