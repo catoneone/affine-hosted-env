@@ -269,11 +269,11 @@ class SweEnv(DockerTaskEnv):
         names containing ' b/' come out right). For a rename or copy git apply names only the new side, which is
         all locking needs; to know everything a patch changes, including the path a rename removes, use
         _changed_paths."""
-        r = sb.execute(f'set -o pipefail; git apply --numstat -z {path} | base64 | tr -d "\\n"', cwd=repo,
+        r = sb.execute(f'set -o pipefail; git apply --numstat -z {path} 2>/dev/null | base64 | tr -d "\\n"', cwd=repo,
                        timeout=120, login=False)
         if r['returncode'] != 0:
             raise GradeError(f'cannot list the paths of {path}: ' + r['output'][-300:])
-        items, out, i = base64.b64decode(r['output'].strip()).split(b'\0'), [], 0
+        items, out, i = base64.b64decode(r['output'].strip(), validate=True).split(b'\0'), [], 0
         while i < len(items):
             fields = items[i].split(b'\t')
             if len(fields) == 3 and fields[2] == b'' and i + 2 < len(items):   # diff-style rename record, tolerated
@@ -285,19 +285,30 @@ class SweEnv(DockerTaskEnv):
             i += 1
         return out
 
-    def _changed_paths(self, sb, repo: str, start: str, path: str) -> list[bytes]:
+    def _changed_paths(self, sb, repo: str, start: str, path: str) -> tuple[list[bytes] | None, str]:
         """Every path whose content or mode the patch at `path` changes relative to the tree `start`, with renames
         and copies counted as their separate deletes and adds. The patch is applied to a throwaway index holding
         `start` by the grading container's own git and compared with --no-renames, so a protected file the model
-        renamed away (conftest.py -> notes.txt) is reported and put back, and force-added ignored files count."""
-        r = sb.execute(f'set -o pipefail; export GIT_INDEX_FILE={TREE_INDEX_REMOTE}; rm -f "$GIT_INDEX_FILE"; '
-                       f'git read-tree {start} 2>/dev/null && '
-                       f'git apply --cached --binary --whitespace=nowarn {path} 2>/dev/null && '
-                       f'git diff --cached --no-renames --no-ext-diff --name-only -z {start} | base64 | tr -d "\\n"; '
-                       'rc=$?; rm -f "$GIT_INDEX_FILE"; exit $rc', cwd=repo, timeout=300, login=False)
+        renamed away (conftest.py -> notes.txt) is reported and put back, and force-added ignored files count.
+        Returns (paths, '') or, when the patch does not apply to the start tree itself, (None, git's complaint):
+        a real diff between two trees always applies there, so that is the model's doing (for example a hunk on a
+        git-ignored file that exists on disk but in neither tree) and is graded 0, never an infra error."""
+        idx = f'GIT_INDEX_FILE={TREE_INDEX_REMOTE}'
+        r = sb.execute(f'rm -f {TREE_INDEX_REMOTE} && {idx} git read-tree {start}', cwd=repo, timeout=120,
+                       login=False)
+        if r['returncode'] != 0:
+            raise GradeError('cannot load the start tree into a scratch index: ' + r['output'][-300:])
+        ap = sb.execute(f'{idx} git apply --cached --binary --whitespace=nowarn {path}', cwd=repo, timeout=300,
+                        login=False)
+        if ap['returncode'] != 0:
+            sb.execute(f'rm -f {TREE_INDEX_REMOTE}', timeout=60, login=False)
+            return None, ap['output'][-300:]
+        r = sb.execute(f'set -o pipefail; {idx} git diff --cached --no-renames --no-ext-diff --name-only -z {start} '
+                       f'2>/dev/null | base64 | tr -d "\\n"; rc=$?; rm -f {TREE_INDEX_REMOTE}; exit $rc', cwd=repo,
+                       timeout=300, login=False)
         if r['returncode'] != 0:
             raise GradeError(f'cannot list the paths {path} changes: ' + r['output'][-300:])
-        return [p for p in base64.b64decode(r['output'].strip()).split(b'\0') if p]
+        return [p for p in base64.b64decode(r['output'].strip(), validate=True).split(b'\0') if p], ''
 
     def _reset_paths(self, sb, repo: str, start: str, paths: list[bytes]) -> None:
         """Put each path back to the start tree, or delete it when the start tree does not have it (NUL-separated,
@@ -394,13 +405,14 @@ fi
             reverted = []
             if patch:
                 self._put_bytes(sb, patch, MODEL_PATCH_REMOTE)
-                ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
-                                timeout=300, login=False)
-                if ap['returncode'] != 0:                   # same start tree, so only the patch can be at fault
-                    sb.execute(f'rm -f {MODEL_PATCH_REMOTE}', timeout=60, login=False)
-                    return {**res, 'grade_detail': 'model_patch_does_not_apply: ' + ap['output'][-300:]}
-                touched = self._changed_paths(sb, repo, start, MODEL_PATCH_REMOTE)
+                touched, why = self._changed_paths(sb, repo, start, MODEL_PATCH_REMOTE)   # first: changes nothing
+                if touched is not None:
+                    ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
+                                    timeout=300, login=False)
+                    why = '' if ap['returncode'] == 0 else ap['output'][-300:]
                 sb.execute(f'rm -f {MODEL_PATCH_REMOTE}', timeout=60, login=False)
+                if touched is None or why:                  # same start tree, so only the patch can be at fault
+                    return {**res, 'grade_detail': 'model_patch_does_not_apply: ' + why}
                 prot = protected_paths([p.decode('utf-8', 'surrogateescape') for p in touched])
                 reverted = sorted(set(prot))
                 self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])

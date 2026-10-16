@@ -173,6 +173,23 @@ def test_protected_file_renamed_away_is_put_back(tmp_path):
     assert g['reward'] == 1.0 and g['reverted_paths'] == ['conftest.py']
 
 
+def test_crafted_patch_on_an_ignored_file_scores_0_not_infra_error(tmp_path):
+    """A hunk on a git-ignored file that exists on disk applies in the worktree but not to the start tree. A real
+    tree-to-tree diff cannot contain it, so the model's own git produced it: graded 0, never a voided rollout."""
+    import subprocess
+    env, task = make_task(tmp_path)
+    subprocess.run(['bash', '-c', 'printf ".env\\n" > .gitignore && printf "SECRET=1\\n" > .env'],
+                   cwd=env.public_spec(task)['image'], check=True)
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    crafted = (b'diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-SECRET=1\n+SECRET=2\n')
+    env.capture_patch = lambda _s: (crafted, '')                      # what a replaced git binary could send
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert g['reward'] == 0.0 and g['grade_detail'].startswith('model_patch_does_not_apply: ')
+    assert '.env' in g['grade_detail']
+
+
 def test_patch_problems_are_the_models_own_zero(tmp_path):
     g, _ = graded(tmp_path, 'head -c 2500000 /dev/urandom | base64 > big.txt')
     assert (g['reward'], g['grade_detail'], g['model_patch']) == (0.0, 'model_patch_too_large', '')
