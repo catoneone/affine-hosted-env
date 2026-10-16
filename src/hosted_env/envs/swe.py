@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import re
+import shlex
 import time
 
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
@@ -134,6 +135,15 @@ TEST_PATCH_REMOTE = '/tmp/_hosted_env_test.patch'
 MODEL_PATCH_REMOTE = '/tmp/_hosted_env_model.patch'
 RESET_LIST_REMOTE = '/tmp/_hosted_env_reset.list'
 TREE_INDEX_REMOTE = '/tmp/_hosted_env_tree.index'
+LOCK_LIST_REMOTE = '/tmp/_hosted_env_lock.list'
+GRADER_UID = 65534                     # nobody: the hidden tests run without root (cfg grader_user = "root" to opt out)
+
+
+def as_grader(command: str) -> str:
+    """Run `command` as GRADER_UID with no supplementary groups and no profile or rc file. HOME stays the
+    image's (its caches and toolchains: Go module cache, nvm, cargo, ...), which _lock_down hands to the grader."""
+    return (f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups -- '
+            f'env USER=nobody LOGNAME=nobody bash --noprofile --norc -c {shlex.quote(command)}')
 MAX_MODEL_PATCH_BYTES = 2_000_000
 GRADER_VERSION = 'isolated-v1'
 
@@ -282,6 +292,35 @@ class SweEnv(DockerTaskEnv):
         if r['returncode'] != 0:
             raise GradeError('reset_protected_failed: ' + r['output'][-300:])
 
+    def _lock_down(self, sb, repo: str, test_patch: str) -> float:
+        """Before the hidden tests run as GRADER_UID. The repo and the image's HOME become the grader's, so tests
+        write caches and scratch files exactly where they would as root (pytest cache, rollup temp configs, the
+        Go build cache, nvm/cargo toolchains). The test infrastructure stays root's: every file of the test patch
+        is root-owned and read-only, and each directory holding one, up to the repo root, is root-owned with mode
+        1777 (like /tmp), so the grader can create files there but cannot replace, rename or delete the tests or
+        the grading script while they run. Returns the seconds it took. (EXP-018 parity runs: a read-only repo
+        root broke pytest with -W error and rollup; a changed HOME hid the Go module cache.)"""
+        t0 = time.time()
+        files = [f.encode('utf-8', 'surrogateescape') for f in patch_touched_files(test_patch)]
+        self._put_bytes(sb, b'\0'.join(files) + (b'\0' if files else b''), LOCK_LIST_REMOTE)
+        r = sb.execute(f'''set -e
+command -v setpriv >/dev/null || {{ echo "setpriv not found: cannot drop privileges"; exit 3; }}
+chown -R {GRADER_UID}:{GRADER_UID} .
+h="${{HOME:-/root}}"
+if [ -d "$h" ] && [ "$h" != / ]; then chown -R {GRADER_UID}:{GRADER_UID} "$h"; fi
+while IFS= read -r -d "" f; do
+  [ -e "$f" ] || [ -L "$f" ] || continue
+  chown -h 0:0 -- "$f"; [ -L "$f" ] || chmod a-w -- "$f"
+  d=$(dirname -- "$f")
+  while [ "$d" != "." ] && [ "$d" != "/" ]; do chown 0:0 -- "$d"; chmod 1777 -- "$d"; d=$(dirname -- "$d"); done
+done < {LOCK_LIST_REMOTE}
+rm -f {LOCK_LIST_REMOTE}
+chown 0:0 .; chmod 1777 .
+''', cwd=repo, timeout=900, login=False)
+        if r['returncode'] != 0:
+            raise GradeError('cannot prepare non-root grading: ' + r['output'][-300:])
+        return round(time.time() - t0, 1)
+
     def grade(self, s: EnvSession, gi: dict) -> dict:
         repo = s.spec['cwd']
         patch, problem = self.capture_patch(s)
@@ -320,7 +359,13 @@ class SweEnv(DockerTaskEnv):
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
             t0 = time.time()
-            r = sb.execute(gi['test_command'], cwd=repo, timeout=gi['verifier_timeout'], login=False)
+            test_cmd, grader = gi['test_command'], self.cfg.get('grader_user', 'nobody')
+            if grader != 'root':
+                lock_s = self._lock_down(sb, repo, gi['test_patch'])
+                test_cmd = as_grader(test_cmd)
+                res['grader_user'], res['lock_seconds'] = GRADER_UID, lock_s
+                t0 = time.time()
+            r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
             return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                     'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
                     'test_output': r['output'][-3000:], 'reverted_paths': reverted}
