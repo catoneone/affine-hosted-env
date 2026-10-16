@@ -141,46 +141,63 @@ class WorkerClient:
 
 
 def run_rollout(worker: WorkerClient, token: str, sampler: Sampler, *, nonce: int = 0) -> dict:
-    """Run one rollout to completion; returns {nonce, segments, receipt, outcome, reward, detail, steps}."""
-    r = worker.start(token)
-    if r.get('done'):                                  # infra error already during setup
-        return {'nonce': nonce, 'segments': [], 'receipt': r.get('receipt'), 'outcome': r['outcome'],
-                'reward': r.get('reward', 0.0), 'detail': r.get('detail'), 'steps': 0}
-    ctx = list(r['prompt_tokens'])
-    segs = [{'src': 'P', 'ids': list(r['prompt_tokens'])}]
-    stops, max_ctx, max_turn = r['stop_token_ids'], r['max_context'], r['max_turn_tokens']
-    seq = 1
-    while True:
-        limits = {'max_tokens': min(max_turn, max_ctx - len(ctx)), 'stop_token_ids': stops, 'nonce': nonce,
-                  'step': seq}
-        out = list(sampler(ctx, limits))
-        r = worker.turn(token, seq, out)
-        segs.append({'src': 'M', 'ids': out})
-        ctx += out
-        if r['done']:
-            return {'nonce': nonce, 'segments': segs, 'receipt': r['receipt'], 'outcome': r['outcome'],
-                    'reward': r['reward'], 'detail': r.get('detail'), 'steps': r.get('steps', seq)}
-        segs.append({'src': 'T', 'ids': list(r['tool_tokens'])})
-        ctx += r['tool_tokens']
-        seq += 1
+    """Run one rollout to completion; returns {nonce, segments, receipt, outcome, reward, detail, steps}.
+    outcome 'voided' means the gateway voided the whole task while this rollout ran (a sibling hit an infra
+    error): there is no receipt and nothing to upload."""
+    segs: list[dict] = []
+    try:
+        r = worker.start(token)
+        if r.get('done'):                              # infra error already during setup
+            return {'nonce': nonce, 'segments': [], 'receipt': r.get('receipt'), 'outcome': r['outcome'],
+                    'reward': r.get('reward', 0.0), 'detail': r.get('detail'), 'steps': 0}
+        ctx = list(r['prompt_tokens'])
+        segs = [{'src': 'P', 'ids': list(r['prompt_tokens'])}]
+        stops, max_ctx, max_turn = r['stop_token_ids'], r['max_context'], r['max_turn_tokens']
+        seq = 1
+        while True:
+            limits = {'max_tokens': min(max_turn, max_ctx - len(ctx)), 'stop_token_ids': stops, 'nonce': nonce,
+                      'step': seq}
+            out = list(sampler(ctx, limits))
+            r = worker.turn(token, seq, out)
+            segs.append({'src': 'M', 'ids': out})
+            ctx += out
+            if r['done']:
+                return {'nonce': nonce, 'segments': segs, 'receipt': r['receipt'], 'outcome': r['outcome'],
+                        'reward': r['reward'], 'detail': r.get('detail'), 'steps': r.get('steps', seq)}
+            segs.append({'src': 'T', 'ids': list(r['tool_tokens'])})
+            ctx += r['tool_tokens']
+            seq += 1
+    except ApiError as e:
+        if e.status != 410:
+            raise
+        return {'nonce': nonce, 'segments': segs, 'receipt': None, 'outcome': 'voided', 'reward': 0.0,
+                'detail': f'{e.code} {e.detail}'.strip(), 'steps': 0}
 
 
 def run_task(gateway: GatewayClient, epoch: str, env_id: str, sampler: Sampler, *, concurrency: int = 8,
              worker_factory: Callable[[str], WorkerClient] = WorkerClient, max_wait: float = 0.0) -> dict:
-    """Open a task, run the whole group of nonces concurrently, finish it; returns {task, rollouts, attachment}.
-    attachment goes into the group object."""
+    """Open a task, run the whole group of nonces concurrently, finish it; returns {task, rollouts, attachment,
+    voided}. attachment goes into the group object; it is None when the gateway voided the task (an infra error in
+    any rollout voids the group and refunds it, so there is nothing to upload)."""
     t = gateway.open_task(epoch, env_id, max_wait=max_wait)
+    results: list[dict] = []
     try:
         sessions = gateway.open_sessions(epoch, t['task_id'], list(range(t['group_size'])))
         worker = worker_factory(t['worker_url'])
         with ThreadPoolExecutor(concurrency) as ex:
             results = list(ex.map(lambda s: run_rollout(worker, s['token'], sampler, nonce=s['nonce']), sessions))
     finally:
-        gateway.finish_task(epoch, t['task_id'])
-    attachment = {'version': GROUP_ATTACHMENT_VERSION, 'env_id': t['env_id'], 'task': t['task'],
-                  'rollouts': [{'nonce': x['nonce'], 'segments': x['segments'], 'receipt': x['receipt']}
-                               for x in sorted(results, key=lambda x: x['nonce'])]}
-    return {'task': t, 'rollouts': results, 'attachment': attachment}
+        try:
+            gateway.finish_task(epoch, t['task_id'])
+        except ApiError as e:
+            if e.status not in (404, 409, 410):        # an already ended (voided) task cannot be finished again
+                raise
+    voided = any(x['outcome'] in ('voided', 'infra_error') for x in results)
+    attachment = None if voided else {
+        'version': GROUP_ATTACHMENT_VERSION, 'env_id': t['env_id'], 'task': t['task'],
+        'rollouts': [{'nonce': x['nonce'], 'segments': x['segments'], 'receipt': x['receipt']}
+                     for x in sorted(results, key=lambda x: x['nonce'])]}
+    return {'task': t, 'rollouts': results, 'attachment': attachment, 'voided': voided}
 
 
 # ---------------------------------------------------------------- samplers
