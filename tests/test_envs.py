@@ -119,7 +119,8 @@ def graded(tmp_path, *cmds, in_place_check=False, image_prep=None):
 def test_honest_fix_scores_and_is_kept(tmp_path):
     g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
                   'printf "notes\\n" > NOTES.md', 'mkdir -p pkg && printf "x = 1\\n" > pkg/helper.py')
-    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v2' and g['reverted_paths'] == []
+    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v3' and g['reverted_paths'] == []
+    assert g['grader_parsers'].startswith('py')
     assert g['grader_user'] == 'root' and 'lock_seconds' not in g
     assert 'a + b' in g['model_patch'] and 'pkg/helper.py' in g['model_patch']
 
@@ -303,16 +304,51 @@ def test_limit_kill_before_any_model_bytes_is_an_infra_error(tmp_path):
 def test_protected_paths_rules():
     assert protected_paths(['src/app.py', 'src/conftest.py', 'lib/util.go', 'lib/util_test.go', 'README.md',
                             'tests/helpers.py', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
-                            'src/setupTests.ts', 'go.mod', 'pkg/testdata/f.bin', 'web/node_modules/.bin/jest',
-                            'vendor/x/y.go', 'setup.py', 'CMakeLists.txt', 'cmake/m.cmake', 'build.gradle.kts',
-                            'test/helpers.js', 'src/vendored/ok.py']) == [
+                            'src/setupTests.ts', 'go.mod', 'package.json', 'pkg/testdata/f.bin',
+                            'web/node_modules/.bin/jest', 'vendor/x/y.go', 'setup.py', 'CMakeLists.txt',
+                            'cmake/m.cmake', 'build.gradle.kts', 'test/helpers.js', 'src/vendored/ok.py']) == [
         'src/conftest.py', 'lib/util_test.go', 'tests/helpers.py', 'tests/test_a.py', 'a/b.test.tsx',
-        'jest.config.js', '.env.test', 'src/setupTests.ts', 'go.mod', 'pkg/testdata/f.bin',
+        'jest.config.js', '.env.test', 'src/setupTests.ts', 'pkg/testdata/f.bin',
         'web/node_modules/.bin/jest', 'vendor/x/y.go', 'setup.py', 'CMakeLists.txt', 'cmake/m.cmake',
-        'build.gradle.kts', 'test/helpers.js']    # src/vendored/ok.py is kept: 'vendored' != 'vendor'
+        'build.gradle.kts', 'test/helpers.js']    # go.mod / package.json: structured, not blanket-reverted here
 
 
-def test_image_whose_tree_differs_from_its_head(tmp_path):
+def test_manifest_reverts():
+    from hosted_env.envs.swe import manifest_reverts
+    # package.json: a dependency bump is kept; a change to scripts / jest config reverts
+    base = b'{"name":"p","version":"1.0.0","dependencies":{"left-pad":"1.0.0"},"scripts":{"test":"jest"}}'
+    assert manifest_reverts('package.json', base,
+                            base.replace(b'"left-pad":"1.0.0"', b'"left-pad":"1.3.0"')) is False
+    assert manifest_reverts('package.json', base, base.replace(b'"test":"jest"', b'"test":"true"')) is True
+    assert manifest_reverts('package.json', base, b'{"name":"p"}') is True            # scripts removed
+    assert manifest_reverts('package.json', base, b'not json') is True                # unparseable -> revert
+    # pyproject.toml: a dependency change is kept; a [tool.pytest.ini_options] change reverts
+    tb = b'[project]\nname="p"\ndependencies=["requests==2.0"]\n[tool.pytest.ini_options]\naddopts="-x"\n'
+    assert manifest_reverts('pyproject.toml', tb, tb.replace(b'2.0', b'2.1')) is False
+    assert manifest_reverts('pyproject.toml', tb, tb.replace(b'"-x"', b'"-p no:cacheprovider"')) is True
+    # go.mod: a new require is kept; changing go / toolchain / replace reverts
+    gb = b'module m\n\ngo 1.21\n\nrequire example.com/x v1.2.3\n'
+    assert manifest_reverts('go.mod', gb, gb + b'require example.com/y v0.1.0\n') is False
+    assert manifest_reverts('go.mod', gb, gb.replace(b'go 1.21', b'go 1.22')) is True
+    assert manifest_reverts('go.mod', gb, gb + b'replace example.com/x => ./local\n') is True
+    # setup.cfg: a dependency change kept; a [tool:pytest] change reverts
+    cb = b'[metadata]\nname = p\n[options]\ninstall_requires =\n    requests\n[tool:pytest]\naddopts = -q\n'
+    assert manifest_reverts('setup.cfg', cb, cb.replace(b'requests', b'requests\n    urllib3')) is False
+    assert manifest_reverts('setup.cfg', cb, cb.replace(b'-q', b'-s')) is True
+    # a newly added manifest (no base) with a test-relevant key reverts
+    assert manifest_reverts('package.json', b'', b'{"jest":{"setupFiles":["x"]}}') is True
+    assert manifest_reverts('go.mod', b'', b'module m\ngo 1.21\n') is True            # a new go directive
+
+
+def test_structured_manifest_dependency_change_is_kept(tmp_path):
+    prep = ('printf \'{"name":"p","dependencies":{"left-pad":"1.0.0"},"scripts":{"test":"jest"}}\\n\' '
+            '> package.json')
+    fix = 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'
+    g, _ = graded(tmp_path, fix, 'sed -i.bak "s/1.0.0/1.3.0/" package.json && rm package.json.bak', image_prep=prep)
+    assert g['reward'] == 1.0 and 'package.json' not in g['reverted_paths']    # a dependency bump is kept
+    assert '"left-pad":"1.3.0"' in g['model_patch'] and g['grader_parsers'].startswith('py')
+    g, _ = graded(tmp_path, fix, 'sed -i.bak "s/jest/true/" package.json && rm package.json.bak', image_prep=prep)
+    assert g['reward'] == 1.0 and 'package.json' in g['reverted_paths']        # a scripts change is reverted
     """Real images (e.g. 001488) ship a working tree that differs from their own HEAD: deleted tracked files,
     edits, extra files. That state is the task, not the model's work: a no-op rollout yields an empty patch, and
     a fix on top of it carries over exactly."""

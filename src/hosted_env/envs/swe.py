@@ -15,6 +15,7 @@ import base64
 import hashlib
 import re
 import shlex
+import sys
 import time
 
 from ..providers.sandbox.base import SandboxCommandError, SandboxLimitError
@@ -116,7 +117,7 @@ GRADER_UID = 65534                     # nobody: the hidden tests run without ro
 DROP_PRIVS = f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups --no-new-privs --'
 GRADER_BASH = 'bash --noprofile --norc -c'   # the drop probes run under exactly what the test command runs under
 MAX_MODEL_PATCH_BYTES = 2_000_000
-GRADER_VERSION = 'isolated-v2'         # v1: isolated container, tests as root; v2: tests as GRADER_UID unless opted out
+GRADER_VERSION = 'isolated-v3'         # v1: tests as root; v2: tests as GRADER_UID; v3: structured manifests, wider revert
 
 
 def as_grader(command: str) -> str:
@@ -130,12 +131,12 @@ def as_grader(command: str) -> str:
 # These are files that decide how tests are collected, configured or reported rather than the code under test.
 _PROTECTED_NAMES = {
     # python: pytest/tox/nox configuration, conftest plugins, interpreter start-up hooks
-    'conftest.py', 'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'noxfile.py',
+    'conftest.py', 'pytest.ini', '.pytest.ini', 'tox.ini', 'noxfile.py',
     'sitecustomize.py', 'usercustomize.py',
-    # go: module graph (replace directives) and workspace
-    'go.mod', 'go.sum', 'go.work', 'go.work.sum',
-    # js/ts: package scripts and test-runner / transpiler configuration
-    'package.json', '.npmrc', '.yarnrc', '.yarnrc.yml', '.babelrc', '.babelrc.json', '.babelrc.js',
+    # go: the workspace graph (go.mod is handled structurally; go.sum is never reverted -- it can only break a build)
+    'go.work', 'go.work.sum',
+    # js/ts: test-runner / transpiler configuration (package.json is handled structurally)
+    '.npmrc', '.yarnrc', '.yarnrc.yml', '.babelrc', '.babelrc.json', '.babelrc.js',
     # build files that are code (a fix does not need to change how the project builds)
     'setup.py', 'CMakeLists.txt', 'build.gradle', 'build.gradle.kts',
     # generic: the grading entry points, build entry points, attributes that change how patches apply
@@ -162,6 +163,109 @@ def protected_paths(files: list[str]) -> list[str]:
                 or any(seg in _PROTECTED_DIRS for seg in f.split('/')[:-1])):
             out.append(f)
     return out
+
+
+# Manifest files are NOT reverted wholesale (a correct fix often must bump a dependency or a build directive);
+# only the fields that decide how tests are collected / run are protected. Both the base and the model's version
+# are parsed in the executor (never in the model's container), the test-relevant projection compared, and the
+# file reset only if that projection changed or either version fails to parse. Parsers are pinned so an offline
+# re-grade reaches the same keep/revert verdict (GRADER_PARSERS, recorded with the grade).
+STRUCTURED_MANIFESTS = {'pyproject.toml', 'setup.cfg', 'package.json', 'go.mod', 'Cargo.toml', 'pom.xml'}
+GRADER_PARSERS = (f'py{sys.version_info.major}.{sys.version_info.minor}:tomllib+json+configparser'
+                  ';gomod=v1;cargo=tomllib;pom=xml.etree-v1')
+_EMPTY_SRC = {'pyproject.toml': b'', 'setup.cfg': b'', 'package.json': b'{}', 'go.mod': b'',
+              'Cargo.toml': b'', 'pom.xml': b'<project/>'}
+
+
+def _pyproject_test_keys(b: bytes):
+    import tomllib
+    d = tomllib.loads(b.decode('utf-8'))
+    eps = ((d.get('project') or {}).get('entry-points') or {}).get('pytest11')
+    return ((d.get('tool') or {}).get('pytest'), d.get('build-system'), eps)
+
+
+def _setupcfg_test_keys(b: bytes):
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.read_string(b.decode('utf-8'))
+    pytest = dict(cp['tool:pytest']) if cp.has_section('tool:pytest') else None
+    eps = dict(cp['options.entry_points']) if cp.has_section('options.entry_points') else {}
+    return (pytest, eps.get('pytest11'))
+
+
+def _packagejson_test_keys(b: bytes):
+    import json as _json
+    d = _json.loads(b.decode('utf-8'))
+    return {k: d.get(k) for k in ('scripts', 'jest', 'mocha', 'ava', 'nyc', 'c8', 'babel')}
+
+
+def _gomod_test_keys(b: bytes):
+    """`go`, `toolchain` and every `replace` directive (single-line and block form). Arbos gates these: a fix may
+    add a dependency (require), but changing the toolchain or redirecting a module can change what runs."""
+    go = toolchain = None
+    replaces, in_replace = [], False
+    for raw in b.decode('utf-8', 'replace').splitlines():
+        line = raw.split('//', 1)[0].strip()
+        if not line:
+            continue
+        if in_replace:
+            if line == ')':
+                in_replace = False
+            else:
+                replaces.append(line)
+            continue
+        if line.startswith('replace (') or line == 'replace (':
+            in_replace = True
+        elif line.startswith('replace '):
+            replaces.append(line[len('replace '):].strip())
+        elif line.startswith('go '):
+            go = line[3:].strip()
+        elif line.startswith('toolchain '):
+            toolchain = line[len('toolchain '):].strip()
+    return (go, toolchain, sorted(replaces))
+
+
+def _cargo_test_keys(b: bytes):
+    import tomllib
+    d = tomllib.loads(b.decode('utf-8'))
+    tests = d.get('test')
+    harness = sorted((t.get('name'), t.get('harness')) for t in tests) if isinstance(tests, list) else None
+    return (d.get('patch'), d.get('replace'), (d.get('package') or {}).get('build'), harness)
+
+
+def _pom_test_keys(b: bytes):
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(b)
+
+    def strip(t):
+        return t.rsplit('}', 1)[-1]
+    plugins, flags = [], []
+    for el in root.iter():
+        if strip(el.tag) == 'plugin':
+            art = next((c.text for c in el if strip(c.tag) == 'artifactId'), '') or ''
+            if 'surefire' in art or 'failsafe' in art:
+                cfg = next((c for c in el if strip(c.tag) == 'configuration'), None)
+                plugins.append(ET.tostring(cfg, encoding='unicode') if cfg is not None else '')
+        if strip(el.tag) in ('skipTests', 'testFailureIgnore', 'maven.test.skip', 'skip'):
+            flags.append((strip(el.tag), (el.text or '').strip()))
+    return (sorted(plugins), sorted(flags))
+
+
+_MANIFEST_KEYS = {'pyproject.toml': _pyproject_test_keys, 'setup.cfg': _setupcfg_test_keys,
+                  'package.json': _packagejson_test_keys, 'go.mod': _gomod_test_keys,
+                  'Cargo.toml': _cargo_test_keys, 'pom.xml': _pom_test_keys}
+
+
+def manifest_reverts(name: str, base: bytes, cur: bytes) -> bool:
+    """True if a structured manifest must be reset to base: a test-relevant key changed, or either version does
+    not parse (fail closed -- a model cannot smuggle a config change through a file that only one side can read)."""
+    fn = _MANIFEST_KEYS[name]
+    try:
+        bk = fn(base if base.strip() else _EMPTY_SRC[name])
+        ck = fn(cur)
+    except Exception:  # noqa: BLE001  unparseable on either side: revert
+        return True
+    return bk != ck
 
 
 class SweEnv(DockerTaskEnv):
@@ -304,6 +408,20 @@ class SweEnv(DockerTaskEnv):
             raise GradeError(f'cannot list the paths {path} changes: ' + r['output'][-300:])
         return [p for p in base64.b64decode(r['output'].strip(), validate=True).split(b'\0') if p], ''
 
+    def _read_blob(self, sb, repo: str, ref: str | None, rel: str) -> bytes:
+        """Raw bytes of `rel` at git ref `ref` (base tree), or from the working file when ref is None (the model's
+        version, after its patch was applied). Missing on either side -> b''. base64 so binary is safe. Read in the
+        executor, not parsed in the container, so a crafted manifest cannot run code during grading."""
+        q = shlex.quote(rel)
+        src = (f'export GIT_LITERAL_PATHSPECS=1; git cat-file -e {ref}:{q} 2>/dev/null && git show {ref}:{q}'
+               if ref else f'[ -f {q} ] && cat {q}')
+        r = sb.execute(f'set -o pipefail; {{ {src}; }} 2>/dev/null | base64 | tr -d "\\n"', cwd=repo, timeout=120,
+                       login=False)
+        try:
+            return base64.b64decode(r['output'].strip(), validate=True) if r['output'].strip() else b''
+        except ValueError:
+            return b''
+
     def _reset_paths(self, sb, repo: str, start: str, paths: list[bytes]) -> None:
         """Put each path back to the start tree, or delete it when the start tree does not have it (NUL-separated,
         so any name)."""
@@ -445,7 +563,17 @@ fi
                 if touched is None or why:                  # same start tree, so only the patch can be at fault
                     return {**res, 'grade_detail': 'model_patch_does_not_apply: ' + why}
                 prot = protected_paths([p.decode('utf-8', 'surrogateescape') for p in touched])
-                reverted = sorted(set(prot))
+                reverted = set(prot)
+                for p in touched:
+                    rel = p.decode('utf-8', 'surrogateescape')
+                    if rel in reverted or rel.rsplit('/', 1)[-1] not in STRUCTURED_MANIFESTS:
+                        continue
+                    name = rel.rsplit('/', 1)[-1]
+                    if manifest_reverts(name, self._read_blob(sb, repo, start, rel),
+                                        self._read_blob(sb, repo, None, rel)):
+                        reverted.add(rel)         # a test-relevant key changed, or it does not parse: reset to base
+                res['grader_parsers'] = GRADER_PARSERS
+                reverted = sorted(reverted)
                 self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])
             sb.copy_text_to(gi['test_patch'], TEST_PATCH_REMOTE)
             test_paths = self._changed_paths(sb, repo, base, TEST_PATCH_REMOTE)[0] if base else None
