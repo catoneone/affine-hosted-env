@@ -330,3 +330,52 @@ def test_amend_js_reporter():
         assert a(bad) is None, bad
     # a comment that only mentions jest does not count as a run
     assert a('# runs jest on the fixed file\nnpx jest a.test.js\n')[1] == 'jest'
+
+
+def _patch_adding(tmp_path, files: dict) -> str:
+    """A test patch (git diff, as the task data has it) that adds `files` to an empty tree."""
+    d = tmp_path / ('p%d' % len(list(tmp_path.iterdir())))
+    d.mkdir()
+    for name, text in files.items():
+        (d / name).parent.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(text)
+    return _run('git init -q && git add -A && git diff --cached --no-color --full-index', d).stdout
+
+
+def test_amend_test_patch_rebuilds_a_new_script(tmp_path):
+    from hosted_env.baseline import amend_test_patch
+    script = 'set -e\ncd /testbed\nnpx jest src/a.test.js --ci 2>&1 | tail -30\n'
+    tp = _patch_adding(tmp_path, {'src/a.test.js': 'test("x", () => {})\n', 'mimo_test_command.sh': script})
+    out = amend_test_patch(tp, 'bash /testbed/mimo_test_command.sh')
+    assert out['report_kind'] == 'jest' and 'test_command' not in out
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _run('git init -q', repo)
+    (repo / 'tp.diff').write_text(out['test_patch'])
+    _run('git apply --check tp.diff && git apply tp.diff && rm tp.diff', repo)
+    got = (repo / 'mimo_test_command.sh').read_text()
+    assert got == script.replace('--ci ', '--ci --json --outputFile="${MIMO_REPORT:-/dev/null}" ')
+    assert (repo / 'src' / 'a.test.js').read_text() == 'test("x", () => {})\n'     # other files untouched
+    # the rebuilt index line carries the blob id of the amended content
+    blob = _run('git hash-object mimo_test_command.sh', repo).stdout.strip()
+    assert f'..{blob}' in out['test_patch']
+
+
+def test_amend_test_patch_refusals(tmp_path):
+    from hosted_env.baseline import amend_test_patch
+    one = _patch_adding(tmp_path, {'mimo_test_command.sh': 'npx jest a.test.js\n'})
+    # runs in two places (patch script + test command), or two runs in the script: not amended
+    assert amend_test_patch(one, 'npx jest b.test.js') is None
+    assert amend_test_patch(_patch_adding(tmp_path, {'mimo_test_command.sh': 'npx jest a\nnpx jest b\n'}), 'x') is None
+    # a modification of an existing script, not a new file
+    base = tmp_path / 'base'
+    base.mkdir()
+    _run('git init -q && printf "echo hi\\n" > run.sh && git add -A && git commit -qm b && '
+         'printf "echo hi\\nnpx mocha t.js\\n" > run.sh', base)
+    mod = _run('git diff --no-color', base).stdout
+    assert amend_test_patch(mod, 'bash run.sh') is None
+    # no runner at all: nothing to amend; a test or doc file that mentions jest is not a run
+    assert amend_test_patch(_patch_adding(tmp_path, {'mimo_test_command.sh': 'node t.js\n'}), 'x') is None
+    assert amend_test_patch(_patch_adding(tmp_path, {'docs.md': 'run jest here\n'}), 'npx jest t.js')['test_command']
+    # the run in the outer test command alone is amended there
+    assert amend_test_patch(_patch_adding(tmp_path, {'t.js': 'x\n'}), 'npx vitest run t.js')['report_kind'] == 'junit'

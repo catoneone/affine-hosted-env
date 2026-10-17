@@ -30,8 +30,8 @@ import re
 import shlex
 import time
 
-from .envs.swe import (_SCRIPT_DIR_RE, GRADER_VERSION, _junit_results, _repo_rel, _shell_commands,
-                       test_patch_scripts)
+from .envs.swe import (_SCRIPT_DIR_RE, GRADER_VERSION, MIMO_BUNDLE, _junit_results, _repo_rel,
+                       _shell_commands, test_patch_scripts)
 
 BASELINE_VERSION = 'baseline-v1'
 _PYTEST_RE = re.compile(r'(^|[\s/;&|(])(py\.test|pytest)(\s|$)')
@@ -422,6 +422,59 @@ def amend_js_reporter(text: str) -> tuple[str, str] | None:
     head, rest = line[:end].rstrip(), line[end:].lstrip()
     lines[i] = f'{head} {flags}' + ('' if not rest else rest if rest.startswith(')') else ' ' + rest)
     return '\n'.join(lines), kind
+
+
+def _js_runs(text: str) -> int:
+    return sum(len(_JS_RUNNER_RE.findall(line)) for line in text.split('\n') if not line.lstrip().startswith('#'))
+
+
+def amend_test_patch(test_patch: str, test_command: str) -> dict | None:
+    """Task-level amend_js_reporter: {'test_patch' or 'test_command': amended text, 'report_kind': kind}, or None.
+    The one jest / vitest / mocha run must be in the outer test command or in a `.sh` file the test patch ADDS
+    (a new-file diff, rebuilt here with its hunk length and git blob id recomputed so `git apply` takes it).
+    A run in a script the patch modifies, or inside the mimo_build_env bundle, is not amended (repacking the
+    tarball is not worth it for the share of tasks it covers) and neither is a task whose runs are spread over
+    several places: such a task gets no expected tests."""
+    import hashlib
+    sections = re.split(r'(?m)^(?=diff --git )', test_patch)
+    cands = []                                    # (index or 'command', text)
+    if _js_runs(test_command):
+        cands.append(('command', test_command))
+    for k, sec in enumerate(sections):
+        head = sec.split('\n', 1)[0]
+        if not head.startswith('diff --git '):
+            continue
+        path = head.rsplit(' b/', 1)[-1]
+        added = [ln[1:] for ln in sec.split('\n') if ln.startswith('+') and not ln.startswith('+++ ')]
+        body = '\n'.join(added)
+        if path.rsplit('/', 1)[-1] == MIMO_BUNDLE:
+            if any(_js_runs(t) for p, t in test_patch_scripts(sec) if p != path):
+                return None
+            continue
+        if path.endswith('.sh') and _js_runs(body):
+            if '\n--- /dev/null\n' not in sec or len(re.findall(r'(?m)^@@ ', sec)) != 1:
+                return None
+            cands.append((k, body))
+    if len(cands) != 1:
+        return None
+    where, text = cands[0]
+    if where == 'command':
+        res = amend_js_reporter(text)
+        return None if res is None else {'test_command': res[0], 'report_kind': res[1]}
+    sec = sections[where]
+    no_eol = '\n\\ No newline at end of file' in sec
+    res = amend_js_reporter(text)
+    if res is None:
+        return None
+    new, kind = res
+    content = new + ('' if no_eol else '\n')
+    hdr = sec.split('\n@@ ', 1)[0]
+    blob = hashlib.sha1(b'blob %d\0' % len(content.encode()) + content.encode()).hexdigest()
+    hdr = re.sub(r'(?m)^(index 0+\.\.)[0-9a-f]+', lambda m: m.group(1) + blob[:len(m.group(0)) - len(m.group(1))], hdr)
+    lines = new.split('\n')
+    sections[where] = (hdr + f'\n@@ -0,0 +1,{len(lines)} @@\n' + ''.join(f'+{ln}\n' for ln in lines)
+                       + ('\\ No newline at end of file\n' if no_eol else ''))
+    return {'test_patch': ''.join(sections), 'report_kind': kind}
 
 
 def _uses_pytest(gi: dict) -> bool:
