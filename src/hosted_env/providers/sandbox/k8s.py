@@ -208,6 +208,17 @@ def _exit_code(resp) -> int:
     return _parse_exit_status(raw)
 
 
+def _terminal(pod) -> bool:
+    """The Pod/container has stopped: a terminated container, or a Failed/Succeeded/Unknown phase."""
+    st = pod.status
+    if getattr(st, 'phase', None) in ('Failed', 'Succeeded', 'Unknown'):
+        return True
+    for cs in getattr(st, 'container_statuses', None) or []:
+        if getattr(cs, 'state', None) and getattr(cs.state, 'terminated', None):
+            return True
+    return False
+
+
 def ws_exec(api, namespace: str) -> ExecFn:
     """exec_fn backed by the Kubernetes exec API (needs the `kubernetes` package).
 
@@ -364,8 +375,9 @@ class K8sSandbox:
         t0 = time.monotonic()
         try:
             out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw, login), timeout + 30)
-        except SandboxCommandError:
-            raise                                   # the command could not launch (e.g. the model deleted /bin/sh)
+        except SandboxCommandError as e:
+            self._reconcile_command_error(e)    # the frame is shared with a dead/limit-killed container: check first
+            raise
         except SandboxError as e:
             self._raise_if_limited(e)
             raise
@@ -391,6 +403,32 @@ class K8sSandbox:
             term = getattr(cs.state, 'terminated', None) if getattr(cs, 'state', None) else None
             if term is not None:                    # the container is gone with no limit reason: an infra failure
                 raise SandboxError(f'container terminated: {term.reason}')
+
+    def _reconcile_command_error(self, err: 'SandboxCommandError') -> None:
+        """An exec reported its program could not launch. The exact same error-channel frame (an InternalError with
+        no exit code) is produced by a node-pressure eviction, a runsc crash, a shim/containerd restart or a
+        container that already exited -- all genuine infra -- as well as by the model deleting a binary exec needs
+        while its container stays up. So Pod status, not the message, decides (EXP-018 round-3 review):
+          - its own limit killed it -> SandboxLimitError;
+          - the container is terminated / the pod is Failed/Succeeded/Unknown / gone -> plain SandboxError (infra);
+          - the container stays up for the whole limit_wait window -> the model's command: keep SandboxCommandError.
+        Before hand-out a launch failure is a broken image (infra), so the SandboxCommandError is re-raised as is."""
+        if not self.handed_out:
+            raise err
+        deadline = time.monotonic() + self.limit_wait
+        while True:
+            try:
+                pod = self.api.read_namespaced_pod(self.name, self.ns)
+            except Exception:  # noqa: BLE001  gone / unreadable: the container is not there, so this is not the model
+                raise SandboxError(f'exec could not start and the pod is unreadable: {err}'[:300]) from None
+            why = limit_reason(pod)
+            if why:
+                raise SandboxLimitError(why) from err
+            if _terminal(pod):
+                raise SandboxError(f'exec could not start and the container is not running: {err}'[:300]) from err
+            if time.monotonic() > deadline:         # stayed up the whole window: nothing killed it but the command
+                raise err
+            time.sleep(self.poll)
 
     def _raise_if_limited(self, err: Exception) -> None:
         """After a failed exec: raise SandboxLimitError if the Pod status shows (within limit_wait, since the kubelet
@@ -419,8 +457,9 @@ class K8sSandbox:
             argv = ['sh', '-c', f'printf %s "$1" | base64 -d {op} "$2"', 'sh', b64, remote_path]
             try:
                 out, rc, _ = self.exec_fn(self.name, argv, 120)
-            except SandboxCommandError:
-                raise                                    # the shell to write with is gone: the caller's own doing
+            except SandboxCommandError as e:
+                self._reconcile_command_error(e)     # a dead container's exec looks the same: check Pod status
+                raise
             except SandboxError as e:                    # like execute: a limit kill is attributed, not hidden
                 self._raise_if_limited(e)
                 raise

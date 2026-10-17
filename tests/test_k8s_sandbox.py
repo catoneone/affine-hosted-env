@@ -291,12 +291,29 @@ def test_parse_exit_status():
         _parse_exit_status(oci)
 
 
-def test_command_that_cannot_launch_is_a_command_error_not_infra(tmp_path):
-    # the model deleted /bin/sh: exec cannot start, but the Pod is alive -- not an infra failure, and no limit poll
-    sb = started(tmp_path, _pod(), gone=raises_cmd('command could not start in the container: ... "sh" ...'))
-    sb.limit_wait = 999                                           # must NOT be reached: a command error does not poll
+def test_command_launch_failure_is_reconciled_against_pod_status(tmp_path):
+    # the model deleted /bin/sh but the container stays up: its own doing, kept as a command error (scores 0)
+    sb = started(tmp_path, _pod(), gone=raises_cmd('command could not start: exec "sh": not found'))
+    sb.limit_wait = 0                                            # container running + window elapsed -> the model's
     with pytest.raises(SandboxCommandError):
         sb.execute('gone')
+    # the SAME frame from a container the node evicted / a runsc crash: genuine infra, not the model
+    sb = started(tmp_path, _dead(terminated='Error'), gone=raises_cmd('command could not start'))
+    with pytest.raises(SandboxError) as e:
+        sb.execute('gone')
+    assert not isinstance(e.value, (SandboxCommandError, SandboxLimitError))
+    # the same frame from an OOMKilled container: a limit kill
+    sb = started(tmp_path, _dead(terminated='OOMKilled'), gone=raises_cmd('command could not start'))
+    with pytest.raises(SandboxLimitError):
+        sb.execute('gone')
+    # the pod is gone: infra, not the model
+    core = FakeCore()
+    sb = make(tmp_path, api=core, exec_fn=scripted(gone=raises_cmd('command could not start')), limit_wait=5)
+    sb.start()
+    core.deleted.append((sb.name, sb.ns))                       # read_namespaced_pod now raises 404
+    with pytest.raises(SandboxError) as e:
+        sb.execute('gone')
+    assert not isinstance(e.value, (SandboxCommandError, SandboxLimitError))
 
 
 def test_check_alive_reads_status_not_a_probe_binary(tmp_path):
@@ -319,7 +336,7 @@ def test_copy_text_to_passes_a_command_error_through(tmp_path):
         if 'base64 -d' in argv[2]:
             raise SandboxCommandError('command could not start in the container')
         return offline_exec()(pod, argv, timeout)
-    sb = make(tmp_path, exec_fn=copy_cannot_launch, limit_wait=999)
+    sb = make(tmp_path, exec_fn=copy_cannot_launch, limit_wait=0)
     sb.start()
     with pytest.raises(SandboxCommandError):
         sb.copy_text_to('x', '/tmp/f')
