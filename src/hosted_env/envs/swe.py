@@ -1239,10 +1239,13 @@ fi
                 rdir = f'/tmp/mimo-report-{secrets.token_hex(8)}'     # random: the model cannot predict / forge it
                 rpath = f'{rdir}/report.{_REPORT_EXT[report_kind]}'
                 sb.execute(f'rm -rf {rdir} && mkdir -p {rdir} && chmod 777 {rdir}', timeout=60, login=False)
-                if report_kind == 'junit':   # make even an unmodified pytest harness emit the report, config aside
+                if report_kind == 'junit':   # make even an unmodified pytest harness emit the report
                     # xunit1 adds the `file` attribute (an unambiguous node id); the baseline also wants the
-                    # tests of the files that do collect when a new test file does not
-                    opts = f'-o addopts= -o junit_family=xunit1 --junit-xml={rpath}'
+                    # tests of the files that do collect when a new test file does not. The repo's own addopts are
+                    # kept: its pytest config is reset to base (protected), and clearing it changes how the tests
+                    # run -- 002371's `addopts = -p no:hypothesispytest` with `filterwarnings = error` crashes
+                    # pytest at start-up without it (EXP-018 baseline pilot)
+                    opts = f'-o junit_family=xunit1 --junit-xml={rpath}'
                     if collect:
                         opts += ' --continue-on-collection-errors'
                     pre = f'PYTEST_ADDOPTS={shlex.quote(opts)} '
