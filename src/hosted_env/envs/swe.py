@@ -135,21 +135,33 @@ _PROTECTED_NAMES = {
     # go: module graph (replace directives) and workspace
     'go.mod', 'go.sum', 'go.work', 'go.work.sum',
     # js/ts: package scripts and test-runner / transpiler configuration
-    'package.json', '.npmrc', '.babelrc', '.babelrc.json', '.babelrc.js',
+    'package.json', '.npmrc', '.yarnrc', '.yarnrc.yml', '.babelrc', '.babelrc.json', '.babelrc.js',
+    # build files that are code (a fix does not need to change how the project builds)
+    'setup.py', 'CMakeLists.txt', 'build.gradle', 'build.gradle.kts',
     # generic: the grading entry points, build entry points, attributes that change how patches apply
     'mimo_test_command.sh', 'test_commands.json', 'Makefile', 'makefile', 'GNUmakefile', '.gitattributes',
     '.gitmodules',
 }
+# a path with any of these as a DIRECTORY component is test infrastructure or a vendored dependency tree, which a
+# correct fix never needs to change; the whole subtree is reset to the base commit before the hidden tests run.
+_PROTECTED_DIRS = {'tests', 'test', 'testdata', '__tests__', '__mocks__',
+                   'node_modules', 'vendor', 'site-packages', '.venv'}
 _PROTECTED_RE = re.compile(
     r'(^|/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*\.pth|[^/]*_test\.go'
     r'|[^/]*\.(test|spec)\.[cm]?[jt]sx?'
     r'|(jest|vitest|vite|ava|babel)\.(config|setup|workspace)\.[^/]*|setupTests\.[^/]*|karma\.conf\.[^/]*'
-    r'|\.mocharc[^/]*|\.env[^/]*)$'
+    r'|\.mocharc[^/]*|\.env[^/]*|[^/]*\.cmake)$'
     r'|(^|/)(__tests__|__mocks__)/')
 
 
 def protected_paths(files: list[str]) -> list[str]:
-    return [f for f in files if f.rsplit('/', 1)[-1] in _PROTECTED_NAMES or _PROTECTED_RE.search(f)]
+    out = []
+    for f in files:
+        name = f.rsplit('/', 1)[-1]
+        if (name in _PROTECTED_NAMES or _PROTECTED_RE.search(f)
+                or any(seg in _PROTECTED_DIRS for seg in f.split('/')[:-1])):
+            out.append(f)
+    return out
 
 
 class SweEnv(DockerTaskEnv):

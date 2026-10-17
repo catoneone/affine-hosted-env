@@ -303,9 +303,13 @@ def test_limit_kill_before_any_model_bytes_is_an_infra_error(tmp_path):
 def test_protected_paths_rules():
     assert protected_paths(['src/app.py', 'src/conftest.py', 'lib/util.go', 'lib/util_test.go', 'README.md',
                             'tests/helpers.py', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
-                            'src/setupTests.ts', 'go.mod']) == [
-        'src/conftest.py', 'lib/util_test.go', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
-        'src/setupTests.ts', 'go.mod']
+                            'src/setupTests.ts', 'go.mod', 'pkg/testdata/f.bin', 'web/node_modules/.bin/jest',
+                            'vendor/x/y.go', 'setup.py', 'CMakeLists.txt', 'cmake/m.cmake', 'build.gradle.kts',
+                            'test/helpers.js', 'src/vendored/ok.py']) == [
+        'src/conftest.py', 'lib/util_test.go', 'tests/helpers.py', 'tests/test_a.py', 'a/b.test.tsx',
+        'jest.config.js', '.env.test', 'src/setupTests.ts', 'go.mod', 'pkg/testdata/f.bin',
+        'web/node_modules/.bin/jest', 'vendor/x/y.go', 'setup.py', 'CMakeLists.txt', 'cmake/m.cmake',
+        'build.gradle.kts', 'test/helpers.js']    # src/vendored/ok.py is kept: 'vendored' != 'vendor'
 
 
 def test_image_whose_tree_differs_from_its_head(tmp_path):
