@@ -339,6 +339,88 @@ def command_repo_paths(test_command: str, cwd: str) -> list[str]:
     return sorted(out)
 
 
+# test-runner config keys whose values name files the runner loads before / around the tests; a model that edits
+# one of those files changes what runs even when the config itself is unchanged, so the referenced files are reset.
+_JS_REF_KEYS = ('setupFiles', 'setupFilesAfterEnv', 'setupFilesAfterEach', 'globalSetup', 'globalTeardown',
+                'testEnvironment', 'reporters', 'transform', 'moduleNameMapper', 'setupFiles')
+_JSON_CONFIGS = ('.json',)                       # jest.config.json, .mocharc.json, tsconfig*.json, ...
+_JS_REF_RE = re.compile(r'''['"]((?:\./|\.\./|<rootDir>/)[^'"]+)['"]''')
+
+
+def _strip_jsonc(text: str) -> str:
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    text = re.sub(r'(^|[^:])//[^\n]*', r'\1', text)       # // comments (tsconfig is JSONC), keep ://  in strings-ish
+    return re.sub(r',(\s*[}\]])', r'\1', text)            # trailing commas
+
+
+def _resolve_ref(ref: str, config_dir: str) -> str | None:
+    if not ref.startswith(('./', '../', '<rootDir>')):   # a bare specifier (a package, 'node', 'default') is not a repo file
+        return None
+    ref = ref.replace('<rootDir>/', '').replace('<rootDir>', '')
+    if not ref or ref.rsplit('/', 1)[-1].count('*'):      # a glob pattern, not one file
+        return None
+    joined = f'{config_dir}/{ref}' if config_dir and not ref.startswith('/') else ref
+    parts: list[str] = []
+    for seg in joined.split('/'):
+        if seg in ('', '.'):
+            continue
+        if seg == '..':
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    rel = '/'.join(parts)
+    return rel if rel and 'node_modules' not in parts else None
+
+
+def _collect_strings(v, out: set):
+    if isinstance(v, str):
+        out.add(v)
+    elif isinstance(v, list):
+        for x in v:
+            _collect_strings(x, out)
+    elif isinstance(v, dict):
+        for x in v.values():
+            _collect_strings(x, out)
+
+
+def jsts_config_refs(name: str, content: bytes, config_dir: str) -> list[str]:
+    """Repo-relative files a jest / vitest / mocha / babel config, or a tsconfig `paths` map, points at. These are
+    reset if the model touched them, because an unchanged config can still load an editable setup/transform file
+    (EXP-018 review). JSON configs are parsed; .js/.ts/.cjs/.mjs/.yml configs are scanned for quoted ./ , ../ and
+    <rootDir>/ paths (best effort -- a config that computes a path at runtime is not caught, and the after-the-fact
+    patch audit backs this up)."""
+    raws: set = set()
+    text = content.decode('utf-8', 'replace')
+    is_json = name.endswith('.json') or name == 'package.json'
+    if is_json:
+        try:
+            d = json.loads(_strip_jsonc(text))
+        except ValueError:
+            d = None
+        if isinstance(d, dict):
+            if name.startswith('tsconfig'):
+                _collect_strings((d.get('compilerOptions') or {}).get('paths'), raws)
+            else:
+                cfg = d.get('jest') if name == 'package.json' else d
+                for k in _JS_REF_KEYS:
+                    _collect_strings((cfg or {}).get(k), raws)
+    else:
+        raws.update(_JS_REF_RE.findall(text))
+    out = set()
+    for r in raws:
+        rel = _resolve_ref(r, config_dir)
+        if rel is not None:
+            out.add(rel)
+    return sorted(out)
+
+
+_JS_CONFIG_NAMES = ('package.json', 'jest.config.json', '.mocharc.json', 'vitest.config.json')
+_JS_CONFIG_RE = re.compile(r'^(jest\.config\.|vitest\.config\.|vite\.config\.|\.mocharc|babel\.config\.|'
+                           r'tsconfig[^/]*\.json$)')
+
+
 class SweEnv(DockerTaskEnv):
     """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error').
 
@@ -478,6 +560,23 @@ class SweEnv(DockerTaskEnv):
         if r['returncode'] != 0:
             raise GradeError(f'cannot list the paths {path} changes: ' + r['output'][-300:])
         return [p for p in base64.b64decode(r['output'].strip(), validate=True).split(b'\0') if p], ''
+
+    def _base_config_files(self, sb, repo: str, start: str) -> list[str]:
+        """Test-runner / tsconfig config files present in the base tree (filtered in the shell so a huge repo does
+        not blow the output cap). Their referenced files are protected whether or not the model changed the config."""
+        pat = r'(^|/)(package\.json|jest\.config\.|vitest\.config\.|vite\.config\.|\.mocharc|babel\.config\.|tsconfig)'
+        r = sb.execute(f'set -o pipefail; git ls-tree -r --name-only {start} 2>/dev/null | grep -E {shlex.quote(pat)}'
+                       ' | head -c 200000 | base64 | tr -d "\\n"', cwd=repo, timeout=120, login=False)
+        try:
+            names = base64.b64decode(r['output'].strip(), validate=True).decode('utf-8', 'replace').splitlines()
+        except ValueError:
+            return []
+        out = []
+        for p in names:
+            b = p.rsplit('/', 1)[-1]
+            if b == 'package.json' or _JS_CONFIG_RE.match(b):
+                out.append(p)
+        return out[:300]
 
     def _importable_modules(self, sb, repo: str) -> set[str]:
         """Top-level module names importable on the image (builtins + everything on the default sys.path), used to
@@ -669,6 +768,12 @@ fi
                 if cmd_dirs:                       # files under a PATH dir / a script the command runs directly
                     reverted.update(f for f in (p.decode('utf-8', 'surrogateescape') for p in touched)
                                     if any(f == d or f.startswith(d + '/') for d in cmd_dirs))
+                touched_set = {p.decode('utf-8', 'surrogateescape') for p in touched}
+                cfg_refs: set = set()
+                for cfgpath in self._base_config_files(sb, repo, start):
+                    cdir, _, cname = cfgpath.rpartition('/')
+                    cfg_refs.update(jsts_config_refs(cname, self._read_blob(sb, repo, start, cfgpath), cdir))
+                reverted.update(touched_set & cfg_refs)   # a file a test-runner config loads: reset even if unchanged config
                 res['grader_parsers'] = GRADER_PARSERS
                 reverted = sorted(reverted)
                 self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])

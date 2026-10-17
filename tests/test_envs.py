@@ -376,6 +376,28 @@ def test_shadow_module_at_repo_root_is_reset(tmp_path):
     assert g['reward'] == 1.0 and 'pytest.py' in g['reverted_paths']
 
 
+def test_jsts_config_refs():
+    from hosted_env.envs.swe import jsts_config_refs
+    pkg = b'{"name":"p","jest":{"setupFiles":["<rootDir>/t/s.js"],"moduleNameMapper":{"^x$":"./t/x.js"},' \
+          b'"testEnvironment":"./t/env.js","reporters":["default",["jest-junit",{}]]}}'
+    assert jsts_config_refs('package.json', pkg, '') == ['t/env.js', 't/s.js', 't/x.js']
+    jc = b'{"setupFilesAfterEnv":["./setup.ts"],"transform":{"^.+\\\\.ts$":"./tools/tr.js"}}'
+    assert jsts_config_refs('jest.config.json', jc, 'web') == ['web/setup.ts', 'web/tools/tr.js']
+    ts = b'{"compilerOptions":{"paths":{"@app/*":["./src/app/*"],"util":["./src/util.ts"]}}}'
+    assert jsts_config_refs('tsconfig.json', ts, '') == ['src/util.ts']   # the glob entry is skipped, the file kept
+    js = b'module.exports = { setupFiles: ["./jest.setup.js"], globalSetup: "<rootDir>/g.js" };'
+    assert jsts_config_refs('jest.config.js', js, '') == ['g.js', 'jest.setup.js']
+    assert jsts_config_refs('package.json', b'{"name":"p"}', '') == []     # no jest config
+
+
+def test_config_referenced_setup_file_is_reset(tmp_path):
+    prep = ('mkdir -p t && printf \'{"name":"p","jest":{"setupFiles":["./t/s.js"]}}\\n\' > package.json; '
+            'printf "// real setup\\n" > t/s.js')
+    fix = 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'
+    g, _ = graded(tmp_path, fix, 'printf "process.exit(0)\\n" > t/s.js', image_prep=prep)   # edit a referenced setup
+    assert g['reward'] == 1.0 and 't/s.js' in g['reverted_paths']
+
+
 def test_image_whose_tree_differs_from_its_head(tmp_path):
     """Real images (e.g. 001488) ship a working tree that differs from their own HEAD: deleted tracked files,
     edits, extra files. That state is the task, not the model's work: a no-op rollout yields an empty patch, and
