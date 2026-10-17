@@ -286,7 +286,7 @@ class K8sSandbox:
                  cpus: str = '1', memory: str = '2g', disk: str | None = DEFAULT_DISK, network: str = 'none',
                  repair_env: bool = True,
                  offline_check: str = 'interfaces', start_timeout: float = 600, poll: float = 0.5,
-                 delete_timeout: float = 120, limit_wait: float = LIMIT_WAIT,
+                 delete_timeout: float = 120, limit_wait: float = LIMIT_WAIT, pid1_guard: bool = True,
                  labels: dict | None = None, **_ignored):
         """runtime_class 'auto': gvisor-nonet for network='none', gvisor otherwise.
         offline_check (network='none' only): 'interfaces' refuses a sandbox that has any interface besides lo;
@@ -310,7 +310,7 @@ class K8sSandbox:
         self.networking_api, self.network, self.offline_check = networking_api, network, offline_check
         self.exec_fn = exec_fn or ws_exec(api, namespace)
         self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env
-        self.delete_timeout, self.limit_wait = delete_timeout, limit_wait
+        self.delete_timeout, self.limit_wait, self.pid1_guard = delete_timeout, limit_wait, pid1_guard
         self.started, self.has_timeout, self.handed_out = False, False, False
         self.env: dict[str, str] = {}
 
@@ -341,11 +341,27 @@ class K8sSandbox:
         if self.network == 'none' and self.offline_check == 'interfaces':
             self._check_offline()
         self.has_timeout = self.execute('command -v timeout', timeout=30, raw=True)['returncode'] == 0
+        if self.pid1_guard:
+            self._check_pid1_protected()
         if self.repair_env:
             out = self.execute(ENV_PROBE, timeout=60, raw=True)['output']
             self.env = dict(ln.split('=', 1) for ln in out.splitlines()
                             if '=' in ln and ln.split('=', 1)[0].isupper())
         self.handed_out = True          # from here on its commands are the caller's: a limit kill is theirs
+
+    def _check_pid1_protected(self) -> None:
+        """Refuse the sandbox (pre-hand-out, so infra not model) unless PID 1 is protected from signals the model
+        sends. The model is root in its rollout container with CAP_KILL; without SIGNAL_UNKILLABLE on the init
+        process it could `kill -9 1` to kill `sleep infinity`, terminate the container and get its rollout voided
+        (EXP-018 PR #15 review). With the gvisor runsc `signal-unkillable-policy=linux` config an intra-namespace
+        SIGSTOP to the handler-less init is ignored; without it the init stops (state T). Probe: stop, read, cont."""
+        r = self.execute("kill -STOP 1 2>/dev/null; s=$(awk '/^State:/{print $2}' /proc/1/status 2>/dev/null); "
+                         "kill -CONT 1 2>/dev/null; printf '%s' \"$s\"", timeout=30, raw=True)
+        state = r['output'].strip()
+        if state == 'T':
+            raise SandboxError('PID 1 is not signal-protected (state T after SIGSTOP): the runtime lacks '
+                               'signal-unkillable-policy=linux, so the model could kill its own container; '
+                               'refusing the sandbox')
 
     def _check_offline(self) -> None:
         """Fail closed unless the sandbox has no network interface besides loopback. NetworkPolicy enforcement is

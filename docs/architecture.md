@@ -92,7 +92,11 @@ container; under runc an OOM may kill only the offending process.
 - Pod network: flannel `wireguard-native` (encrypted, 25 s keepalive from each node), so only the control plane
   opens a UDP port.
 - gVisor: `runsc` from the gVisor apt repository plus a containerd drop-in (`config-v3.toml.d/runsc.toml`) with two
-  runtimes, `runsc` and `runsc-nonet` (`--network=none`), and RuntimeClasses `gvisor` and `gvisor-nonet`.
+  runtimes, `runsc` and `runsc-nonet` (`--network=none`), and RuntimeClasses `gvisor` and `gvisor-nonet`. Both
+  runsc runtimes set `signal-unkillable-policy=linux`, so the rollout container's PID 1 (`sleep infinity`) is
+  signal-protected and the model, root with CAP_KILL, cannot `kill -9 1` to kill the container and void its
+  rollout. `K8sSandbox.start()` probes PID 1 (SIGSTOP, read state, SIGCONT) and refuses the sandbox if the
+  protection is not in force, so a node missing the config fails closed instead of letting the void through.
 - Boot scripts re-apply firewall rules on every boot, because boat snapshots do not keep them.
 
 ## Measured (EXP-017, 2026-10-15)

@@ -79,8 +79,29 @@ def offline_exec(dev=LO_ONLY, rc=0):
 
 def make(tmp_path, **kw):
     kw.setdefault('repair_env', False)
+    kw.setdefault('pid1_guard', False)   # the real probe would run `kill -STOP 1` on the host under the fake exec
     return K8sSandbox('img:1', str(tmp_path), api=kw.pop('api', FakeCore()), networking_api=kw.pop('net', FakeNet()),
                       exec_fn=kw.pop('exec_fn', offline_exec()), poll=0, **kw)
+
+
+def test_pid1_guard_refuses_a_killable_init(tmp_path):
+    def probe(state):
+        def run(pod, argv, timeout):
+            if 'kill -STOP 1' in argv[-1]:
+                return state.encode(), 0, False
+            return offline_exec()(pod, argv, timeout)
+        return run
+    # protection off: SIGSTOP stopped PID 1 (state T) -> the model could kill its container -> refuse (pre-hand-out)
+    sb = K8sSandbox('img:1', str(tmp_path), api=FakeCore(), networking_api=FakeNet(), exec_fn=probe('T'),
+                    repair_env=False, poll=0, pid1_guard=True)
+    with pytest.raises(SandboxError, match='not signal-protected'):
+        sb.start()
+    assert not sb.handed_out
+    # protection on: the handler-less init ignored SIGSTOP (stays S) -> the sandbox is handed out
+    sb = K8sSandbox('img:1', str(tmp_path), api=FakeCore(), networking_api=FakeNet(), exec_fn=probe('S'),
+                    repair_env=False, poll=0, pid1_guard=True)
+    sb.start()
+    assert sb.handed_out
 
 
 def test_pod_manifest_defaults_and_placement():
@@ -351,7 +372,7 @@ def test_executor_builds_k8s_sandboxes(tmp_path):
     core, net = FakeCore(), FakeNet()
     rt = EnvRuntime(env=DockerTaskEnv('e', {'group_size': 8}), renderer=CharRenderer(), sandbox='k8s',
                     sandbox_opts={'exec_fn': offline_exec(), 'node_name': 'node-a', 'repair_env': False,
-                                  'poll': 0})
+                                  'poll': 0, 'pid1_guard': False})
     w = Worker(worker_id='local', key=SigningKey.generate(), gateway=None, gateway_pub=SigningKey.generate().verify_key,
                runtimes={'e': rt}, public_url='http://x', k8s_api=(core, net))
     sb = w._sandbox_factory(rt)('img:1', str(tmp_path))
