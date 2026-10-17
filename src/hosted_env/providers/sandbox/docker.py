@@ -60,7 +60,10 @@ def _pump(stream, buf: bytearray):
 
 class DockerSandbox:
     def __init__(self, image: str, cwd: str, *, network: str = 'none', cpus: str = '1', memory: str = '2g',
-                 pids: int = 4096, repair_env: bool = True):
+                 pids: int = 4096, repair_env: bool = True, disk: str | None = None):
+        """disk is accepted so a k8s sandbox_opts table can be reused, but not enforced: `--storage-opt size=`
+        works only on overlay2 over xfs with pquota. Development only, like the rest of this provider."""
+        del disk
         self.image, self.cwd = image, cwd
         self.run_args = ['--network', network, '--cpus', str(cpus), '--memory', str(memory),
                          '--pids-limit', str(pids), '--security-opt', 'no-new-privileges']

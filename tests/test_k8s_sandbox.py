@@ -237,6 +237,43 @@ def test_sigkilled_command_checks_the_container(tmp_path):
     assert sb.execute('hog')['returncode'] == 137                 # only the process died: an ordinary exit status
 
 
+def test_node_pressure_eviction_of_a_pod_over_its_own_request_is_its_limit():
+    over = NODE_DISK + 'Container task was using 12Gi, request is 10Gi, has larger consumption of ephemeral-storage. '
+    under = NODE_DISK + 'Container task was using 3Gi, request is 10Gi, has larger consumption of ephemeral-storage. '
+    assert limit_reason(_dead('Evicted', over)).startswith('ephemeral-storage limit: The node was low')
+    assert limit_reason(_dead('Evicted', under)) is None         # a neighbour filled the node: infra
+
+
+def test_copy_into_a_sandbox_killed_for_its_limit_is_a_limit_error(tmp_path):
+    def copy_fails(pod, argv, timeout):
+        if argv[:2] == ['sh', '-c'] and 'base64 -d' in argv[2]:
+            raise SandboxError('exec failed: 0 Handshake status 500')
+        return offline_exec()(pod, argv, timeout)
+    core = FakeCore()
+    sb = make(tmp_path, api=core, exec_fn=copy_fails, limit_wait=5)
+    sb.start()
+    core.pods = [_dead('Evicted', OWN_DISK)]
+    with pytest.raises(SandboxLimitError):
+        sb.copy_text_to('x', '/tmp/f')
+
+
+def test_timeout_escalated_to_sigkill_is_a_client_timeout(tmp_path):
+    sb = started(tmp_path, _pod(), slow=lambda: (b'', 137, False), true=raises('must not probe'))
+    sb.has_timeout = True
+    assert sb.execute('slow', timeout=0)['reason'] == 'client_timeout'   # 137 at/after the timeout: `timeout -k`
+    sb = started(tmp_path, _dead(terminated='OOMKilled'), slow=lambda: (b'', 137, False), true=raises('gone'))
+    sb.has_timeout = True
+    with pytest.raises(SandboxLimitError):
+        sb.execute('slow', timeout=60)                              # 137 well before the timeout: probed
+
+
+def test_zero_disk_and_units():
+    assert 'ephemeral-storage' not in pod_manifest('p', 'i', '/w', namespace='n', disk='0')['spec']['containers'][0][
+        'resources']['limits']
+    lim = pod_manifest('p', 'i', '/w', namespace='n', memory='2G', disk='10G')['spec']['containers'][0]['resources']
+    assert lim['limits'] == {'cpu': '1', 'memory': '2G', 'ephemeral-storage': '10G'}   # upper case: k8s decimal
+
+
 def test_executor_builds_k8s_sandboxes(tmp_path):
     from nacl.signing import SigningKey
 

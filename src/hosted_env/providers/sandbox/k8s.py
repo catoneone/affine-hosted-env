@@ -16,6 +16,7 @@ API object and an `exec_fn`.
 from __future__ import annotations
 
 import base64
+import re
 import threading
 import time
 import uuid
@@ -38,10 +39,18 @@ ExecFn = Callable[[str, list[str], float], tuple[bytes, int, bool]]
 
 
 def _mem(v: str) -> str:
-    """Docker-style sizes ('2g', '512m') to Kubernetes quantities ('2Gi', '512Mi')."""
+    """Docker-style sizes ('2g', '512m') to Kubernetes quantities ('2Gi', '512Mi'). Only the lower-case docker
+    suffixes are binary; Kubernetes ones ('2G' decimal, '2Gi') pass through, as coordinator/nodes.mem_bytes reads
+    them, so slot sizing and the Pod limit agree."""
     v = str(v).strip()
     units = {'k': 'Ki', 'm': 'Mi', 'g': 'Gi', 't': 'Ti'}
-    return v[:-1] + units[v[-1].lower()] if v and v[-1].lower() in units else v
+    return v[:-1] + units[v[-1]] if v and v[-1] in units else v
+
+
+def _positive(q) -> bool:
+    """A size like '10g' / '0' / '' / None: true only for a positive amount (a 0 disk limit would evict at once)."""
+    m = re.match(r'\s*([0-9]*\.?[0-9]+)', str(q or ''))
+    return bool(m) and float(m.group(1)) > 0
 
 
 def pod_manifest(name: str, image: str, cwd: str, *, namespace: str, node_name: str | None = None,
@@ -51,7 +60,7 @@ def pod_manifest(name: str, image: str, cwd: str, *, namespace: str, node_name: 
     the node filling up and evicting every sandbox on it (EXP-018: under gVisor the limit is enforced, a 1.5 GiB
     write into a 1Gi Pod is evicted within ~20 s). None leaves it unlimited."""
     res = {'cpu': str(cpus), 'memory': _mem(memory)}
-    if disk:
+    if _positive(disk):
         res['ephemeral-storage'] = _mem(disk)
     spec = {
         'restartPolicy': 'Never',
@@ -124,8 +133,22 @@ def _ready(pod) -> bool:
 
 
 # kubelet messages for a Pod evicted over its OWN ephemeral-storage limit (pod-level / container-level). A node-pressure
-# eviction reads "The node was low on resource: ephemeral-storage" and is deliberately not matched.
+# eviction reads "The node was low on resource: ephemeral-storage" and is attributed only when it also says our
+# container was using more than its request (requests equal limits, so that is over its own limit too).
 _OWN_DISK_EVICTION = ('exceeds the total limit of containers', 'exceeded its local ephemeral storage limit')
+_NODE_PRESSURE_USAGE = re.compile(r'Container \S+ was using (\S+), request is (\S+), has larger consumption of '
+                                  r'ephemeral-storage')
+
+
+def _over_request(msg: str) -> bool:
+    from ...coordinator.nodes import mem_bytes
+    for used, req in _NODE_PRESSURE_USAGE.findall(msg):
+        try:
+            if mem_bytes(used.rstrip(',.')) > mem_bytes(req.rstrip(',.')) > 0:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def limit_reason(pod) -> str | None:
@@ -136,7 +159,7 @@ def limit_reason(pod) -> str | None:
     the sandbox's own."""
     st = pod.status
     msg = getattr(st, 'message', None) or ''
-    if getattr(st, 'reason', None) == 'Evicted' and any(m in msg for m in _OWN_DISK_EVICTION):
+    if getattr(st, 'reason', None) == 'Evicted' and (any(m in msg for m in _OWN_DISK_EVICTION) or _over_request(msg)):
         return f'ephemeral-storage limit: {msg.strip()[:200]}'
     for cs in getattr(st, 'container_statuses', None) or []:
         term = getattr(cs.state, 'terminated', None) if getattr(cs, 'state', None) else None
@@ -295,13 +318,14 @@ class K8sSandbox:
         SandboxError for any other exec failure."""
         if not self.started:
             raise SandboxError('sandbox not started')
+        t0 = time.monotonic()
         try:
             out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw, login), timeout + 30)
         except SandboxError as e:
             self._raise_if_limited(e)
             raise
-        if self.has_timeout and not raw and rc == 124:
-            timed_out = True
+        if self.has_timeout and not raw and (rc == 124 or (rc == 137 and time.monotonic() - t0 >= timeout)):
+            timed_out = True                        # 137 here: `timeout -k 5` had to escalate to SIGKILL
         if rc in KILLED_RC and not timed_out and self.handed_out:
             self._check_alive()
         return {'output': out[:OUTPUT_CAP_BYTES].decode('utf-8', 'replace'), 'returncode': rc,
@@ -340,8 +364,14 @@ class K8sSandbox:
             b64 = base64.b64encode(data[i:i + WRITE_CHUNK]).decode()
             op = '>' if i == 0 else '>>'
             argv = ['sh', '-c', f'printf %s "$1" | base64 -d {op} "$2"', 'sh', b64, remote_path]
-            out, rc, _ = self.exec_fn(self.name, argv, 120)
+            try:
+                out, rc, _ = self.exec_fn(self.name, argv, 120)
+            except SandboxError as e:                    # like execute: a limit kill is attributed, not hidden
+                self._raise_if_limited(e)
+                raise
             if rc != 0:
+                if rc in KILLED_RC and self.handed_out:
+                    self._check_alive()
                 raise SandboxError(f'write {remote_path} failed: {out[-300:].decode("utf-8", "replace")}')
 
     def cleanup(self):

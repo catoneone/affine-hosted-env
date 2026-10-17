@@ -8,7 +8,7 @@ from conftest import make_swe_tasks
 
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, GradeError, truncate_middle
-from hosted_env.envs.swe import future_commits, protected_paths
+from hosted_env.envs.swe import TEST_PATCH_REMOTE, future_commits, protected_paths
 from hosted_env.providers.sandbox import LocalSandbox, SandboxLimitError
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
 
@@ -230,6 +230,58 @@ def test_tests_killed_for_the_grading_containers_limit_score_0(tmp_path):
     s.close()
     assert g['reward'] == 0.0 and g['grade_detail'].startswith('grader_sandbox_limit: ephemeral-storage limit')
     assert 'a + b' in g['model_patch'] and g.get('verifier_returncode') is None
+
+
+class LimitAfter(LimitedSandbox):
+    """Reports a limit kill on the first command containing `marker` (or the upload to `copy_kill`), and on
+    everything after it."""
+    def __init__(self, *a, marker=None, copy_kill=None, **kw):
+        super().__init__(*a, **kw)
+        self.marker, self.copy_kill = marker, copy_kill
+
+    def execute(self, command, *a, **kw):
+        if self.marker and self.marker in command:
+            self.dead = True
+        return super().execute(command, *a, **kw)
+
+    def copy_text_to(self, text, remote_path):
+        if self.dead or remote_path == self.copy_kill:
+            self.dead = True
+            raise SandboxLimitError('memory limit: container OOMKilled')
+        return super().copy_text_to(text, remote_path)
+
+
+def grade_with_grader(tmp_path, fix=True, **grader_kw):
+    """One rollout in a plain sandbox, graded in a LimitAfter(**grader_kw) container."""
+    env, task = make_task(tmp_path)
+    gi, made = env.grade_inputs(task), []
+
+    def factory(image, cwd):
+        made.append(LimitAfter(image, cwd, base_dir=str(tmp_path), **(grader_kw if made else {})))
+        return made[-1]
+    s = env.open(env.public_spec(task), factory)
+    s.setup()
+    if fix:
+        assert s.sb.execute('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')['returncode'] == 0
+    try:
+        return s.grade(gi)
+    finally:
+        s.close()
+
+
+@pytest.mark.parametrize('kw', [{'marker': 'git apply --cached'}, {'marker': 'git apply --binary'},
+                                {'copy_kill': TEST_PATCH_REMOTE}])
+def test_limit_kill_while_the_grader_handles_the_model_patch_scores_0(tmp_path, kw):
+    """A few-KB git binary delta can expand to GBs inside `git apply` (review of PR #15): from the moment model bytes
+    are in the grading container, a limit kill is the model's, even before the hidden tests run."""
+    g = grade_with_grader(tmp_path, **kw)
+    assert g['reward'] == 0.0 and g['grade_detail'].startswith('grader_sandbox_limit: ')
+    assert 'a + b' in g['model_patch']
+
+
+def test_limit_kill_before_any_model_bytes_is_an_infra_error(tmp_path):
+    with pytest.raises(GradeError, match='during setup'):            # empty model patch: nothing of the model's ran
+        grade_with_grader(tmp_path, fix=False, copy_kill=TEST_PATCH_REMOTE)
 
 
 def test_protected_paths_rules():

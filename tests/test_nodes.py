@@ -48,6 +48,7 @@ def test_node_info_disk_slots():
     assert node_info(small).slots == 2                                 # disk bound: (40 - 20) / 10
     assert node_info(small, disk='5g').slots == 4
     assert node_info(small, disk=None).slots == 7                      # disk not counted
+    assert node_info(small, disk='0').slots == 7                       # 0 means unlimited, not a division by zero
     assert node_info(knode('nodisk', cpu='8', mem='32Gi')).slots == 7   # node reports no ephemeral-storage
     assert node_info(knode('full', disk='15Gi')).slots == 0             # below the image-cache reserve
 
