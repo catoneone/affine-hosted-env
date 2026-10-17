@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 import shlex
 import sys
@@ -268,6 +269,76 @@ def manifest_reverts(name: str, base: bytes, cur: bytes) -> bool:
     return bk != ck
 
 
+_ALWAYS_SHADOW = {'pytest', '_pytest', 'py', 'pluggy'}   # internals of the test runner itself, by name
+
+
+def shadow_added(added: list[str], importable: set[str]) -> list[str]:
+    """Model-ADDED paths that would shadow an importable top-level module. `python -m pytest` runs with the repo on
+    sys.path, so a new root file `pytest.py` or a new root directory `_pytest/` is imported before the real one
+    (verified in EXP-018). The shadow is the top-level component: a root `*.py` file by its stem, or the first
+    directory of a deeper path. A name is a shadow if it is importable on the image, is a pytest internal, or
+    matches `pytest_*`. Files inside an existing package import as a submodule, not a top-level shadow, and are
+    left to the name / structured rules."""
+    out = []
+    for p in added:
+        segs = p.split('/')
+        if len(segs) == 1:
+            if not segs[0].endswith('.py'):
+                continue
+            mod = segs[0][:-3]
+        else:
+            mod = segs[0]                                 # a new top-level directory == an importable package name
+        if not mod or '.' in mod:
+            continue
+        if mod in importable or mod in _ALWAYS_SHADOW or mod.startswith('pytest_'):
+            out.append(p)
+    return out
+
+
+_CMD_PATH_RE = re.compile(r'PATH=([^\s;"\']+)')
+_CMD_INVOKE_RE = re.compile(r'(?:^|[\s;&|(])(?:exec\s+)?(?:bash|sh)\s+(\S+\.sh)'
+                            r'|(?:^|[\s;&|(])(\./[^\s;&|)]+)')
+
+
+def _repo_rel(p: str, cwd: str) -> str | None:
+    """`p` as a path relative to the repo `cwd`, or None when it is outside the repo. Relative paths are taken as
+    repo-relative; an absolute path is kept only if it is under cwd."""
+    p = p.strip().strip('"\'')
+    if not p or p in ('.', './'):
+        return None
+    if p.startswith('/'):
+        pre = cwd.rstrip('/') + '/'
+        if not p.startswith(pre):
+            return None
+        p = p[len(pre):]
+    elif p.startswith('./'):
+        p = p[2:]
+    if not p or p.startswith('../') or '/../' in p:
+        return None
+    p = p.rstrip('/')
+    if any(seg in ('.', '..', '...') for seg in p.split('/')):   # e.g. go's ./... wildcard is not a path
+        return None
+    return p
+
+
+def command_repo_paths(test_command: str, cwd: str) -> list[str]:
+    """Repo-relative directories put on PATH and scripts invoked directly by the test command: anything the model
+    adds or changes under them decides what the grader runs, so they are protected like the test infrastructure.
+    Absolute paths outside the repo are ignored. Heuristic over the command string (the inner script of a mimo
+    task lives in the test patch and is reset separately)."""
+    out = set()
+    for m in _CMD_PATH_RE.findall(test_command):
+        for part in m.split(':'):
+            rel = _repo_rel(part, cwd)
+            if rel is not None and not rel.startswith('$'):
+                out.add(rel)
+    for sh, dot in _CMD_INVOKE_RE.findall(test_command):
+        rel = _repo_rel(sh or dot, cwd)
+        if rel is not None and '$' not in rel:
+            out.add(rel)
+    return sorted(out)
+
+
 class SweEnv(DockerTaskEnv):
     """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error').
 
@@ -380,7 +451,7 @@ class SweEnv(DockerTaskEnv):
         return out
 
     def _changed_paths(self, sb, repo: str, start: str, path: str,
-                       keep_deleted: bool = True) -> tuple[list[bytes] | None, str]:
+                       keep_deleted: bool = True, added_only: bool = False) -> tuple[list[bytes] | None, str]:
         """Every path whose content or mode the patch at `path` changes relative to the tree `start`, with renames
         and copies counted as their separate deletes and adds. The patch is applied to a throwaway index holding
         `start` by the grading container's own git and compared with --no-renames, so a protected file the model
@@ -399,7 +470,7 @@ class SweEnv(DockerTaskEnv):
         if ap['returncode'] != 0:
             sb.execute(f'rm -f {TREE_INDEX_REMOTE}', timeout=60, login=False)
             return None, ap['output'][-300:] or f'git apply --cached exited {ap["returncode"]}'
-        only = '' if keep_deleted else '--diff-filter=d '
+        only = '--diff-filter=A ' if added_only else ('' if keep_deleted else '--diff-filter=d ')
         r = sb.execute(f'set -o pipefail; {idx} git diff --cached --no-renames --no-ext-diff --name-only -z {only}'
                        f'{start} '
                        f'2>/dev/null | base64 | tr -d "\\n"; rc=$?; rm -f {TREE_INDEX_REMOTE}; exit $rc', cwd=repo,
@@ -407,6 +478,23 @@ class SweEnv(DockerTaskEnv):
         if r['returncode'] != 0:
             raise GradeError(f'cannot list the paths {path} changes: ' + r['output'][-300:])
         return [p for p in base64.b64decode(r['output'].strip(), validate=True).split(b'\0') if p], ''
+
+    def _importable_modules(self, sb, repo: str) -> set[str]:
+        """Top-level module names importable on the image (builtins + everything on the default sys.path), used to
+        decide which model-added top-level names shadow a real module. Run from `/`, never the repo, so the repo's
+        own modules are not counted. Empty when no python is on the image (then only the pytest internals apply)."""
+        probe = ('import sys,pkgutil,json;'
+                 "m=set(sys.builtin_module_names);"
+                 "m|={x.name for x in pkgutil.iter_modules() if '.' not in x.name};"
+                 'print(json.dumps(sorted(m)))')
+        for py in ('python3', 'python'):
+            r = sb.execute(f'{py} -c {shlex.quote(probe)}', cwd='/', timeout=120, login=False)
+            if r['returncode'] == 0 and r['output'].strip():
+                try:
+                    return set(json.loads(r['output'].strip().splitlines()[-1]))
+                except ValueError:
+                    pass
+        return set()
 
     def _read_blob(self, sb, repo: str, ref: str | None, rel: str) -> bytes:
         """Raw bytes of `rel` at git ref `ref` (base tree), or from the working file when ref is None (the model's
@@ -555,7 +643,11 @@ fi
                 # to gigabytes in `git apply` (review of PR #15). A limit kill from now on is the model's: 0.
                 untrusted = True
                 touched, why = self._changed_paths(sb, repo, start, MODEL_PATCH_REMOTE)   # first: changes nothing
+                added: list[str] = []
                 if touched is not None:
+                    added = [p.decode('utf-8', 'surrogateescape')          # new files, read before the patch is gone
+                             for p in (self._changed_paths(sb, repo, start, MODEL_PATCH_REMOTE,
+                                                           added_only=True)[0] or [])]
                     ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
                                     timeout=300, login=False)
                     why = '' if ap['returncode'] == 0 else (ap['output'][-300:] or f'exit {ap["returncode"]}')
@@ -572,6 +664,11 @@ fi
                     if manifest_reverts(name, self._read_blob(sb, repo, start, rel),
                                         self._read_blob(sb, repo, None, rel)):
                         reverted.add(rel)         # a test-relevant key changed, or it does not parse: reset to base
+                reverted.update(shadow_added(added, self._importable_modules(sb, repo) if added else set()))
+                cmd_dirs = command_repo_paths(gi['test_command'], repo)
+                if cmd_dirs:                       # files under a PATH dir / a script the command runs directly
+                    reverted.update(f for f in (p.decode('utf-8', 'surrogateescape') for p in touched)
+                                    if any(f == d or f.startswith(d + '/') for d in cmd_dirs))
                 res['grader_parsers'] = GRADER_PARSERS
                 reverted = sorted(reverted)
                 self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])

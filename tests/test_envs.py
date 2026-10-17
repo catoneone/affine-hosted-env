@@ -349,6 +349,34 @@ def test_structured_manifest_dependency_change_is_kept(tmp_path):
     assert '"left-pad":"1.3.0"' in g['model_patch'] and g['grader_parsers'].startswith('py')
     g, _ = graded(tmp_path, fix, 'sed -i.bak "s/jest/true/" package.json && rm package.json.bak', image_prep=prep)
     assert g['reward'] == 1.0 and 'package.json' in g['reverted_paths']        # a scripts change is reverted
+
+
+def test_shadow_added():
+    from hosted_env.envs.swe import shadow_added
+    imp = {'numpy', 'requests'}
+    assert shadow_added(['pytest.py', 'x/pytest.py', '_pytest/foo.py', 'requests.py', 'pkg/helper.py',
+                         'notes.txt', 'pytest_plug.py', 'app.py'], imp) == [
+        'pytest.py', '_pytest/foo.py', 'requests.py', 'pytest_plug.py']
+    assert shadow_added(['sitecustomize.py'], set()) == []        # not importable and not a pytest internal here
+    assert shadow_added(['numpy/__init__.py'], imp) == ['numpy/__init__.py']   # a new top-level numpy/ package
+
+
+def test_command_repo_paths():
+    from hosted_env.envs.swe import command_repo_paths
+    assert command_repo_paths('bash /workspace/repo/mimo_test_command.sh', '/workspace/repo') == \
+        ['mimo_test_command.sh']
+    assert command_repo_paths('cd /testbed && PATH=./bin:$PATH exec bash ./run.sh', '/testbed') == ['bin', 'run.sh']
+    assert command_repo_paths('bash /other/x.sh', '/testbed') == []          # outside the repo
+    assert command_repo_paths('go test ./...', '/workspace/repo') == []
+
+
+def test_shadow_module_at_repo_root_is_reset(tmp_path):
+    fix = 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'
+    g, _ = graded(tmp_path, fix, 'printf "import os\\nos._exit(0)\\n" > pytest.py')   # shadow the test runner
+    assert g['reward'] == 1.0 and 'pytest.py' in g['reverted_paths']
+
+
+def test_image_whose_tree_differs_from_its_head(tmp_path):
     """Real images (e.g. 001488) ship a working tree that differs from their own HEAD: deleted tracked files,
     edits, extra files. That state is the task, not the model's work: a no-op rollout yields an empty patch, and
     a fix on top of it carries over exactly."""
