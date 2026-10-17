@@ -40,7 +40,7 @@ from .gateway_client import GatewayRejected, GatewayUnavailable, WorkerGatewayCl
 log = logging.getLogger('hosted_env.executor')
 # grade() fields the executor log keeps for each finished rollout: how it was graded and what the verifier said
 # (model_patch and test_output are too large for the log)
-GRADE_LOG_FIELDS = ('grader', 'grader_user', 'lock_seconds', 'grade_detail', 'verifier_returncode',
+GRADE_LOG_FIELDS = ('grader', 'grader_parsers', 'grader_user', 'lock_seconds', 'grade_detail', 'verifier_returncode',
                     'verifier_reason', 'test_seconds')
 
 
@@ -413,7 +413,8 @@ class Worker:
         return {'image': str(spec.get('image', '')), 'start_tree': str(state.get('start_tree', '')),
                 'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
                 'test_command_sha256': _sha256_text(gi.get('test_command', '')),
-                'grader': str(grade.get('grader', '')), 'grader_user': str(grade.get('grader_user', '')),
+                'grader': str(grade.get('grader', '')), 'grader_parsers': str(grade.get('grader_parsers', '')),
+                'grader_user': str(grade.get('grader_user', '')),
                 'model_patch_sha256': str(grade.get('model_patch_sha256', '')),
                 'verifier_returncode': rc if type(rc) is int else None,
                 'model_id': r.model_id, 'model_revision': r.model_revision, **r.identity,

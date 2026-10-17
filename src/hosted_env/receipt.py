@@ -45,7 +45,8 @@ CONTEXT_FIELDS = {
     'start_tree': str,              # git tree the model started from (after setup); the patch applies to it
     'test_patch_sha256': str,       # of the hidden test patch text (UTF-8)
     'test_command_sha256': str,     # of the test command text (UTF-8)
-    'grader': str,                  # grading semantics version, e.g. isolated-v2
+    'grader': str,                  # grading semantics version, e.g. isolated-v3
+    'grader_parsers': str,          # pinned parsers that decided keep/revert of structured manifests (isolated-v3+)
     'grader_user': str,             # who the hidden tests ran as: nobody or root
     'model_patch_sha256': str,      # of the model's patch bytes as captured, before the grader put protected test
                                     # infrastructure back (a re-grader applies the same rule); the attachment has it
