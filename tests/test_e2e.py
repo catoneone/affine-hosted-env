@@ -98,6 +98,9 @@ def test_group_end_to_end(stack):
     res = run_task(gw, EPOCH, 'swe', sampler)
     outs = [(x['nonce'], x['outcome'], x['reward']) for x in res['rollouts']]
     assert outs == [(n, 'completed', 1.0 if n % 2 == 0 else 0.0) for n in range(8)]
+    # this task has no expected tests: the receipt says so, and the reward rests on the exit code
+    from hosted_env.common import unb64u
+    assert all(json.loads(unb64u(x['receipt']['payload']))['expected_tests_sha256'] == '' for x in res['rollouts'])
 
     info, keys = trusted(stack)
     assert key_id(stack['wkey'].verify_key) in keys and info['envs']['swe']['group_size'] == 8
@@ -218,3 +221,22 @@ def test_single_process_group_and_data_plane_limit(tmp_path):
         assert httpx.get(gw.url + '/v1/health').json()['worker_id'] == 'local'
         bad = httpx.post(gw.url + '/v1/start', json={}, headers={'Authorization': 'Bearer nope'})
         assert (bad.status_code, bad.json()['error']) == (401, 'bad_token')
+
+
+def test_receipt_context_binds_expected_tests():
+    """The receipt carries the digest of the expected tests the grader was handed, so an offline re-grade can
+    check it used the same list; an ungraded rollout (gi == {}) carries ''."""
+    from types import SimpleNamespace
+
+    from hosted_env.executor.core import Worker
+    from hosted_env.receipt import expected_tests_digest
+    rend = SimpleNamespace(model_id='m', model_revision='r', identity={'tokenizer_sha256': '', 'chat_template_sha256': '',
+                                                                     'renderer': 'char'})
+    s = SimpleNamespace(rt=SimpleNamespace(renderer=rend), envsess=None, started=1.0)
+    me = SimpleNamespace(build_version='t')
+    gi = {'test_patch': 'p', 'test_command': 'c', 'report_kind': 'junit',
+          'fail_to_pass': ['tests/test_a.py::t1'], 'pass_to_pass': ['tests/test_a.py::t0']}
+    ctx = Worker._receipt_context(me, s, gi, {'grader': 'isolated-v3'})
+    assert ctx['expected_tests_sha256'] == expected_tests_digest(['tests/test_a.py::t1'], ['tests/test_a.py::t0'],
+                                                                'junit') != ''
+    assert Worker._receipt_context(me, s, {}, {})['expected_tests_sha256'] == ''

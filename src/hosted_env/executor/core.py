@@ -30,7 +30,7 @@ from .. import __version__
 from ..auth import AuthError, verify_token
 from ..common import canonical, key_id, sha256_hex
 from ..envs import SetupError
-from ..receipt import TrajectoryHasher, receipt_digest, sign_receipt
+from ..receipt import TrajectoryHasher, expected_tests_digest, receipt_digest, sign_receipt
 from ..render import TemplateRenderer
 from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox, SandboxCommandError, SandboxLimitError
 from ..providers.sandbox.k8s import K8sSandbox
@@ -423,6 +423,10 @@ class Worker:
                 'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
                 'test_command_sha256': _sha256_text(gi.get('test_command', '')),
                 'grader': str(grade.get('grader', '')), 'grader_parsers': str(grade.get('grader_parsers', '')),
+                # the expected tests the grader was handed (gi is {} when the rollout was not graded -> '')
+                'expected_tests_sha256': expected_tests_digest(gi.get('fail_to_pass') or [],
+                                                               gi.get('pass_to_pass') or [],
+                                                               gi.get('report_kind') or ''),
                 'grader_user': str(grade.get('grader_user', '')),
                 'model_patch_sha256': str(grade.get('model_patch_sha256', '')),
                 'verifier_returncode': rc if type(rc) is int else None,

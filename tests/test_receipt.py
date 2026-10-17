@@ -7,8 +7,8 @@ import pytest
 from nacl.signing import SigningKey
 
 from hosted_env.common import b64u, unb64u
-from hosted_env.receipt import (ReceiptError, TrajectoryHasher, loss_mask, sign_receipt, trajectory_sha256,
-                                verify_receipt)
+from hosted_env.receipt import (ReceiptError, TrajectoryHasher, expected_tests_digest, loss_mask, sign_receipt,
+                                trajectory_sha256, verify_receipt)
 from hosted_env.verify import GROUP_ATTACHMENT_VERSION, verify_group
 
 ID = dict(epoch='e000001', hotkey='5Hotkey0', env_id='mimo_swe', task='002119', nonce=3)
@@ -17,6 +17,7 @@ SEGS = [('P', [151644, 8948, 198]), ('M', [40, 1184, 311, 1349]), ('T', [27, 141
 CTX = {'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64, 'start_tree': '9' * 40,
        'test_patch_sha256': 'a' * 64,
        'test_command_sha256': 'b' * 64, 'grader': 'isolated-v3', 'grader_parsers': 'py3.12:tomllib+json+configparser',
+       'expected_tests_sha256': '',
        'grader_user': 'nobody',
        'model_patch_sha256': 'd' * 64, 'verifier_returncode': 0, 'model_id': 'XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B',
        'model_revision': '2367e865', 'tokenizer_sha256': 'e' * 64, 'chat_template_sha256': 'f' * 64,
@@ -279,3 +280,23 @@ def test_group_seal_binds_the_receipts_and_the_gateway():
             verify_group(dict(g, seal=seal), keys, **GID)
     with pytest.raises(ReceiptError, match='bad_seal_signature'):    # signed by a worker key, not the gateway's
         verify_group(g, keys, **{**GID, 'gateway_key': wk.verify_key})
+
+
+def test_expected_tests_digest():
+    """Order and duplicates do not change it; any id, the split between F2P / P2P, or the report kind does; a task
+    with no expected tests digests to ''."""
+    d = expected_tests_digest(['t.py::a', 't.py::b'], ['t.py::c'], 'junit')
+    assert len(d) == 64 and d == expected_tests_digest(['t.py::b', 't.py::a', 't.py::a'], ['t.py::c'], 'junit')
+    assert d != expected_tests_digest(['t.py::a'], ['t.py::b', 't.py::c'], 'junit')     # moved F2P -> P2P
+    assert d != expected_tests_digest(['t.py::a', 't.py::b'], ['t.py::c'], 'gotest')
+    assert d != expected_tests_digest(['t.py::a', 't.py::x'], ['t.py::c'], 'junit')
+    assert expected_tests_digest([], [], 'junit') == '' == expected_tests_digest(None, None, '')
+
+
+def test_receipt_requires_expected_tests_field():
+    wk = SigningKey.generate()
+    ctx = {k: v for k, v in CTX.items() if k != 'expected_tests_sha256'}
+    with pytest.raises(ValueError):
+        _sign(wk, ctx=ctx)
+    with pytest.raises(ValueError):
+        _sign(wk, ctx={**CTX, 'expected_tests_sha256': 'not-hex'})
