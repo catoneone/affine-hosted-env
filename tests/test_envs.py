@@ -1,5 +1,6 @@
 """toolcall.py, envs/: ported from EXP-014 test_harness.py. No docker needed: LocalSandbox runs in a temp
 directory on the host."""
+import base64
 import os
 import shutil
 
@@ -61,8 +62,8 @@ def test_tool_schema_matches_official():
 
 # ---------------------------------------------------------------- end to end on a local git repo
 
-def make_task(tmp_path):
-    path, ids = make_swe_tasks(tmp_path)
+def make_task(tmp_path, script=None):
+    path, ids = make_swe_tasks(tmp_path, script=script)
     return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root',
                           'require_image_digest': False}), ids[0]
 
@@ -86,13 +87,14 @@ def test_setup_strips_and_grades(tmp_path):
     s.close()
 
 
-def graded(tmp_path, *cmds, in_place_check=False, image_prep=None):
+def graded(tmp_path, *cmds, in_place_check=False, image_prep=None, script=None):
     """One rollout: the model runs `cmds` in its container, then the isolated grader runs. With in_place_check,
     also run the hidden tests inside the model's own container first (what the old grader did) and return that
-    exit code too. image_prep runs once in the image template (to build images with unusual states)."""
+    exit code too. image_prep runs once in the image template (to build images with unusual states); script
+    replaces the test patch's mimo_test_command.sh."""
     tmp_path = tmp_path / f'g{len(list(tmp_path.iterdir()))}'          # each call builds its own task
     tmp_path.mkdir()
-    env, task = make_task(tmp_path)
+    env, task = make_task(tmp_path, script=script)
     if image_prep:
         import subprocess
         subprocess.run(['bash', '-c', image_prep], cwd=env.public_spec(task)['image'], check=True)
@@ -368,6 +370,89 @@ def test_command_repo_paths():
     assert command_repo_paths('cd /testbed && PATH=./bin:$PATH exec bash ./run.sh', '/testbed') == ['bin', 'run.sh']
     assert command_repo_paths('bash /other/x.sh', '/testbed') == []          # outside the repo
     assert command_repo_paths('go test ./...', '/workspace/repo') == []
+
+
+def _bundle_patch(script: str, members: dict[str, str]) -> str:
+    """A MiMo-style test patch: mimo_test_command.sh plus a base64 tar.gz bundle of `members`."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+        for n, text in members.items():
+            data = text.encode()
+            info = tarfile.TarInfo(n)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    lines = [b64[i:i + 76] for i in range(0, len(b64), 76)]
+    sh = script.splitlines()
+    return (f'diff --git a/mimo_test_command.sh b/mimo_test_command.sh\nnew file mode 100644\n--- /dev/null\n'
+            f'+++ b/mimo_test_command.sh\n@@ -0,0 +1,{len(sh)} @@\n' + ''.join(f'+{x}\n' for x in sh) +
+            f'diff --git a/mimo_build_env.tar.gz.b64 b/mimo_build_env.tar.gz.b64\nnew file mode 100644\n'
+            f'--- /dev/null\n+++ b/mimo_build_env.tar.gz.b64\n@@ -0,0 +1,{len(lines)} @@\n' +
+            ''.join(f'+{x}\n' for x in lines))
+
+
+def test_test_patch_scripts():
+    from hosted_env.envs.swe import test_patch_scripts
+    tp = _bundle_patch('cd /testbed\nbash .build_env/run.sh', {'./.build_env/run.sh': 'node .build_env/x.js\n',
+                                                               '.build_env/x.js': 'process.exit(1)\n'})
+    assert test_patch_scripts(tp) == [('mimo_test_command.sh', 'cd /testbed\nbash .build_env/run.sh'),
+                                      ('.build_env/run.sh', 'node .build_env/x.js\n')]   # only the .sh members
+    assert test_patch_scripts('') == []
+    broken = tp.replace(tp.splitlines()[-1], '+!!not-base64!!')
+    with pytest.raises(GradeError, match='does not decode'):
+        test_patch_scripts(broken)
+
+
+def test_script_named_files():
+    from hosted_env.envs.swe import script_named_files
+
+    def f(script, script_dir=''):
+        files, dirs = script_named_files(script, '/testbed', script_dir)
+        return sorted(files), sorted(dirs)
+    # 002970: the runner the inner script executes, after a cd (also kept as written for the suffix rule)
+    assert f('cd /testbed\nrc=0\ncd packages/vuetify && node build/run-tests.js --testPathPattern X\n'
+             'rc=$(( rc | $? ))') == (['build/run-tests.js', 'packages/vuetify/build/run-tests.js'], [])
+    assert f('NETBOX_CONFIGURATION=x.y python3 -W ignore manage.py test a.b -v2 2>&1 | tee o.log') == (['manage.py'], [])
+    assert f('timeout 600 npx ts-node scripts/check.ts > /dev/null') == (['scripts/check.ts'], [])
+    assert f('node -r ./t/setup.js -r esm node_modules/.bin/mocha t/a.js') == (
+        ['node_modules/.bin/mocha', 't/setup.js'], [])              # -r esm is a package; mocha's arguments are not
+    assert f('go run -tags x tools/gen.go -out x.go && go run ./cmd/x') == (['tools/gen.go'], [])
+    assert f('export PATH=./bin:$PATH; ./run_tests --fast') == (['run_tests'], ['bin'])
+    assert f('X=$(node scripts/get.js) && echo $X') == (['scripts/get.js'], [])     # command substitution runs it
+    # the script's own directory: $(dirname "$0") is known (a bundle script lives in .build_env/)
+    assert f('cd "$(dirname "$0")" && python3 run.py', '.build_env') == (['.build_env/run.py', 'run.py'], [])
+    # NOT named: arguments (doctest sources, cp'd files), modules, packages, here-doc bodies, code strings
+    assert f('python -m pytest --doctest-modules \\\n  pkg/io/smiles.py \\\n  tests/test_a.py') == ([], [])
+    assert f('cp /testbed/scipy/sparse/a.py "$SITE/a.py"') == ([], [])
+    assert f('python -m rastervision.pipeline.cli run && go test ./idxmgmt/ -run "TestA|\nTestB/c" -v') == ([], [])
+    assert f("cat > x.py <<'PY'\nnode = 'a/b.js'\nnode a/c.js\nPY\npython3 x.py") == (['x.py'], [])
+    assert f('( cd /testbed && node -e "require(\'./package.json\')" >/dev/null )') == ([], [])
+    assert f('sed -i "s/peer/trust/g; s/md5/trust/g" /etc/x.conf && bash $DIR/run.sh') == ([], [])
+
+
+def test_script_protected():
+    from hosted_env.envs.swe import script_protected
+    touched = {'packages/vuetify/build/run-tests.js', 'src/index.js', 'pkg/scripts/test.js', 'bin/x', 'index.js'}
+    assert script_protected(touched, {'scripts/test.js', 'index.js', 'build/run-tests.js'}, {'bin'}) == {
+        'packages/vuetify/build/run-tests.js', 'pkg/scripts/test.js', 'bin/x', 'index.js'}   # bare name: exact only
+
+
+_RUNNER = ('mkdir -p tools && printf "import runpy, sys\\nrunpy.run_path(sys.argv[1], run_name=\\"__main__\\")\\n" '
+           '> tools/run.py && git add -A && git -c user.name=t -c user.email=t@t commit -qm runner')
+_RUNNER_SCRIPT = 'cd "$(dirname "$0")" && PYTHONPATH=. python3 tools/run.py tests/test_calc.py\n'
+
+
+def test_runner_script_named_by_inner_script_is_reset(tmp_path):
+    hack = 'printf "import sys\\nsys.exit(0)\\n" > tools/run.py'            # the runner the grading script executes
+    g, in_place = graded(tmp_path, hack, in_place_check=True, image_prep=_RUNNER, script=_RUNNER_SCRIPT)
+    assert in_place == 0                                                    # the old in-place grader was fooled
+    assert g['reward'] == 0.0 and g['reverted_paths'] == ['tools/run.py']
+    fix = 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'
+    keep = 'printf "x = 1\\n" > tools/other.py'                             # a file the script does not run: kept
+    g, _ = graded(tmp_path, fix, hack, keep, image_prep=_RUNNER, script=_RUNNER_SCRIPT)
+    assert g['reward'] == 1.0 and g['reverted_paths'] == ['tools/run.py']
 
 
 def test_shadow_module_at_repo_root_is_reset(tmp_path):
