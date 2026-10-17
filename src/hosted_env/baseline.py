@@ -13,9 +13,14 @@ report injection) in collect mode, and its structured report is read back:
   from the source and filtered by the script's own selection (node ids, `-k`), all FAIL_TO_PASS;
 - a test whose status differs between runs is flaky and left out.
 
+Two runners so far. pytest (`report_kind = "junit"`): the grader injects a JUnit report through
+PYTEST_ADDOPTS. go test (`report_kind = "gotest"`): the grader's `go` shim records `go test -json` events; a
+package whose new test file does not build at base gets its `func TestX` from the test patch, selected by the
+-run of the go test commands that run that package. jest / mocha / vitest need the grader to produce their
+reports first; a task with no supported runner gets no expected tests and stays exit-code graded.
+
 Without a gold patch this cannot prove that every FAIL_TO_PASS test is fixable; a task no real model ever
-solves is dropped later. pytest only for now (`report_kind = "junit"`); Go and jest need the grader to produce
-their reports first.
+solves is dropped later.
 """
 from __future__ import annotations
 
