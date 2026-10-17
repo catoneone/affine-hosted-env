@@ -409,34 +409,53 @@ def test_script_named_files():
     from hosted_env.envs.swe import script_named_files
 
     def f(script, script_dir=''):
-        files, dirs = script_named_files(script, '/testbed', script_dir)
-        return sorted(files), sorted(dirs)
-    # 002970: the runner the inner script executes, after a cd (also kept as written for the suffix rule)
+        exact, suffix, dirs = script_named_files(script, '/testbed', script_dir)
+        return sorted(exact), sorted(suffix), sorted(dirs)
+    # 002970: the runner the inner script executes; after `cd /testbed` names are exact, before it a suffix
     assert f('cd /testbed\nrc=0\ncd packages/vuetify && node build/run-tests.js --testPathPattern X\n'
-             'rc=$(( rc | $? ))') == (['build/run-tests.js', 'packages/vuetify/build/run-tests.js'], [])
-    assert f('NETBOX_CONFIGURATION=x.y python3 -W ignore manage.py test a.b -v2 2>&1 | tee o.log') == (['manage.py'], [])
-    assert f('timeout 600 npx ts-node scripts/check.ts > /dev/null') == (['scripts/check.ts'], [])
+             'rc=$(( rc | $? ))') == (['packages/vuetify/build/run-tests.js'], [], [])
+    assert f('cd packages/x && node build/run.js') == ([], ['packages/x/build/run.js'], [])
+    assert f('NETBOX_CONFIGURATION=x.y python3 -W ignore manage.py test a.b -v2 2>&1 | tee o.log') == (
+        [], ['manage.py'], [])
+    assert f('timeout 600 npx ts-node scripts/check.ts > /dev/null') == ([], ['scripts/check.ts'], [])
     assert f('node -r ./t/setup.js -r esm node_modules/.bin/mocha t/a.js') == (
-        ['node_modules/.bin/mocha', 't/setup.js'], [])              # -r esm is a package; mocha's arguments are not
-    assert f('go run -tags x tools/gen.go -out x.go && go run ./cmd/x') == (['tools/gen.go'], [])
-    assert f('export PATH=./bin:$PATH; ./run_tests --fast') == (['run_tests'], ['bin'])
-    assert f('X=$(node scripts/get.js) && echo $X') == (['scripts/get.js'], [])     # command substitution runs it
-    # the script's own directory: $(dirname "$0") is known (a bundle script lives in .build_env/)
-    assert f('cd "$(dirname "$0")" && python3 run.py', '.build_env') == (['.build_env/run.py', 'run.py'], [])
-    # NOT named: arguments (doctest sources, cp'd files), modules, packages, here-doc bodies, code strings
-    assert f('python -m pytest --doctest-modules \\\n  pkg/io/smiles.py \\\n  tests/test_a.py') == ([], [])
-    assert f('cp /testbed/scipy/sparse/a.py "$SITE/a.py"') == ([], [])
-    assert f('python -m rastervision.pipeline.cli run && go test ./idxmgmt/ -run "TestA|\nTestB/c" -v') == ([], [])
-    assert f("cat > x.py <<'PY'\nnode = 'a/b.js'\nnode a/c.js\nPY\npython3 x.py") == (['x.py'], [])
-    assert f('( cd /testbed && node -e "require(\'./package.json\')" >/dev/null )') == ([], [])
-    assert f('sed -i "s/peer/trust/g; s/md5/trust/g" /etc/x.conf && bash $DIR/run.sh') == ([], [])
+        [], ['node_modules/.bin/mocha', 't/setup.js'], [])         # -r esm is a package; mocha's arguments are not
+    assert f('go run -tags x tools/gen.go -out x.go && go run ./cmd/x') == ([], ['tools/gen.go'], [])
+    assert f('export PATH=./bin:$PATH; ./run_tests --fast') == ([], ['run_tests'], ['bin'])
+    assert f('cd "$(dirname "$0")" && python3 run.py', '.build_env') == (['.build_env/run.py'], [], [])
+    assert f('bash -eo pipefail /testbed/.build_env/test_command.sh') == (['.build_env/test_command.sh'], [], [])
+    # review of PR #17: shapes bash executes that the first version missed
+    run = ([], ['tools/run.sh'], [])
+    assert f('source ./tools/run.sh') == run and f('. tools/run.sh') == run
+    assert f('if ! bash tools/run.sh; then exit 1; fi') == run
+    assert f('while read l; do bash tools/run.sh; done < list') == run
+    assert f('for p in x; do node build/run.js; done') == ([], ['build/run.js'], [])
+    assert f('{ node build/run.js; } 2>&1') == ([], ['build/run.js'], [])
+    assert f('bash -c "bash tools/run.sh"') == run and f("sh -c 'bash tools/run.sh'") == run
+    assert f("exec bash -lc 'cd /testbed && bash tools/run.sh'") == (['tools/run.sh'], [], [])
+    assert f('bash <<EOF\nbash tools/run.sh\nEOF') == run and f("cat <<'E' | bash\nbash tools/run.sh\nE") == run
+    assert f('X=$(node scripts/get.js) && Y=`node scripts/got.js`') == ([], ['scripts/get.js', 'scripts/got.js'], [])
+    # cd scoping: a subshell's cd ends with it (one line or several); a cd we cannot follow keeps names as written
+    assert f('cd /testbed\n( cd sub && make )\nnode build/run.js') == (['build/run.js'], [], [])
+    assert f('cd /testbed\n(\n  cd sub\n  make\n)\nnode build/run.js') == (['build/run.js'], [], [])
+    assert f('cd /testbed && cd "$DIR" && node scripts/test.js && node run.js') == (['run.js'], ['scripts/test.js'], [])
+    # NOT named: arguments (doctest sources, cp'd files), modules, packages, other programs' here-docs, code strings
+    assert f('python -m pytest --doctest-modules \\\n  pkg/io/smiles.py \\\n  tests/test_a.py') == ([], [], [])
+    assert f('cp /testbed/scipy/sparse/a.py "$SITE/a.py"') == ([], [], [])
+    assert f('python -m rastervision.pipeline.cli run && go test ./idxmgmt/ -run "TestA|\nTestB/c" -v') == ([], [], [])
+    assert f("cat > x.py <<'PY'\nnode = 'a/b.js'\nnode a/c.js\nPY\npython3 x.py") == ([], ['x.py'], [])
+    assert f('( cd /testbed && node -e "require(\'./package.json\')" >/dev/null )') == ([], [], [])
+    assert f('sed -i "s/peer/trust/g; s/md5/trust/g" /etc/x.conf && bash $DIR/run.sh') == ([], [], [])
 
 
 def test_script_protected():
     from hosted_env.envs.swe import script_protected
-    touched = {'packages/vuetify/build/run-tests.js', 'src/index.js', 'pkg/scripts/test.js', 'bin/x', 'index.js'}
-    assert script_protected(touched, {'scripts/test.js', 'index.js', 'build/run-tests.js'}, {'bin'}) == {
-        'packages/vuetify/build/run-tests.js', 'pkg/scripts/test.js', 'bin/x', 'index.js'}   # bare name: exact only
+    touched = {'packages/x/build/run.js', 'unrelated/build/run.js', 'a/packages/x/build/run.js', 'src/index.js',
+               'bin/x', 'index.js'}
+    # exact: only that path; suffix: that path or a deeper one ending in it; a bare name only exactly
+    assert script_protected(touched, {'packages/x/build/run.js'}, set(), set()) == {'packages/x/build/run.js'}
+    assert script_protected(touched, set(), {'packages/x/build/run.js', 'index.js'}, {'bin'}) == {
+        'packages/x/build/run.js', 'a/packages/x/build/run.js', 'index.js', 'bin/x'}
 
 
 _RUNNER = ('mkdir -p tools && printf "import runpy, sys\\nrunpy.run_path(sys.argv[1], run_name=\\"__main__\\")\\n" '
@@ -453,6 +472,15 @@ def test_runner_script_named_by_inner_script_is_reset(tmp_path):
     keep = 'printf "x = 1\\n" > tools/other.py'                             # a file the script does not run: kept
     g, _ = graded(tmp_path, fix, hack, keep, image_prep=_RUNNER, script=_RUNNER_SCRIPT)
     assert g['reward'] == 1.0 and g['reverted_paths'] == ['tools/run.py']
+
+
+def test_runner_inside_compound_command_is_reset(tmp_path):
+    """Review of PR #17: the runner behind `if !` (and an env assignment) is still the program bash runs."""
+    script = ('cd "$(dirname "$0")" || exit 1\n'
+              'if ! PYTHONPATH=. python3 tools/run.py tests/test_calc.py; then exit 1; fi\n')
+    hack = 'printf "import sys\\nsys.exit(0)\\n" > tools/run.py'
+    g, in_place = graded(tmp_path, hack, in_place_check=True, image_prep=_RUNNER, script=script)
+    assert in_place == 0 and g['reward'] == 0.0 and g['reverted_paths'] == ['tools/run.py']
 
 
 def test_shadow_module_at_repo_root_is_reset(tmp_path):
