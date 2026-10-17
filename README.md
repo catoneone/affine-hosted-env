@@ -49,6 +49,7 @@ port, for both the control plane and `/v1/start` / `/v1/turn`.
 ```bash
 hosted-env keygen keys/gateway.key        # signs session tokens
 hosted-env keygen keys/executor.key       # signs receipts (must be a different key)
+hosted-env pin-images tasks.jsonl         # image name:tag -> name@sha256:...; envs refuse unpinned rows by default
 hosted-env server --config examples/server.toml            # default 127.0.0.1:8780
 hosted-env machines --config examples/server.toml          # machine inventory: what runs where, hours, est. cost
 hosted-env roster-sync --out roster.chain.json --every 300  # SN120 registered hotkeys (extra `chain`)

@@ -52,3 +52,21 @@ def test_server_example_builds(tmp_path, capsys):
     app = build_server_app(str(tmp_path / 'cfg' / 'server.toml'))
     assert {r.path for r in app.routes} >= {'/v1/tasks/open', '/v1/start', '/v1/turn', '/v1/info'}
     assert (tmp_path / 'runs' / 'executor-logs').is_dir()
+
+
+def test_slot_sizes_must_match_the_sandbox_pods():
+    from types import SimpleNamespace as NS
+
+    import pytest
+
+    from hosted_env.config import _check_slot_sizes
+    k8s = {'placement': {'kind': 'k8s', 'cpus': '1', 'memory': '2g'}}
+    _check_slot_sizes(k8s, {'e': NS(sandbox='k8s', sandbox_opts={})})                       # defaults agree
+    _check_slot_sizes(k8s, {'e': NS(sandbox='k8s', sandbox_opts={'memory': '2Gi', 'disk': '10g'})})   # same sizes
+    _check_slot_sizes({'placement': {'kind': 'k8s', 'disk': '0'}},
+                      {'e': NS(sandbox='k8s', sandbox_opts={'disk': ''})})                   # both unlimited
+    _check_slot_sizes({}, {'e': NS(sandbox='k8s', sandbox_opts={'cpus': '4'})})              # no k8s placement
+    _check_slot_sizes(k8s, {'e': NS(sandbox='docker', sandbox_opts={'cpus': '4'})})          # not a k8s sandbox
+    for opts in ({'cpus': '2'}, {'memory': '4g'}, {'disk': '20g'}):
+        with pytest.raises(ValueError, match='sized alike'):
+            _check_slot_sizes(k8s, {'e': NS(sandbox='k8s', sandbox_opts=opts)})

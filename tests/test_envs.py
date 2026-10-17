@@ -8,8 +8,8 @@ from conftest import make_swe_tasks
 
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, GradeError, truncate_middle
-from hosted_env.envs.swe import future_commits, protected_paths
-from hosted_env.providers.sandbox import LocalSandbox
+from hosted_env.envs.swe import TEST_PATCH_REMOTE, future_commits, protected_paths
+from hosted_env.providers.sandbox import LocalSandbox, SandboxCommandError, SandboxLimitError
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
 
 
@@ -63,7 +63,8 @@ def test_tool_schema_matches_official():
 
 def make_task(tmp_path):
     path, ids = make_swe_tasks(tmp_path)
-    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}), ids[0]
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root',
+                          'require_image_digest': False}), ids[0]
 
 
 def open_local(env, task, tmp_path):
@@ -189,6 +190,114 @@ def test_patch_problems_are_the_models_own_zero(tmp_path):
     g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
                   'head -c 3000 /dev/urandom > blob.bin')
     assert g['reward'] == 1.0 and 'GIT binary patch' in g['model_patch']   # binary files carry over
+
+
+class LimitedSandbox(LocalSandbox):
+    """LocalSandbox that reports a sandbox failure (`err`, default SandboxLimitError) on one command, or on every
+    command once dead -- as K8sSandbox does for an own-limit kill or a command that cannot launch."""
+    def __init__(self, *a, fail_on=None, dead=False, err=SandboxLimitError, **kw):
+        super().__init__(*a, **kw)
+        self.fail_on, self.dead, self.err = fail_on, dead, err
+
+    def _boom(self):
+        raise self.err('ephemeral-storage limit: Pod ephemeral local storage usage exceeds the total '
+                       'limit of containers 10Gi.' if self.err is SandboxLimitError
+                       else 'command could not start in the container: exec "sh": not found')
+
+    def execute(self, command, *a, **kw):
+        if self.dead or command == self.fail_on:
+            self._boom()
+        return super().execute(command, *a, **kw)
+
+
+def open_limited(env, task, tmp_path, **kw):
+    return env.open(env.public_spec(task), lambda image, cwd: LimitedSandbox(image, cwd, base_dir=str(tmp_path), **kw))
+
+
+def test_rollout_container_killed_for_its_limit_scores_0(tmp_path):
+    env, task = make_task(tmp_path)
+    s = open_limited(env, task, tmp_path)
+    s.setup()
+    s.sb.dead = True                                                   # its commands got it evicted
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert (g['reward'], g['model_patch']) == (0.0, '')
+    assert g['grade_detail'].startswith('rollout_sandbox_limit: ephemeral-storage limit')
+
+
+def test_rollout_container_with_a_deleted_shell_scores_0(tmp_path):
+    # the model deleted /bin/sh: reading its tree can't launch -> model_patch_capture_failed, reward 0, not void
+    env, task = make_task(tmp_path)
+    s = open_limited(env, task, tmp_path, err=SandboxCommandError)
+    s.setup()
+    s.sb.dead = True
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert (g['reward'], g['model_patch'], g['grade_detail']) == (0.0, '', 'model_patch_capture_failed')
+
+
+def test_tests_killed_for_the_grading_containers_limit_score_0(tmp_path):
+    env, task = make_task(tmp_path)
+    gi = env.grade_inputs(task)
+    s = open_limited(env, task, tmp_path, fail_on=gi['test_command'])   # only the hidden tests trip the limit
+    s.setup()
+    assert s.sb.execute('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')['returncode'] == 0
+    g = s.grade(gi)
+    s.close()
+    assert g['reward'] == 0.0 and g['grade_detail'].startswith('grader_sandbox_limit: ephemeral-storage limit')
+    assert 'a + b' in g['model_patch'] and g.get('verifier_returncode') is None
+
+
+class LimitAfter(LimitedSandbox):
+    """Reports a limit kill on the first command containing `marker` (or the upload to `copy_kill`), and on
+    everything after it."""
+    def __init__(self, *a, marker=None, copy_kill=None, **kw):
+        super().__init__(*a, **kw)
+        self.marker, self.copy_kill = marker, copy_kill
+
+    def execute(self, command, *a, **kw):
+        if self.marker and self.marker in command:
+            self.dead = True
+        return super().execute(command, *a, **kw)
+
+    def copy_text_to(self, text, remote_path):
+        if self.dead or remote_path == self.copy_kill:
+            self.dead = True
+            raise SandboxLimitError('memory limit: container OOMKilled')
+        return super().copy_text_to(text, remote_path)
+
+
+def grade_with_grader(tmp_path, fix=True, **grader_kw):
+    """One rollout in a plain sandbox, graded in a LimitAfter(**grader_kw) container."""
+    env, task = make_task(tmp_path)
+    gi, made = env.grade_inputs(task), []
+
+    def factory(image, cwd):
+        made.append(LimitAfter(image, cwd, base_dir=str(tmp_path), **(grader_kw if made else {})))
+        return made[-1]
+    s = env.open(env.public_spec(task), factory)
+    s.setup()
+    if fix:
+        assert s.sb.execute('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')['returncode'] == 0
+    try:
+        return s.grade(gi)
+    finally:
+        s.close()
+
+
+@pytest.mark.parametrize('kw', [{'marker': 'git apply --cached'}, {'marker': 'git apply --binary'},
+                                {'copy_kill': TEST_PATCH_REMOTE}])
+def test_limit_kill_while_the_grader_handles_the_model_patch_scores_0(tmp_path, kw):
+    """A few-KB git binary delta can expand to GBs inside `git apply` (review of PR #15): from the moment model bytes
+    are in the grading container, a limit kill is the model's, even before the hidden tests run."""
+    g = grade_with_grader(tmp_path, **kw)
+    assert g['reward'] == 0.0 and g['grade_detail'].startswith('grader_sandbox_limit: ')
+    assert 'a + b' in g['model_patch']
+
+
+def test_limit_kill_before_any_model_bytes_is_an_infra_error(tmp_path):
+    with pytest.raises(GradeError, match='during setup'):            # empty model patch: nothing of the model's ran
+        grade_with_grader(tmp_path, fix=False, copy_kill=TEST_PATCH_REMOTE)
 
 
 def test_protected_paths_rules():
@@ -455,7 +564,8 @@ def _rich_task(tmp_path):
     path.write_text(json.dumps({'id': 'rich', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'python',
                                 'problem_statement': 'add() subtracts', 'test_patch': test_patch,
                                 'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
-    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root'}), 'rich'
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
+                          'require_image_digest': False}), 'rich'
 
 
 @pytest.mark.parametrize('shape', [

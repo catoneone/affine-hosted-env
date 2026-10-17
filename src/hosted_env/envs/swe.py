@@ -17,6 +17,7 @@ import re
 import shlex
 import time
 
+from ..providers.sandbox.base import SandboxCommandError, SandboxLimitError
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
 
 _RESIDUE_SCRUB_GLOBAL = (
@@ -215,12 +216,16 @@ class SweEnv(DockerTaskEnv):
         repo = s.spec['cwd']
         try:
             end_tree = self._tree(s.sb, repo, s.state['base'])
+            r = s.sb.execute(f'set -o pipefail; git diff --binary --no-color --no-ext-diff --no-textconv '
+                             f'{s.state["start_tree"]} {end_tree} 2>/dev/null '
+                             f'| head -c {MAX_MODEL_PATCH_BYTES + 1} | base64 | tr -d "\\n"',
+                             cwd=repo, timeout=300, login=False)
         except SetupError:
             return b'', 'model_patch_capture_failed'      # e.g. the model deleted .git
-        r = s.sb.execute(f'set -o pipefail; git diff --binary --no-color --no-ext-diff --no-textconv '
-                         f'{s.state["start_tree"]} {end_tree} 2>/dev/null '
-                         f'| head -c {MAX_MODEL_PATCH_BYTES + 1} | base64 | tr -d "\\n"',
-                         cwd=repo, timeout=300, login=False)
+        except SandboxCommandError:
+            return b'', 'model_patch_capture_failed'      # the model deleted a binary exec needs (/bin/sh, git)
+        except SandboxLimitError as e:                    # the model's commands blew its memory / disk limit
+            return b'', f'rollout_sandbox_limit: {e}'
         try:
             data = base64.b64decode(r['output'].strip(), validate=True)
         except ValueError:
@@ -406,6 +411,7 @@ fi
             raise GradeError('no sandbox factory for an isolated grading container')
         s.sb.cleanup()                                      # the rollout container is never used again
         sb = s.grader_sb = s.factory(s.spec['image'], repo)
+        reverted, untrusted, t0 = [], False, None
         try:
             sb.start()
             base = self._prepare_repo(sb, repo, s.spec.get('lang', ''))
@@ -413,9 +419,11 @@ fi
             if start != s.state['start_tree']:
                 raise GradeError(f'grading container starts from tree {start[:12]}, the rollout started from '
                                  f'{s.state["start_tree"][:12]} (non-deterministic image or setup)')
-            reverted = []
             if patch:
                 self._put_bytes(sb, patch, MODEL_PATCH_REMOTE)
+                # From here on the container processes bytes the model chose: a tiny git binary delta can expand
+                # to gigabytes in `git apply` (review of PR #15). A limit kill from now on is the model's: 0.
+                untrusted = True
                 touched, why = self._changed_paths(sb, repo, start, MODEL_PATCH_REMOTE)   # first: changes nothing
                 if touched is not None:
                     ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
@@ -446,11 +454,21 @@ fi
             if grader == 'nobody':
                 res['lock_seconds'] = self._lock_down(sb, repo, test_paths)
                 test_cmd = as_grader(test_cmd)
-            t0 = time.time()
+            untrusted, t0 = True, time.time()               # the tests run the model's code
             r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
             return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                     'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
                     'test_output': r['output'][-3000:], 'reverted_paths': reverted}
+        except SandboxLimitError as e:
+            if not untrusted:                               # only our own setup had run: not the model's doing
+                raise GradeError(f'grading container hit a limit during setup: {e}') from None
+            return {**res, 'grade_detail': f'grader_sandbox_limit: {e}', 'reverted_paths': reverted,
+                    **({'test_seconds': round(time.time() - t0, 1)} if t0 else {})}
+        except SandboxCommandError as e:
+            if not untrusted:                               # a broken grading image, before any model bytes: infra
+                raise GradeError(f'grading container command would not start during setup: {e}') from None
+            return {**res, 'grade_detail': f'grader_sandbox_command_failed: {e}', 'reverted_paths': reverted,
+                    **({'test_seconds': round(time.time() - t0, 1)} if t0 else {})}
         except SetupError as e:
             raise GradeError(f'grading container setup failed: {e}') from None
         finally:

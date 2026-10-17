@@ -29,7 +29,13 @@ import shlex
 K3S_VERSION = 'v1.36.5+k3s1'          # the version EXP-017 ran; pin, do not follow a moving channel
 CLUSTER_CIDRS = ('10.42.0.0/16', '10.43.0.0/16')
 CONTAINERD_DROPIN = '/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/runsc.toml'
+RUNSC_CONFIG = '/etc/hosted-env/runsc.toml'                # RuntimeClass gvisor
 RUNSC_NONET_CONFIG = '/etc/hosted-env/runsc-nonet.toml'    # runsc --network=none, for RuntimeClass gvisor-nonet
+# signal-unkillable-policy=linux gives PID-namespace init (our `sleep infinity`, PID 1) Linux SIGNAL_UNKILLABLE
+# semantics, so a model that is root in its own rollout container cannot `kill -9 1` to kill the container and
+# void its rollout (EXP-018 PR #15 review). Confirmed on runsc release-20261012.0. K8sSandbox.start() also probes
+# PID 1 and refuses the sandbox if the protection is not in force, so a node without this config fails closed.
+_RUNSC_POLICY = '  signal-unkillable-policy = "linux"'
 _LABEL = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._/-]{0,251}[A-Za-z0-9])?$')
 
 
@@ -82,14 +88,22 @@ def _gvisor() -> list[str]:
         'https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list',
         'apt-get update -qq',
         'apt-get install -y -qq runsc',
-        f'mkdir -p {q(CONTAINERD_DROPIN.rsplit("/", 1)[0])} {q(RUNSC_NONET_CONFIG.rsplit("/", 1)[0])}',
+        f'mkdir -p {q(CONTAINERD_DROPIN.rsplit("/", 1)[0])} {q(RUNSC_CONFIG.rsplit("/", 1)[0])}',
+        f"cat > {q(RUNSC_CONFIG)} <<'EOF'",
+        '[runsc_config]',
+        _RUNSC_POLICY,
+        'EOF',
         f"cat > {q(RUNSC_NONET_CONFIG)} <<'EOF'",
         '[runsc_config]',
         '  network = "none"',
+        _RUNSC_POLICY,
         'EOF',
         f"cat > {q(CONTAINERD_DROPIN)} <<'EOF'",
         "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]",
         '  runtime_type = "io.containerd.runsc.v1"',
+        "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc.options]",
+        '  TypeUrl = "io.containerd.runsc.v1.options"',
+        f'  ConfigPath = "{RUNSC_CONFIG}"',
         "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-nonet]",
         '  runtime_type = "io.containerd.runsc.v1"',
         "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc-nonet.options]",

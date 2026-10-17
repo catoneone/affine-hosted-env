@@ -170,7 +170,7 @@ class DockerTaskEnv:
                 if line.strip():
                     r = json.loads(line)
                     rows[str(r['id'])] = r
-            if self.cfg.get('require_image_digest'):
+            if self.cfg.get('require_image_digest', True):   # on by default; false only for local dev with tags
                 from ..images import is_pinned
                 loose = sorted(k for k, r in rows.items() if not is_pinned(r.get('image', '')))
                 if loose:

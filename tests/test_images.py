@@ -57,13 +57,16 @@ def test_pin_tasks_resolves_each_tag_once_and_keeps_pinned_rows():
     assert out[0] == {'id': 1, 'image': f'x/y@{D1}', 'image_tag': 'x/y:tag'} and out[2] == rows[2]
 
 
-def test_env_can_require_pinned_images(tmp_path):
+def test_env_requires_pinned_images_by_default(tmp_path):
     from hosted_env.envs import SweEnv
     path = tmp_path / 't.jsonl'
     path.write_text(json.dumps({'id': 'a', 'image': 'x/y:tag', 'cwd': '/w', 'problem_statement': 'p',
                                 'test_command': 'true', 'test_patch': ''}) + '\n')
-    assert SweEnv('swe', {'tasks': str(path)}).task_ids() == ['a']                     # off by default
+    assert SweEnv('swe', {'tasks': str(path), 'require_image_digest': False}).task_ids() == ['a']   # explicit opt-out
+    with pytest.raises(RuntimeError, match='not pinned by digest'):
+        SweEnv('swe', {'tasks': str(path)}).task_ids()                                      # on by default
     with pytest.raises(RuntimeError, match='not pinned by digest'):
         SweEnv('swe', {'tasks': str(path), 'require_image_digest': True}).task_ids()
     path.write_text(path.read_text().replace('x/y:tag', f'x/y@{D1}'))
+    assert SweEnv('swe', {'tasks': str(path)}).task_ids() == ['a']
     assert SweEnv('swe', {'tasks': str(path), 'require_image_digest': True}).task_ids() == ['a']

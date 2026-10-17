@@ -37,7 +37,7 @@ class InProcGateway:
 @pytest.fixture
 def rig(tmp_path):
     path, ids = make_swe_tasks(tmp_path, n=4)
-    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}
+    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root', 'require_image_digest': False}
     gkey, wkey = SigningKey.generate(), SigningKey.generate()
     store = Store(str(tmp_path / 'g.db'), {'swe': SweEnv('swe', cfg)}, gkey, Limits())
     r = CharRenderer()
@@ -181,6 +181,45 @@ def test_grade_infra_error_is_signed(rig, monkeypatch):
     res, segs = run(w, s['token'], enc(r, 'done'))
     assert (res[-1]['outcome'], res[-1]['reward']) == ('infra_error', 0.0)
     assert check_receipt(res[-1], segs, t, 0, wkey)['outcome'] == 'infra_error'
+
+
+def test_sandbox_limit_in_a_tool_call_scores_0_not_void(rig, monkeypatch):
+    """A rollout whose commands blow the sandbox's own memory / disk limit must not be able to void itself."""
+    from hosted_env.envs.base import EnvSession
+    from hosted_env.providers.sandbox import SandboxLimitError
+    w, store, r, rt, session, wkey = rig
+    t, (s,) = session()
+
+    def hog(sess, name, arguments):
+        raise SandboxLimitError('memory limit: container OOMKilled')
+    monkeypatch.setattr(EnvSession, 'call_tool', hog)
+    res = [w.start(s['token']).result(30)]
+    res.append(w.turn(s['token'], 1, enc(r, FIX)).result(30))
+    last = res[-1]
+    assert (last['done'], last['outcome'], last['reward']) == (True, 'unresolved', 0.0)
+    assert last['detail'] == 'sandbox_limit: memory limit: container OOMKilled'
+    segs = [('P', res[0]['prompt_tokens']), ('M', enc(r, FIX))]
+    assert check_receipt(last, segs, t, 0, wkey)['outcome'] == 'unresolved'     # signed, no trailing T segment
+    assert store.db.execute('SELECT state FROM tasks WHERE task_id=?', (t['task_id'],)).fetchone()[0] != 'void'
+
+
+def test_sandbox_command_failure_in_a_tool_call_scores_0_not_void(rig, monkeypatch):
+    """The model deletes a binary exec needs (/bin/sh): the next command cannot launch. That is the model's own
+    doing, so the rollout is unresolved / 0, never voided."""
+    from hosted_env.envs.base import EnvSession
+    from hosted_env.providers.sandbox import SandboxCommandError
+    w, store, r, rt, session, wkey = rig
+    t, (s,) = session()
+
+    def broke_its_shell(sess, name, arguments):
+        raise SandboxCommandError('command could not start in the container: exec "sh": not found')
+    monkeypatch.setattr(EnvSession, 'call_tool', broke_its_shell)
+    res = [w.start(s['token']).result(30)]
+    res.append(w.turn(s['token'], 1, enc(r, FIX)).result(30))
+    last = res[-1]
+    assert (last['done'], last['outcome'], last['reward']) == (True, 'unresolved', 0.0)
+    assert last['detail'].startswith('sandbox_command_failed: ')
+    assert store.db.execute('SELECT state FROM tasks WHERE task_id=?', (t['task_id'],)).fetchone()[0] != 'void'
 
 
 def test_wrong_worker_and_bad_token(rig):

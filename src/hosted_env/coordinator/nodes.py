@@ -67,17 +67,23 @@ def _usable(node, include_control_plane: bool) -> bool:
     return bool(ready) and ready[0].status == 'True'
 
 
-def node_info(node, *, cpus='1', memory='2g', reserve_cpu='500m', reserve_memory='1Gi',
-              include_control_plane: bool = False) -> NodeInfo | None:
+def node_info(node, *, cpus='1', memory='2g', reserve_cpu='500m', reserve_memory='1Gi', disk='10g',
+              reserve_disk='20Gi', include_control_plane: bool = False) -> NodeInfo | None:
     """include_control_plane: count a tainted control-plane node as a sandbox node (single-node dev clusters only).
     The coordinator pins Pods with nodeName, which bypasses the scheduler and so the NoSchedule taint: this check
-    is the only thing keeping sandboxes off the control plane (EXP-018 P0 first ran a group there)."""
+    is the only thing keeping sandboxes off the control plane (EXP-018 P0 first ran a group there).
+    disk: the sandbox's ephemeral-storage limit (k8s sandbox `disk`, same default); reserve_disk is kept for the
+    image cache, which shares the node's disk but is not part of allocatable. A node that does not report
+    ephemeral-storage, or disk = '' / None, is sized by CPU and memory only."""
     if not _usable(node, include_control_plane):
         return None
     alloc = node.status.allocatable or {}
     cpu = cpu_cores(alloc.get('cpu', '0')) - cpu_cores(reserve_cpu)
     mem = mem_bytes(alloc.get('memory', '0')) - mem_bytes(reserve_memory)
     slots = max(0, min(math.floor(cpu / cpu_cores(cpus) + 1e-9), mem // mem_bytes(memory)))
+    per = mem_bytes(disk) if disk else 0
+    if per > 0 and alloc.get('ephemeral-storage') is not None:
+        slots = max(0, min(slots, (mem_bytes(alloc['ephemeral-storage']) - mem_bytes(reserve_disk)) // per))
     images = set()
     for img in node.status.images or []:
         images |= image_names(img.names)

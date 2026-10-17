@@ -66,6 +66,7 @@ hotkey_data = [200, 400]
 [envs.mimo_swe]                           # coordinator (task pool) and executor (runtime) settings in one table
 kind = "mimo_swe"
 tasks = "tasks.jsonl"
+require_image_digest = true              # default: refuse task rows whose image is not name@sha256:... (`hosted-env pin-images`)
 group_size = 8
 success_reward = 1.0
 sandbox = "docker"
@@ -86,5 +87,6 @@ revision = "<upstream revision the tokenizer files come from>"
 [envs.mimo_swe.sandbox_opts]
 cpus = "1"
 memory = "2g"
+disk = "10g"                              # k8s: ephemeral-storage limit, the kubelet evicts a sandbox that writes more
 network = "none"
 pids = 4096

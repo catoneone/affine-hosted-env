@@ -10,10 +10,11 @@ from hosted_env.coordinator.nodes import NodeInfo, cpu_cores, image_names, k8s_n
 from hosted_env.coordinator.store import CapacityError, Limits, Store
 
 
-def knode(name, cpu='8', mem='16Gi', ready='True', unschedulable=False, taints=(), images=()):
+def knode(name, cpu='8', mem='16Gi', ready='True', unschedulable=False, taints=(), images=(), disk=None):
+    alloc = {'cpu': cpu, 'memory': mem, **({'ephemeral-storage': disk} if disk is not None else {})}
     return NS(metadata=NS(name=name),
               spec=NS(unschedulable=unschedulable, taints=[NS(key=k, effect=e) for k, e in taints]),
-              status=NS(allocatable={'cpu': cpu, 'memory': mem}, conditions=[NS(type='Ready', status=ready)],
+              status=NS(allocatable=alloc, conditions=[NS(type='Ready', status=ready)],
                         images=[NS(names=list(n)) for n in images]))
 
 
@@ -37,6 +38,19 @@ def test_node_info_slots_and_filters():
     assert node_info(knode('g', taints=[('x', 'PreferNoSchedule')])) is not None
     core = NS(list_node=lambda: NS(items=[knode('a'), knode('c', ready='False')]))
     assert [x.name for x in k8s_nodes(core)] == ['a']
+
+
+def test_node_info_disk_slots():
+    # boat `default` node as reported in EXP-018: 4 cpu, ~7.75Gi memory, 69953425354 bytes of ephemeral-storage
+    boat = knode('boat', cpu='4', mem='8131944Ki', disk='69953425354')
+    assert node_info(boat).slots == 3                                  # cpu bound: (65 - 20) Gi / 10 Gi = 4
+    small = knode('small', cpu='8', mem='32Gi', disk='40Gi')
+    assert node_info(small).slots == 2                                 # disk bound: (40 - 20) / 10
+    assert node_info(small, disk='5g').slots == 4
+    assert node_info(small, disk=None).slots == 7                      # disk not counted
+    assert node_info(small, disk='0').slots == 7                       # 0 means unlimited, not a division by zero
+    assert node_info(knode('nodisk', cpu='8', mem='32Gi')).slots == 7   # node reports no ephemeral-storage
+    assert node_info(knode('full', disk='15Gi')).slots == 0             # below the image-cache reserve
 
 
 def node_store(tmp_path, n=40, limits=None):

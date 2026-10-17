@@ -262,7 +262,10 @@ def test_boot_script_defaults():
     assert '--node-label hosted-env/provider=boat' in s and 'apt-get install -y -qq runsc' in s
     assert "runtimes.runsc]" in s and 'ufw allow from 10.42.0.0/16' in s and 'flannel.json' not in s
     assert "runtimes.runsc-nonet]" in s and 'ConfigPath = "/etc/hosted-env/runsc-nonet.toml"' in s
-    assert '[runsc_config]\n  network = "none"\nEOF' in s
+    assert 'ConfigPath = "/etc/hosted-env/runsc.toml"' in s                      # the networked runsc has a config too
+    assert '[runsc_config]\n  network = "none"\n  signal-unkillable-policy = "linux"\nEOF' in s   # nonet: offline + policy
+    assert '[runsc_config]\n  signal-unkillable-policy = "linux"\nEOF' in s       # runsc: PID 1 unkillable by the model
+    assert s.count('signal-unkillable-policy = "linux"') == 2
 
 
 def test_boot_script_remapped_wireguard_and_no_gvisor():

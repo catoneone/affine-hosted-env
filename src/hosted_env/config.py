@@ -42,7 +42,8 @@ def _store(cfg: dict, base: Path, key):
 
 def _node_source(cfg: dict):
     """[placement] kind = "k8s": read nodes from the cluster (in-cluster config, else kubeconfig). Other keys
-    (cpus, memory, reserve_cpu, reserve_memory, include_control_plane) size one standard sandbox slot."""
+    (cpus, memory, disk, reserve_cpu, reserve_memory, reserve_disk, include_control_plane) size one standard sandbox
+    slot; keep cpus / memory / disk equal to the env's sandbox_opts."""
     pcfg = dict(cfg.get('placement') or {})
     if pcfg.pop('kind', None) != 'k8s':
         return None
@@ -196,6 +197,27 @@ def build_worker_app(path: str):
     return create_worker_app(build_worker(path))
 
 
+def _check_slot_sizes(cfg: dict, runtimes: dict) -> None:
+    """With [placement] kind = "k8s" the coordinator sizes node slots from [placement] cpus / memory / disk, while
+    each k8s sandbox Pod is sized by its env's sandbox_opts. If they differ the coordinator over- or under-commits
+    nodes (the kubelet refuses a Pod that does not fit), so refuse to start. Unset keys mean the shared defaults."""
+    pcfg = cfg.get('placement') or {}
+    if pcfg.get('kind') != 'k8s':
+        return
+    from .coordinator.nodes import cpu_cores, mem_bytes
+    from .providers.sandbox.k8s import DEFAULT_DISK
+    sizes = {'cpus': ('1', cpu_cores), 'memory': ('2g', mem_bytes),
+             'disk': (DEFAULT_DISK, lambda q: mem_bytes(q) if q else 0)}
+    for env_id, rt in runtimes.items():
+        if rt.sandbox != 'k8s':
+            continue
+        for k, (default, norm) in sizes.items():
+            slot, pod = pcfg.get(k, default), rt.sandbox_opts.get(k, default)
+            if norm(slot) != norm(pod):
+                raise ValueError(f'env {env_id}: sandbox_opts.{k} = {pod!r} but [placement] {k} = {slot!r}; '
+                                 'node slots and sandbox Pods must be sized alike')
+
+
 def build_server_app(path: str):
     """gateway + coordinator + executor in one process (architecture v2). The executor calls the coordinator
     directly and is reachable only through the gateway's /v1/start and /v1/turn."""
@@ -208,8 +230,10 @@ def build_server_app(path: str):
     wkey = load_key_file(_abs(base, wcfg['key_file']))
     if bytes(wkey) == bytes(gkey):
         raise ValueError('the executor receipt key must differ from the gateway session key')
+    runtimes = _runtimes(cfg, base)
+    _check_slot_sizes(cfg, runtimes)
     worker = _executor(wcfg, base, wkey, InProcessGatewayClient(store, wcfg['worker_id']), gkey.verify_key,
-                       cfg['public_url'], _runtimes(cfg, base))
+                       cfg['public_url'], runtimes)
     planner, interval = _planner(cfg, base, store)
     return create_gateway_app(store, _roster(cfg, base), {wcfg['worker_id']: wkey.verify_key},
                               gkey.verify_key, limiter=_limiter(cfg), executor=worker, node_source=_node_source(cfg),

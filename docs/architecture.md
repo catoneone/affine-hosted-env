@@ -41,7 +41,8 @@ and stay in the coordinator as business rules.
 ### Coordinator
 - Keeps today's store logic: task pool, assignment, quotas, global budget with per-hotkey fair share (equal split
   per hotkey; weighting is a P2 decision), sessions, voiding and refunds.
-- Reads capacity from Kubernetes instead of worker heartbeats: node allocatable CPU and memory, sandbox Pods
+- Reads capacity from Kubernetes instead of worker heartbeats: node allocatable CPU, memory and ephemeral storage
+  (less a reserve for the image cache), sandbox Pods
   already placed, and the images each node has cached (`node.status.images`), so placement stays cache-aware.
 - Places each sandbox Pod itself (`nodeName`). The kubelet refuses a Pod that does not fit (`OutOfcpu`,
   `OutOfmemory`) instead of queueing it, so the coordinator must not over-commit a node.
@@ -66,12 +67,22 @@ Two separate interfaces, because a machine and a sandbox are different products:
 | `SandboxProvider` | one isolated container per rollout: `start`, `execute`, `copy_text_to`, `cleanup` | `k8s` (default), `docker` (single-host dev), `local` (tests); later vendor sandboxes such as Targon Sandbox (template-based, cannot run arbitrary task images) |
 | `MachineProvider` | whole machines: create, list, delete, spec, price, limits; a boot script that joins the cluster | `boat`, `targon` (VM), `static` (machines registered by hand) |
 
-The `k8s` sandbox: one Pod per rollout, CPU and memory limits, no service-account token, and the same environment
+The `k8s` sandbox: one Pod per rollout, CPU, memory and ephemeral-storage limits (`disk`, default 10g), no
+service-account token, and the same environment
 repair as `DockerSandbox` (`ENV_PROBE`). Without that repair Go tasks cannot find their module cache and try to
 download it. Offline sandboxes are denied the network twice: the `gvisor-nonet` RuntimeClass (runsc
 `--network=none`, loopback only, checked after start; a sandbox with any other interface is refused) and a
 default-deny NetworkPolicy. The policy alone is not enough: it is enforced asynchronously, and on a freshly joined
 node the first Pod reached the internet (EXP-018).
+
+A sandbox killed for its own limits (OOMKilled, or evicted for its own ephemeral-storage usage) scores the
+rollout 0 (`sandbox_limit`, `rollout_sandbox_limit` or `grader_sandbox_limit`) instead of an infra error, so a
+model cannot void a rollout it expects to fail by filling the memory or the disk. A node-pressure eviction or any
+other sandbox failure is still an infra error. Under gVisor both limits are enforced (EXP-018): an over-limit
+allocation is SIGKILLed (exit 137) and the container OOMKilled; an over-limit write is evicted ~15-20 s later.
+A command that cannot be launched because the model deleted a binary exec needs (e.g. /bin/sh) is likewise the
+model's own doing, not an infra error. This attribution assumes gVisor, where an overrun OOMKills the whole
+container; under runc an OOM may kill only the offending process.
 
 ## Cluster
 - k3s. The control plane runs on a stable dual-stack host. Avoid a boat sandbox for this role: it was IPv6-only
@@ -81,7 +92,11 @@ node the first Pod reached the internet (EXP-018).
 - Pod network: flannel `wireguard-native` (encrypted, 25 s keepalive from each node), so only the control plane
   opens a UDP port.
 - gVisor: `runsc` from the gVisor apt repository plus a containerd drop-in (`config-v3.toml.d/runsc.toml`) with two
-  runtimes, `runsc` and `runsc-nonet` (`--network=none`), and RuntimeClasses `gvisor` and `gvisor-nonet`.
+  runtimes, `runsc` and `runsc-nonet` (`--network=none`), and RuntimeClasses `gvisor` and `gvisor-nonet`. Both
+  runsc runtimes set `signal-unkillable-policy=linux`, so the rollout container's PID 1 (`sleep infinity`) is
+  signal-protected and the model, root with CAP_KILL, cannot `kill -9 1` to kill the container and void its
+  rollout. `K8sSandbox.start()` probes PID 1 (SIGSTOP, read state, SIGCONT) and refuses the sandbox if the
+  protection is not in force, so a node missing the config fails closed instead of letting the void through.
 - Boot scripts re-apply firewall rules on every boot, because boat snapshots do not keep them.
 
 ## Measured (EXP-017, 2026-10-15)

@@ -6,9 +6,9 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from hosted_env.providers.sandbox import SandboxError
-from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, ensure_network_policies,
-                                              network_policy_manifest, pod_manifest)
+from hosted_env.providers.sandbox import SandboxError, SandboxCommandError, SandboxLimitError
+from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, _parse_exit_status, ensure_network_policies,
+                                              limit_reason, network_policy_manifest, pod_manifest)
 
 
 class ApiErr(Exception):
@@ -79,8 +79,29 @@ def offline_exec(dev=LO_ONLY, rc=0):
 
 def make(tmp_path, **kw):
     kw.setdefault('repair_env', False)
+    kw.setdefault('pid1_guard', False)   # the real probe would run `kill -STOP 1` on the host under the fake exec
     return K8sSandbox('img:1', str(tmp_path), api=kw.pop('api', FakeCore()), networking_api=kw.pop('net', FakeNet()),
                       exec_fn=kw.pop('exec_fn', offline_exec()), poll=0, **kw)
+
+
+def test_pid1_guard_refuses_a_killable_init(tmp_path):
+    def probe(state):
+        def run(pod, argv, timeout):
+            if 'kill -STOP 1' in argv[-1]:
+                return state.encode(), 0, False
+            return offline_exec()(pod, argv, timeout)
+        return run
+    # protection off: SIGSTOP stopped PID 1 (state T) -> the model could kill its container -> refuse (pre-hand-out)
+    sb = K8sSandbox('img:1', str(tmp_path), api=FakeCore(), networking_api=FakeNet(), exec_fn=probe('T'),
+                    repair_env=False, poll=0, pid1_guard=True)
+    with pytest.raises(SandboxError, match='not signal-protected'):
+        sb.start()
+    assert not sb.handed_out
+    # protection on: the handler-less init ignored SIGSTOP (stays S) -> the sandbox is handed out
+    sb = K8sSandbox('img:1', str(tmp_path), api=FakeCore(), networking_api=FakeNet(), exec_fn=probe('S'),
+                    repair_env=False, poll=0, pid1_guard=True)
+    sb.start()
+    assert sb.handed_out
 
 
 def test_pod_manifest_defaults_and_placement():
@@ -88,11 +109,15 @@ def test_pod_manifest_defaults_and_placement():
     spec, c = m['spec'], m['spec']['containers'][0]
     assert (spec['runtimeClassName'], spec['nodeName'], spec['automountServiceAccountToken']) == ('gvisor', 'node-a', False)
     assert spec['enableServiceLinks'] is False and spec['restartPolicy'] == 'Never' and spec['dnsPolicy'] == 'None'
-    assert c['resources']['limits'] == {'cpu': '2', 'memory': '3Gi'} and c['workingDir'] == '/testbed'
+    assert c['resources']['limits'] == {'cpu': '2', 'memory': '3Gi', 'ephemeral-storage': '10Gi'}
+    assert c['resources']['requests'] == c['resources']['limits'] and c['workingDir'] == '/testbed'
     assert c['securityContext'] == {'allowPrivilegeEscalation': False} and c['command'] == ['sleep', 'infinity']
     assert m['metadata']['labels']['hosted-env/network'] == 'none'
-    m2 = pod_manifest('p2', 'i', '/w', namespace='ns', runtime_class=None, network='bridge')
+    m2 = pod_manifest('p2', 'i', '/w', namespace='ns', runtime_class=None, network='bridge', disk=None)
     assert 'runtimeClassName' not in m2['spec'] and 'nodeName' not in m2['spec'] and 'dnsPolicy' not in m2['spec']
+    assert 'ephemeral-storage' not in m2['spec']['containers'][0]['resources']['limits']
+    m3 = pod_manifest('p3', 'i', '/w', namespace='ns', disk='512m')
+    assert m3['spec']['containers'][0]['resources']['limits']['ephemeral-storage'] == '512Mi'
 
 
 def test_network_policy_is_default_deny_and_idempotent():
@@ -166,6 +191,178 @@ def test_pod_gone_during_exec(tmp_path):
         sb.start()                                              # the `command -v timeout` probe already fails
 
 
+def _dead(reason=None, message='', terminated=None, phase='Failed'):
+    st = NS(waiting=None, terminated=NS(reason=terminated) if terminated else None)
+    return NS(status=NS(phase=phase, reason=reason, message=message, container_statuses=[NS(ready=False, state=st)]))
+
+
+OWN_DISK = 'Pod ephemeral local storage usage exceeds the total limit of containers 1Gi. '   # as seen in EXP-018
+NODE_DISK = 'The node was low on resource: ephemeral-storage. '
+
+
+def test_limit_reason_only_blames_the_pods_own_limits():
+    assert limit_reason(_dead('Evicted', OWN_DISK)).startswith('ephemeral-storage limit: Pod ephemeral')
+    assert limit_reason(_dead('Evicted', 'Container task exceeded its local ephemeral storage limit "10Gi". '))
+    assert limit_reason(_dead(terminated='OOMKilled')) == 'memory limit: container OOMKilled'
+    assert limit_reason(_dead('Evicted', NODE_DISK)) is None       # node pressure: not the sandbox's doing
+    assert limit_reason(_dead(terminated='Error')) is None
+    assert limit_reason(_pod()) is None
+
+
+def scripted(**plan):
+    """offline_exec, except for commands named in plan (argv[-1] -> callable returning an exec result)."""
+    base = offline_exec()
+
+    def run(pod, argv, timeout):
+        act = plan.get(argv[-1])
+        return act() if act else base(pod, argv, timeout)
+    return run
+
+
+def raises(msg):
+    def act():
+        raise SandboxError(msg)
+    return act
+
+
+def raises_cmd(msg):
+    def act():
+        raise SandboxCommandError(msg)
+    return act
+
+
+def started(tmp_path, then, **plan):
+    """A started sandbox whose Pod reads as `then` from now on."""
+    core = FakeCore()
+    sb = make(tmp_path, api=core, exec_fn=scripted(**plan), limit_wait=5)
+    sb.start()
+    core.pods = [then]
+    return sb
+
+
+def test_exec_failure_after_an_own_limit_kill_is_a_limit_error(tmp_path):
+    sb = started(tmp_path, _dead('Evicted', OWN_DISK), work=raises('exec failed: 0 Handshake status 500'))
+    with pytest.raises(SandboxLimitError, match='ephemeral-storage limit'):
+        sb.execute('work')
+    sb = started(tmp_path, _dead('Evicted', NODE_DISK), work=raises('exec failed: 0 Handshake status 500'))
+    with pytest.raises(SandboxError) as e:
+        sb.execute('work')
+    assert not isinstance(e.value, SandboxLimitError)             # node-wide eviction stays an infra error
+    sb = started(tmp_path, _pod(), work=raises('exec failed: 500'))
+    sb.limit_wait = 0
+    with pytest.raises(SandboxError) as e:
+        sb.execute('work')                                        # Pod still running: some other failure
+    assert not isinstance(e.value, SandboxLimitError)
+
+
+def test_sigkilled_command_checks_the_container(tmp_path):
+    oom = _dead(terminated='OOMKilled')
+    sb = started(tmp_path, oom, hog=lambda: (b'', 137, False), true=raises('exec stream failed: KeyError'))
+    with pytest.raises(SandboxLimitError, match='memory limit'):
+        sb.execute('hog')                                         # the container died with the command
+    sb = started(tmp_path, _pod(), hog=lambda: (b'Killed', 137, False))
+    assert sb.execute('hog')['returncode'] == 137                 # only the process died: an ordinary exit status
+
+
+def test_node_pressure_eviction_of_a_pod_over_its_own_request_is_its_limit():
+    over = NODE_DISK + 'Container task was using 12Gi, request is 10Gi, has larger consumption of ephemeral-storage. '
+    under = NODE_DISK + 'Container task was using 3Gi, request is 10Gi, has larger consumption of ephemeral-storage. '
+    assert limit_reason(_dead('Evicted', over)).startswith('ephemeral-storage limit: The node was low')
+    assert limit_reason(_dead('Evicted', under)) is None         # a neighbour filled the node: infra
+
+
+def test_copy_into_a_sandbox_killed_for_its_limit_is_a_limit_error(tmp_path):
+    def copy_fails(pod, argv, timeout):
+        if argv[:2] == ['sh', '-c'] and 'base64 -d' in argv[2]:
+            raise SandboxError('exec failed: 0 Handshake status 500')
+        return offline_exec()(pod, argv, timeout)
+    core = FakeCore()
+    sb = make(tmp_path, api=core, exec_fn=copy_fails, limit_wait=5)
+    sb.start()
+    core.pods = [_dead('Evicted', OWN_DISK)]
+    with pytest.raises(SandboxLimitError):
+        sb.copy_text_to('x', '/tmp/f')
+
+
+def test_timeout_escalated_to_sigkill_is_a_client_timeout(tmp_path):
+    sb = started(tmp_path, _pod(), slow=lambda: (b'', 137, False), true=raises('must not probe'))
+    sb.has_timeout = True
+    assert sb.execute('slow', timeout=0)['reason'] == 'client_timeout'   # 137 at/after the timeout: `timeout -k`
+    sb = started(tmp_path, _dead(terminated='OOMKilled'), slow=lambda: (b'', 137, False), true=raises('gone'))
+    sb.has_timeout = True
+    with pytest.raises(SandboxLimitError):
+        sb.execute('slow', timeout=60)                              # 137 well before the timeout: probed
+
+
+def test_zero_disk_and_units():
+    assert 'ephemeral-storage' not in pod_manifest('p', 'i', '/w', namespace='n', disk='0')['spec']['containers'][0][
+        'resources']['limits']
+    lim = pod_manifest('p', 'i', '/w', namespace='n', memory='2G', disk='10G')['spec']['containers'][0]['resources']
+    assert lim['limits'] == {'cpu': '1', 'memory': '2G', 'ephemeral-storage': '10G'}   # upper case: k8s decimal
+
+
+def test_parse_exit_status():
+    assert _parse_exit_status('') == 0
+    assert _parse_exit_status('{"status":"Success"}') == 0
+    nonzero = '{"status":"Failure","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"137"}]}}'
+    assert _parse_exit_status(nonzero) == 137
+    oci = ('{"status":"Failure","message":"OCI runtime exec failed: exec failed: unable to start container '
+           'process: exec: \\"sh\\": executable file not found in $PATH","reason":"InternalError"}')
+    with pytest.raises(SandboxCommandError, match='could not start'):
+        _parse_exit_status(oci)
+
+
+def test_command_launch_failure_is_reconciled_against_pod_status(tmp_path):
+    # the model deleted /bin/sh but the container stays up: its own doing, kept as a command error (scores 0)
+    sb = started(tmp_path, _pod(), gone=raises_cmd('command could not start: exec "sh": not found'))
+    sb.limit_wait = 0                                            # container running + window elapsed -> the model's
+    with pytest.raises(SandboxCommandError):
+        sb.execute('gone')
+    # the SAME frame from a container the node evicted / a runsc crash: genuine infra, not the model
+    sb = started(tmp_path, _dead(terminated='Error'), gone=raises_cmd('command could not start'))
+    with pytest.raises(SandboxError) as e:
+        sb.execute('gone')
+    assert not isinstance(e.value, (SandboxCommandError, SandboxLimitError))
+    # the same frame from an OOMKilled container: a limit kill
+    sb = started(tmp_path, _dead(terminated='OOMKilled'), gone=raises_cmd('command could not start'))
+    with pytest.raises(SandboxLimitError):
+        sb.execute('gone')
+    # the pod is gone: infra, not the model
+    core = FakeCore()
+    sb = make(tmp_path, api=core, exec_fn=scripted(gone=raises_cmd('command could not start')), limit_wait=5)
+    sb.start()
+    core.deleted.append((sb.name, sb.ns))                       # read_namespaced_pod now raises 404
+    with pytest.raises(SandboxError) as e:
+        sb.execute('gone')
+    assert not isinstance(e.value, (SandboxCommandError, SandboxLimitError))
+
+
+def test_check_alive_reads_status_not_a_probe_binary(tmp_path):
+    # 137 with a live container: that command's own exit code (no exec of a model-deletable probe)
+    sb = started(tmp_path, _pod(), kill=lambda: (b'', 137, False))
+    assert sb.execute('kill')['returncode'] == 137
+    # 137 with the container OOMKilled: a limit kill
+    sb = started(tmp_path, _dead(terminated='OOMKilled'), kill=lambda: (b'', 137, False))
+    with pytest.raises(SandboxLimitError):
+        sb.execute('kill')
+    # 137 with the container terminated for another reason: infra
+    sb = started(tmp_path, _dead(terminated='Error'), kill=lambda: (b'', 137, False))
+    with pytest.raises(SandboxError) as e:
+        sb.execute('kill')
+    assert not isinstance(e.value, SandboxLimitError)
+
+
+def test_copy_text_to_passes_a_command_error_through(tmp_path):
+    def copy_cannot_launch(pod, argv, timeout):
+        if 'base64 -d' in argv[2]:
+            raise SandboxCommandError('command could not start in the container')
+        return offline_exec()(pod, argv, timeout)
+    sb = make(tmp_path, exec_fn=copy_cannot_launch, limit_wait=0)
+    sb.start()
+    with pytest.raises(SandboxCommandError):
+        sb.copy_text_to('x', '/tmp/f')
+
+
 def test_executor_builds_k8s_sandboxes(tmp_path):
     from nacl.signing import SigningKey
 
@@ -175,7 +372,7 @@ def test_executor_builds_k8s_sandboxes(tmp_path):
     core, net = FakeCore(), FakeNet()
     rt = EnvRuntime(env=DockerTaskEnv('e', {'group_size': 8}), renderer=CharRenderer(), sandbox='k8s',
                     sandbox_opts={'exec_fn': offline_exec(), 'node_name': 'node-a', 'repair_env': False,
-                                  'poll': 0})
+                                  'poll': 0, 'pid1_guard': False})
     w = Worker(worker_id='local', key=SigningKey.generate(), gateway=None, gateway_pub=SigningKey.generate().verify_key,
                runtimes={'e': rt}, public_url='http://x', k8s_api=(core, net))
     sb = w._sandbox_factory(rt)('img:1', str(tmp_path))

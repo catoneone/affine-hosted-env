@@ -22,7 +22,7 @@ def make_env(tmp_path, n=60, group_size=8, images=None, name='env'):
             img = images(i) if images else f'img-{i}'
             f.write(json.dumps({'id': f't{i:03d}', 'image': img, 'cwd': '/w', 'problem_statement': f'p{i}',
                                 'test_command': 'true'}) + '\n')
-    return DockerTaskEnv(name, {'tasks': str(p), 'group_size': group_size})
+    return DockerTaskEnv(name, {'tasks': str(p), 'group_size': group_size, 'require_image_digest': False})
 
 
 def make_store(tmp_path, limits=None, envs=None, workers=(('w1', 10_000, ()),), db='g.db'):
