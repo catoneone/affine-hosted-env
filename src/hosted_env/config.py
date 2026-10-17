@@ -42,7 +42,8 @@ def _store(cfg: dict, base: Path, key):
 
 def _node_source(cfg: dict):
     """[placement] kind = "k8s": read nodes from the cluster (in-cluster config, else kubeconfig). Other keys
-    (cpus, memory, reserve_cpu, reserve_memory, include_control_plane) size one standard sandbox slot."""
+    (cpus, memory, disk, reserve_cpu, reserve_memory, reserve_disk, include_control_plane) size one standard sandbox
+    slot; keep cpus / memory / disk equal to the env's sandbox_opts."""
     pcfg = dict(cfg.get('placement') or {})
     if pcfg.pop('kind', None) != 'k8s':
         return None

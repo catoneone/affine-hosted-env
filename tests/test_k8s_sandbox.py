@@ -88,11 +88,15 @@ def test_pod_manifest_defaults_and_placement():
     spec, c = m['spec'], m['spec']['containers'][0]
     assert (spec['runtimeClassName'], spec['nodeName'], spec['automountServiceAccountToken']) == ('gvisor', 'node-a', False)
     assert spec['enableServiceLinks'] is False and spec['restartPolicy'] == 'Never' and spec['dnsPolicy'] == 'None'
-    assert c['resources']['limits'] == {'cpu': '2', 'memory': '3Gi'} and c['workingDir'] == '/testbed'
+    assert c['resources']['limits'] == {'cpu': '2', 'memory': '3Gi', 'ephemeral-storage': '10Gi'}
+    assert c['resources']['requests'] == c['resources']['limits'] and c['workingDir'] == '/testbed'
     assert c['securityContext'] == {'allowPrivilegeEscalation': False} and c['command'] == ['sleep', 'infinity']
     assert m['metadata']['labels']['hosted-env/network'] == 'none'
-    m2 = pod_manifest('p2', 'i', '/w', namespace='ns', runtime_class=None, network='bridge')
+    m2 = pod_manifest('p2', 'i', '/w', namespace='ns', runtime_class=None, network='bridge', disk=None)
     assert 'runtimeClassName' not in m2['spec'] and 'nodeName' not in m2['spec'] and 'dnsPolicy' not in m2['spec']
+    assert 'ephemeral-storage' not in m2['spec']['containers'][0]['resources']['limits']
+    m3 = pod_manifest('p3', 'i', '/w', namespace='ns', disk='512m')
+    assert m3['spec']['containers'][0]['resources']['limits']['ephemeral-storage'] == '512Mi'
 
 
 def test_network_policy_is_default_deny_and_idempotent():

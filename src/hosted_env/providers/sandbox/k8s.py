@@ -1,7 +1,7 @@
 """Kubernetes sandboxes (architecture v2): one Pod per rollout.
 
-- The Pod runs the task image with `sleep infinity`, CPU and memory limits, no service-account token and no
-  service links. For `network="none"` it uses the `gvisor-nonet` RuntimeClass (runsc `--network=none`: loopback
+- The Pod runs the task image with `sleep infinity`, CPU, memory and ephemeral-storage limits, no service-account
+  token and no service links. For `network="none"` it uses the `gvisor-nonet` RuntimeClass (runsc `--network=none`: loopback
   only), checks after start that loopback is the only interface (fail closed), and is also covered by a
   default-deny NetworkPolicy for Pods labelled `hosted-env/network=none`. The policy alone is not enough: it is
   enforced asynchronously, and on a freshly joined node the first Pod reached the internet (EXP-018).
@@ -29,6 +29,7 @@ NETWORK_LABEL = 'hosted-env/network'
 CONTAINER = 'task'
 WRITE_CHUNK = 48 * 1024          # bytes of file content per exec when writing files (base64 grows it by 4/3)
 HANDSHAKE_RETRIES, HANDSHAKE_BACKOFF = 3, 1.0     # exec WebSocket handshakes answered with 5xx (see ws_exec)
+DEFAULT_DISK = '10g'             # ephemeral-storage per sandbox; coordinator/nodes.py sizes slots with the same default
 
 # exec_fn(pod, argv, timeout) -> (output bytes with stdout and stderr merged, returncode, timed_out)
 ExecFn = Callable[[str, list[str], float], tuple[bytes, int, bool]]
@@ -43,7 +44,13 @@ def _mem(v: str) -> str:
 
 def pod_manifest(name: str, image: str, cwd: str, *, namespace: str, node_name: str | None = None,
                  runtime_class: str | None = 'gvisor', cpus: str = '1', memory: str = '2g',
-                 network: str = 'none', labels: dict | None = None) -> dict:
+                 disk: str | None = DEFAULT_DISK, network: str = 'none', labels: dict | None = None) -> dict:
+    """disk: ephemeral-storage limit (writable layer + logs). Past it the kubelet evicts this Pod alone, instead of
+    the node filling up and evicting every sandbox on it (EXP-018: under gVisor the limit is enforced, a 1.5 GiB
+    write into a 1Gi Pod is evicted within ~20 s). None leaves it unlimited."""
+    res = {'cpu': str(cpus), 'memory': _mem(memory)}
+    if disk:
+        res['ephemeral-storage'] = _mem(disk)
     spec = {
         'restartPolicy': 'Never',
         'automountServiceAccountToken': False,
@@ -51,8 +58,7 @@ def pod_manifest(name: str, image: str, cwd: str, *, namespace: str, node_name: 
         'terminationGracePeriodSeconds': 0,
         'containers': [{
             'name': CONTAINER, 'image': image, 'command': ['sleep', 'infinity'], 'workingDir': cwd,
-            'resources': {'limits': {'cpu': str(cpus), 'memory': _mem(memory)},
-                          'requests': {'cpu': str(cpus), 'memory': _mem(memory)}},
+            'resources': {'limits': dict(res), 'requests': dict(res)},
             'securityContext': {'allowPrivilegeEscalation': False},
         }],
     }
@@ -172,7 +178,8 @@ def ws_exec(api, namespace: str) -> ExecFn:
 class K8sSandbox:
     def __init__(self, image: str, cwd: str, *, api=None, networking_api=None, exec_fn: ExecFn | None = None,
                  namespace: str = 'hosted-env', node_name: str | None = None, runtime_class: str | None = 'auto',
-                 cpus: str = '1', memory: str = '2g', network: str = 'none', repair_env: bool = True,
+                 cpus: str = '1', memory: str = '2g', disk: str | None = DEFAULT_DISK, network: str = 'none',
+                 repair_env: bool = True,
                  offline_check: str = 'interfaces', start_timeout: float = 600, poll: float = 0.5,
                  delete_timeout: float = 120,
                  labels: dict | None = None, **_ignored):
@@ -193,8 +200,8 @@ class K8sSandbox:
         self.image, self.cwd, self.api, self.ns = image, cwd, api, namespace
         self.name = f'hosted-env-{uuid.uuid4().hex[:12]}'
         self.manifest = pod_manifest(self.name, image, cwd, namespace=namespace, node_name=node_name,
-                                     runtime_class=runtime_class, cpus=cpus, memory=memory, network=network,
-                                     labels=labels)
+                                     runtime_class=runtime_class, cpus=cpus, memory=memory, disk=disk,
+                                     network=network, labels=labels)
         self.networking_api, self.network, self.offline_check = networking_api, network, offline_check
         self.exec_fn = exec_fn or ws_exec(api, namespace)
         self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env

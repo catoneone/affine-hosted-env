@@ -87,5 +87,6 @@ revision = "<upstream revision the tokenizer files come from>"
 [envs.mimo_swe.sandbox_opts]
 cpus = "1"
 memory = "2g"
+disk = "10g"                              # k8s: ephemeral-storage limit, the kubelet evicts a sandbox that writes more
 network = "none"
 pids = 4096
