@@ -804,6 +804,36 @@ def _jestjson_results(report: bytes) -> dict:
 _REPORT_PARSERS = {'junit': _junit_results, 'gotest': _gotest_results, 'jest': _jestjson_results}
 _REPORT_EXT = {'junit': 'xml', 'gotest': 'ndjson', 'jest': 'json'}
 
+# `go` placed first on PATH in the grading container for a report_kind='gotest' task: `go test` runs with -json
+# and its stdout (one test2json event per line) is appended to $MIMO_GO_REPORT, so every `go test` the task's own
+# scripts run lands in the report without editing them. Every other go command, and `go test` in a mode with no
+# test events (-c compile only, -list) or already given -json, is passed through untouched -- GOFLAGS=-json is
+# not used because go env / go list / go build / go mod also take -json and scripts parse their output.
+# EXP-018 go_scan.py over the 721 Go tasks: 702 run `go test`; 2 redirect its output and none pipes it into
+# a parser; 4 call go by absolute path or through $GO and so get no report -- the baseline then derives no
+# expected tests for them and they stay exit-code graded. stdout is buffered to a file beside the report (no
+# pipefail in POSIX sh) and replayed, so the exit status is go test's own.
+GO_REPORT_SHIM = '''#!/bin/sh
+REAL=__REAL_GO__
+if [ "$1" = test ] && [ -n "$MIMO_GO_REPORT" ]; then
+  for a in "$@"; do
+    case "$a" in
+      -args) break ;;
+      -c|-json|-json=*|-list|-list=*) exec "$REAL" "$@" ;;
+    esac
+  done
+  shift
+  out="$MIMO_GO_REPORT.$$.out"
+  "$REAL" test -json "$@" >"$out"
+  rc=$?
+  cat "$out" >>"$MIMO_GO_REPORT"
+  cat "$out"
+  rm -f "$out"
+  exit $rc
+fi
+exec "$REAL" "$@"
+'''
+
 
 def report_verdict(report_kind: str, report: bytes, fail_to_pass: list[str], pass_to_pass: list[str]) -> tuple[bool, str]:
     """The second check: every expected test id (the tests the fix must make pass, plus those that must stay
@@ -1012,6 +1042,26 @@ class SweEnv(DockerTaskEnv):
                 except ValueError:
                     pass
         return set()
+
+    def _install_go_shim(self, sb, repo: str, rdir: str, rpath: str, res: dict) -> str:
+        """Put GO_REPORT_SHIM first on PATH for the test command; returns the env prefix ('' when not installed).
+        Runs as root before the tests, so the shim and its directory are root-owned and not writable by the grader
+        user. The real go is what the image's own PATH resolves, and must be an absolute path outside the repo (a
+        model-added `go` in the repo is never the one wrapped). When there is no such go the shim is skipped and
+        recorded: the report stays empty and a task with expected tests fails the second check -- never a void,
+        since a missing go is fixed by the pinned image, which the baseline ran against too."""
+        r = sb.execute('command -v go || true', cwd=repo, timeout=60, login=False)
+        real = (r['output'].strip().splitlines() or [''])[-1].strip()
+        root = repo.rstrip('/') + '/'
+        if not real.startswith('/') or real.startswith(root) or any(c in real for c in '\'"$`\\'):
+            res['go_report_shim'] = 'skipped: no go outside the repo on PATH'
+            return ''
+        bindir = f'{rdir}-bin'
+        sb.execute(f'rm -rf {bindir} && mkdir -p {bindir}', timeout=60, login=False)
+        sb.copy_text_to(GO_REPORT_SHIM.replace('__REAL_GO__', shlex.quote(real)), f'{bindir}/go')
+        sb.execute(f'chmod 755 {bindir} {bindir}/go', timeout=60, login=False)
+        res['go_report_shim'] = real
+        return f'PATH={bindir}:"$PATH" MIMO_GO_REPORT={shlex.quote(rpath)} '
 
     def _read_abs(self, sb, path: str) -> bytes:
         """Raw bytes of an absolute file (a structured test report in a random dir), base64 so binary is safe."""
@@ -1249,6 +1299,8 @@ fi
                     if collect:
                         opts += ' --continue-on-collection-errors'
                     pre = f'PYTEST_ADDOPTS={shlex.quote(opts)} '
+                elif report_kind == 'gotest':
+                    pre = self._install_go_shim(sb, repo, rdir, rpath, res)
                 pre += f'MIMO_REPORT={shlex.quote(rpath)} '           # harnesses the baseline tool amended honour this
             if collect:                                     # the test files as the hidden tests see them
                 res['report_test_files'] = {p.decode('utf-8', 'surrogateescape'): self._read_blob(
