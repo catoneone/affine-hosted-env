@@ -59,25 +59,26 @@ def test_report_verdict_accepts_parametrised_instances():
     assert not report_verdict('junit', junit, ['t/test_m.py::test_r'], [])[0]   # no instance at all: missing
 
 
-def _task(tmp_path):
+def _task(tmp_path, base_extra='', calc_test=None, select='-k "add or zero or mul or old"'):
     """Base: calc.add subtracts, tests/test_old.py passes. Test patch: tests/test_calc.py (test_add fails at base,
     test_zero passes, test_p is deselected by -k) and tests/test_new.py, which imports calc.mul (not in the base,
-    so the file does not collect): test_mul is selected, test_other is not."""
+    so the file does not collect): test_mul is selected, test_other is not. base_extra: more shell for the base
+    commit; calc_test / select replace tests/test_calc.py and the pytest selection."""
     tpl = tmp_path / 'tpl'
     tpl.mkdir()
     _run('git init -q -b master && printf "def add(a, b):\\n    return a - b\\n" > calc.py && mkdir tests && '
-         'printf "def test_old(): pass\\n" > tests/test_old.py && git add -A && git commit -qm base', tpl)
+         f'printf "def test_old(): pass\\n" > tests/test_old.py && {base_extra or "true"} && git add -A && '
+         'git commit -qm base', tpl)
     tp = tmp_path / 'tp'
     tp.mkdir()
     (tp / 'tests').mkdir()
-    (tp / 'tests' / 'test_calc.py').write_text(
+    (tp / 'tests' / 'test_calc.py').write_text(calc_test or (
         'import pytest\nfrom calc import add\ndef test_add(): assert add(2, 3) == 5\n'
-        'def test_zero(): assert add(0, 0) == 0\n@pytest.mark.parametrize("x", [1])\ndef test_p(x): pass\n')
+        'def test_zero(): assert add(0, 0) == 0\n@pytest.mark.parametrize("x", [1])\ndef test_p(x): pass\n'))
     (tp / 'tests' / 'test_new.py').write_text('from calc import mul\ndef test_mul(): assert mul(2, 3) == 6\n'
                                               'def test_other(): pass\n')
     (tp / 'mimo_test_command.sh').write_text(
-        f'cd "$(dirname "$0")" && PYTHONPATH=. {sys.executable} -m pytest -p no:cacheprovider tests '
-        '-k "add or zero or mul or old"\n')
+        f'cd "$(dirname "$0")" && PYTHONPATH=. {sys.executable} -m pytest -p no:cacheprovider tests {select}\n')
     test_patch = _run('git init -q && git add -A && git diff --cached --no-color', tp).stdout
     path = tmp_path / 'tasks.jsonl'
     path.write_text(json.dumps({'id': 'bt', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'python',
@@ -119,3 +120,28 @@ def test_derive_then_grade_with_the_expected_tests(tmp_path):
     assert g['reward'] == 1.0 and g['second_check'] is True
     g = grade_after('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')   # half a fix: test_new still broken
     assert g['reward'] == 0.0
+
+
+def test_repo_addopts_are_kept(tmp_path):
+    """Review of PR #18: the grader must not clear the repo's own pytest addopts (EXP-018 002371 crashed at
+    start-up without them). Here the base pytest.ini loads a plugin that provides the fixture the tests use:
+    with `-o addopts=` injected, test_add errors at base and after the fix alike, so the fix would score 0."""
+    from hosted_env.baseline import derive
+    plug = ("printf 'import pytest\\n@pytest.fixture\\ndef answer():\\n    return 5\\n' > plug.py && "
+            "printf '[pytest]\\naddopts = -p plug\\n' > pytest.ini")
+    test = 'from calc import add\ndef test_add(answer): assert add(2, 3) == answer\n'
+    env, path, factory = _task(tmp_path, base_extra=plug, calc_test=test, select='')
+    rec = derive(env, factory, 'bt', runs=1)
+    assert 'tests/test_calc.py::test_add' in rec['fail_to_pass'] and rec['pass_to_pass'] == ['tests/test_old.py::test_old']
+    row = json.loads(path.read_text())
+    row.update(report_kind='junit', fail_to_pass=rec['fail_to_pass'], pass_to_pass=rec['pass_to_pass'])
+    path.write_text(json.dumps(row) + '\n')
+    env2 = SweEnv('swe', {**env.cfg})
+    s = env2.open(env2.public_spec('bt'), factory)
+    s.setup()
+    fix = ('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak && '
+           'printf "def mul(a, b):\\n    return a * b\\n" >> calc.py')
+    assert s.sb.execute(fix)['returncode'] == 0
+    g = s.grade(env2.grade_inputs('bt'))
+    s.close()
+    assert g['reward'] == 1.0 and g['second_check'] is True
