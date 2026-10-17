@@ -18,6 +18,7 @@ CTX = {'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64, 'sta
        'test_patch_sha256': 'a' * 64,
        'test_command_sha256': 'b' * 64, 'grader': 'isolated-v3', 'grader_parsers': 'py3.12:tomllib+json+configparser',
        'expected_tests_sha256': '',
+       'sandbox_limits': 'k8s:cpus=1;memory=2g;disk=10g',
        'grader_user': 'nobody',
        'model_patch_sha256': 'd' * 64, 'verifier_returncode': 0, 'model_id': 'XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B',
        'model_revision': '2367e865', 'tokenizer_sha256': 'e' * 64, 'chat_template_sha256': 'f' * 64,

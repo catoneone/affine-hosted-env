@@ -53,6 +53,22 @@ def _reverted_summary(grade: dict) -> dict:
     return {'reverted_count': len(rp), 'reverted_head': sorted(rp)[:REVERTED_LOG_HEAD]} if rp else {}
 
 
+def _sandbox_limits(rt) -> str:
+    """The receipt's sandbox_limits: provider kind and the cpus / memory / disk the rollout and grading
+    containers were given, with each provider's own defaults filled in so the value names what was enforced.
+    The docker provider does not enforce disk (development only); the local one enforces nothing (tests)."""
+    if rt.sandbox == 'local':
+        return 'local'
+    o = rt.sandbox_opts
+    if rt.sandbox == 'k8s':
+        from ..providers.sandbox.k8s import DEFAULT_DISK
+        disk = o.get('disk', DEFAULT_DISK)
+        disk = 'none' if not disk or str(disk) == '0' else str(disk)
+    else:
+        disk = 'unenforced'
+    return f"{rt.sandbox}:cpus={o.get('cpus', '1')};memory={o.get('memory', '2g')};disk={disk}"
+
+
 def _build_version() -> str:
     """Package version plus the git commit the worker runs from, when it runs from its own checkout (deploys do;
     not a wheel inside some other repository), and '.dirty' when tracked files differ from that commit."""
@@ -427,6 +443,7 @@ class Worker:
                 'expected_tests_sha256': expected_tests_digest(gi.get('fail_to_pass') or [],
                                                                gi.get('pass_to_pass') or [],
                                                                gi.get('report_kind') or ''),
+                'sandbox_limits': _sandbox_limits(s.rt),
                 'grader_user': str(grade.get('grader_user', '')),
                 'model_patch_sha256': str(grade.get('model_patch_sha256', '')),
                 'verifier_returncode': rc if type(rc) is int else None,

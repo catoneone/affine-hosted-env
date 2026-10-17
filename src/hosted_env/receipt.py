@@ -50,6 +50,9 @@ CONTEXT_FIELDS = {
     'expected_tests_sha256': str,   # expected_tests_digest() of the task's expected tests (fail_to_pass /
                                     # pass_to_pass / report_kind) the second check used; '' when the task has none,
                                     # so the reward rests on the verifier's exit code alone
+    'sandbox_limits': str,          # the sandbox the rollout and its grading ran in and its limits, e.g.
+                                    # 'k8s:cpus=1;memory=2g;disk=10g': hitting its own limit scores 0, so an
+                                    # offline re-grade on a bigger box can differ unless it uses the same limits
     'grader_user': str,             # who the hidden tests ran as: nobody or root
     'model_patch_sha256': str,      # of the model's patch bytes as captured, before the grader put protected test
                                     # infrastructure back (a re-grader applies the same rule); the attachment has it

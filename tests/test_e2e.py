@@ -232,7 +232,8 @@ def test_receipt_context_binds_expected_tests():
     from hosted_env.receipt import expected_tests_digest
     rend = SimpleNamespace(model_id='m', model_revision='r', identity={'tokenizer_sha256': '', 'chat_template_sha256': '',
                                                                      'renderer': 'char'})
-    s = SimpleNamespace(rt=SimpleNamespace(renderer=rend), envsess=None, started=1.0)
+    s = SimpleNamespace(rt=SimpleNamespace(renderer=rend, sandbox='local', sandbox_opts={}), envsess=None,
+                        started=1.0)
     me = SimpleNamespace(build_version='t')
     gi = {'test_patch': 'p', 'test_command': 'c', 'report_kind': 'junit',
           'fail_to_pass': ['tests/test_a.py::t1'], 'pass_to_pass': ['tests/test_a.py::t0']}
@@ -240,3 +241,19 @@ def test_receipt_context_binds_expected_tests():
     assert ctx['expected_tests_sha256'] == expected_tests_digest(['tests/test_a.py::t1'], ['tests/test_a.py::t0'],
                                                                 'junit') != ''
     assert Worker._receipt_context(me, s, {}, {})['expected_tests_sha256'] == ''
+
+
+def test_sandbox_limits_names_what_was_enforced():
+    """The receipt's sandbox_limits fills each provider's defaults, so it names the limits actually enforced."""
+    from types import SimpleNamespace
+
+    from hosted_env.executor.core import _sandbox_limits
+    from hosted_env.providers.sandbox.k8s import DEFAULT_DISK
+
+    def rt(kind, **o):
+        return SimpleNamespace(sandbox=kind, sandbox_opts=o)
+    assert _sandbox_limits(rt('k8s')) == f'k8s:cpus=1;memory=2g;disk={DEFAULT_DISK}'
+    assert _sandbox_limits(rt('k8s', cpus='2', memory='4g', disk='20g')) == 'k8s:cpus=2;memory=4g;disk=20g'
+    assert _sandbox_limits(rt('k8s', disk='0')) == _sandbox_limits(rt('k8s', disk=None)) == 'k8s:cpus=1;memory=2g;disk=none'
+    assert _sandbox_limits(rt('docker', memory='8g', disk='10g')) == 'docker:cpus=1;memory=8g;disk=unenforced'
+    assert _sandbox_limits(rt('local', memory='8g')) == 'local'
