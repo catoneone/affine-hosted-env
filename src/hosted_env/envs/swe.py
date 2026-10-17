@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import re
+import secrets
 import shlex
 import sys
 import time
@@ -421,6 +422,98 @@ _JS_CONFIG_RE = re.compile(r'^(jest\.config\.|vitest\.config\.|vite\.config\.|\.
                            r'tsconfig[^/]*\.json$)')
 
 
+def _junit_results(report: bytes) -> dict:
+    """{test id -> 'pass'|'fail'|'skip'} from a JUnit XML report (pytest --junit-xml, jest-junit, go-junit).
+    A case with a <failure>/<error> child failed; `skipped` is skip; otherwise pass. pytest roots `classname` at
+    the filesystem path (e.g. tmp.abc.tests.test_calc), so for every dotted classname we register nodeids built
+    from each path SUFFIX -- `tests/test_calc.py::name`, with the last segment taken as a module or (for class
+    tests) as a class. The report lives in a random directory the model cannot write, so over-generating keys to
+    match a baseline id spelling is safe (there is nothing to forge)."""
+    import xml.etree.ElementTree as ET
+    out: dict[str, str] = {}
+    root = ET.fromstring(report)
+    for tc in root.iter('testcase'):
+        name, cls, fil = tc.get('name', ''), tc.get('classname', ''), tc.get('file', '')
+        children = {c.tag for c in tc}
+        status = 'fail' if {'failure', 'error'} & children else ('skip' if 'skipped' in children else 'pass')
+        keys = {name}
+        if cls:
+            keys |= {f'{cls}::{name}', f'{cls}.{name}'}
+        if fil:
+            keys.add(f'{fil}::{name}')
+        parts = cls.split('.') if cls else []
+        for k in range(len(parts)):
+            mod = '/'.join(parts[k:])
+            keys.add(f'{mod}.py::{name}')                               # last segment is the module file
+            if len(parts) - k >= 2:                                     # or the last segment is a class
+                keys.add(f'{"/".join(parts[k:-1])}.py::{parts[-1]}::{name}')
+        for key in keys:
+            if key:
+                out[key] = status
+    return out
+
+
+def _gotest_results(report: bytes) -> dict:
+    """{test id -> status} from `go test -json` output (one JSON object per line, action pass/fail/skip per Test)."""
+    out: dict[str, str] = {}
+    for line in report.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        t, act = ev.get('Test'), ev.get('Action')
+        if t and act in ('pass', 'fail', 'skip'):
+            out[t] = {'pass': 'pass', 'fail': 'fail', 'skip': 'skip'}[act]
+            if ev.get('Package'):
+                out[f"{ev['Package']}::{t}"] = out[t]
+    return out
+
+
+def _jestjson_results(report: bytes) -> dict:
+    """{test id -> status} from `jest --json` output (testResults[].assertionResults[].{fullName,title,status})."""
+    out: dict[str, str] = {}
+    d = json.loads(report.decode('utf-8', 'replace'))
+    for suite in d.get('testResults', []):
+        for a in suite.get('assertionResults', []):
+            st = {'passed': 'pass', 'failed': 'fail', 'pending': 'skip', 'skipped': 'skip',
+                  'todo': 'skip'}.get(a.get('status'), 'fail')
+            for key in {a.get('fullName'), a.get('title')}:
+                if key:
+                    out[key] = st
+    return out
+
+
+_REPORT_PARSERS = {'junit': _junit_results, 'gotest': _gotest_results, 'jest': _jestjson_results}
+_REPORT_EXT = {'junit': 'xml', 'gotest': 'ndjson', 'jest': 'json'}
+
+
+def report_verdict(report_kind: str, report: bytes, fail_to_pass: list[str], pass_to_pass: list[str]) -> tuple[bool, str]:
+    """The second check: every expected test id (the tests the fix must make pass, plus those that must stay
+    passing) is present in the structured report AND passed; a skip never counts as a pass. Returns (ok, detail).
+    This is on top of the exit code -- a model that forces exit 0 but did not actually pass the tests fails here,
+    as long as the ids come from our own baseline, not the model."""
+    parse = _REPORT_PARSERS.get(report_kind)
+    if parse is None:
+        return False, f'unknown report_kind {report_kind!r}'
+    try:
+        results = parse(report)
+    except Exception as e:  # noqa: BLE001  a malformed / forged report is not a pass
+        return False, f'report unparseable: {type(e).__name__}'
+    expected = list(dict.fromkeys([*(fail_to_pass or []), *(pass_to_pass or [])]))
+    if not expected:
+        return False, 'no expected test ids'
+    missing = [t for t in expected if t not in results]
+    if missing:
+        return False, f'{len(missing)} expected test(s) not in the report, e.g. {missing[0]}'
+    notpass = [t for t in expected if results[t] != 'pass']
+    if notpass:
+        return False, f'{len(notpass)} expected test(s) not passing (e.g. {notpass[0]}={results[notpass[0]]})'
+    return True, f'{len(expected)} expected tests passed'
+
+
 class SweEnv(DockerTaskEnv):
     """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error').
 
@@ -432,7 +525,8 @@ class SweEnv(DockerTaskEnv):
 
     def grade_inputs(self, task: str) -> dict:
         r = self._load()[task]
-        return {**super().grade_inputs(task), 'test_patch': r['test_patch']}
+        extra = {k: r[k] for k in ('fail_to_pass', 'pass_to_pass', 'report_kind') if r.get(k)}
+        return {**super().grade_inputs(task), 'test_patch': r['test_patch'], **extra}
 
     def _prepare_repo(self, sb, repo: str, lang: str) -> str:
         """Bring a fresh container's repo to the base state the model starts from (also used for the grading
@@ -594,6 +688,17 @@ class SweEnv(DockerTaskEnv):
                 except ValueError:
                     pass
         return set()
+
+    def _read_abs(self, sb, path: str) -> bytes:
+        """Raw bytes of an absolute file (a structured test report in a random dir), base64 so binary is safe."""
+        if not path:
+            return b''
+        q = shlex.quote(path)
+        r = sb.execute(f'set -o pipefail; [ -f {q} ] && base64 < {q} | tr -d "\\n" || true', timeout=120, login=False)
+        try:
+            return base64.b64decode(r['output'].strip(), validate=True) if r['output'].strip() else b''
+        except ValueError:
+            return b''
 
     def _read_blob(self, sb, repo: str, ref: str | None, rel: str) -> bytes:
         """Raw bytes of `rel` at git ref `ref` (base tree), or from the working file when ref is None (the model's
@@ -793,14 +898,31 @@ fi
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
             test_cmd = gi['test_command']
+            expected = list(gi.get('fail_to_pass') or []) + list(gi.get('pass_to_pass') or [])
+            report_kind = gi.get('report_kind') or ''
+            rdir = rpath = pre = ''
+            if expected and report_kind in _REPORT_PARSERS:
+                rdir = f'/tmp/mimo-report-{secrets.token_hex(8)}'     # random: the model cannot predict / forge it
+                rpath = f'{rdir}/report.{_REPORT_EXT[report_kind]}'
+                sb.execute(f'rm -rf {rdir} && mkdir -p {rdir} && chmod 777 {rdir}', timeout=60, login=False)
+                if report_kind == 'junit':   # make even an unmodified pytest harness emit the report, config aside
+                    pre = f'PYTEST_ADDOPTS={shlex.quote(f"-o addopts= --junit-xml={rpath}")} '
+                pre += f'MIMO_REPORT={shlex.quote(rpath)} '           # harnesses the baseline tool amended honour this
             if grader == 'nobody':
                 res['lock_seconds'] = self._lock_down(sb, repo, test_paths)
                 test_cmd = as_grader(test_cmd)
             untrusted, t0 = True, time.time()               # the tests run the model's code
-            r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
-            return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
-                    'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
-                    'test_output': r['output'][-3000:], 'reverted_paths': reverted}
+            r = sb.execute(pre + test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
+            out = {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
+                   'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
+                   'test_output': r['output'][-3000:], 'reverted_paths': reverted}
+            if expected and report_kind in _REPORT_PARSERS:        # second check: the exact tests must be present & pass
+                ok, why = report_verdict(report_kind, self._read_abs(sb, rpath),
+                                         gi.get('fail_to_pass') or [], gi.get('pass_to_pass') or [])
+                out['second_check'] = ok
+                if not ok:
+                    return {**out, 'reward': 0.0, 'grade_detail': 'second_check: ' + why}
+            return out
         except SandboxLimitError as e:
             if not untrusted:                               # only our own setup had run: not the model's doing
                 raise GradeError(f'grading container hit a limit during setup: {e}') from None

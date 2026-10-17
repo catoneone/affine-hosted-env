@@ -398,6 +398,78 @@ def test_config_referenced_setup_file_is_reset(tmp_path):
     assert g['reward'] == 1.0 and 't/s.js' in g['reverted_paths']
 
 
+def test_report_verdict():
+    from hosted_env.envs.swe import report_verdict
+    junit = (b'<testsuite><testcase classname="t.test_m" name="test_a"/>'
+             b'<testcase classname="t.test_m" name="test_b"><failure/></testcase>'
+             b'<testcase classname="t.test_m" name="test_c"><skipped/></testcase></testsuite>')
+    assert report_verdict('junit', junit, ['t.test_m::test_a'], [])[0] is True
+    assert report_verdict('junit', junit, ['t.test_m::test_b'], [])[0] is False   # failed
+    assert report_verdict('junit', junit, ['t.test_m::test_c'], [])[0] is False   # skipped != pass
+    assert report_verdict('junit', junit, ['t.test_m::test_missing'], [])[0] is False  # absent
+    assert report_verdict('junit', b'not xml', ['x'], [])[0] is False             # forged / unparseable
+    assert report_verdict('junit', junit, [], [])[0] is False                     # no expected ids
+    go = (b'{"Action":"pass","Test":"TestA"}\n{"Action":"fail","Test":"TestB"}\n'
+          b'{"Action":"skip","Test":"TestC"}\n')
+    assert report_verdict('gotest', go, ['TestA'], [])[0] is True
+    assert report_verdict('gotest', go, ['TestA', 'TestB'], [])[0] is False
+    jest = (b'{"testResults":[{"assertionResults":['
+            b'{"fullName":"s a","status":"passed"},{"fullName":"s b","status":"failed"},'
+            b'{"fullName":"s c","status":"pending"}]}]}')
+    assert report_verdict('jest', jest, ['s a'], [])[0] is True
+    assert report_verdict('jest', jest, ['s a', 's c'], [])[0] is False
+    assert report_verdict('whatnot', b'', ['x'], [])[0] is False
+
+
+def _pytest_task(tmp_path):
+    """A task whose hidden tests run under pytest, with a JUnit second check and expected test ids."""
+    import json as _json
+    import subprocess
+    from hosted_env.envs import SweEnv
+    d = tmp_path / f'pt{len(list(tmp_path.iterdir()))}'
+    d.mkdir()
+    tpl = d / 'tpl'
+    tpl.mkdir()
+    subprocess.run(['bash', '-c',
+                    'git init -q -b master && printf "def add(a, b):\\n    return a - b\\n" > calc.py && '
+                    'git add -A && git -c user.email=t@t -c user.name=t commit -qm base'], cwd=tpl, check=True)
+    tp = d / 'tp'
+    tp.mkdir()
+    tpatch = subprocess.run(['bash', '-c',
+                             'git init -q && mkdir tests && printf "from calc import add\\n'
+                             'def test_add(): assert add(2,3)==5\\ndef test_zero(): assert add(0,0)==0\\n" '
+                             '> tests/test_calc.py && printf \'cd "$(dirname "$0")" && PYTHONPATH=. '
+                             'python3 -m pytest tests/test_calc.py\\n\' > mimo_test_command.sh && git add -A && '
+                             'git diff --cached --no-color'], cwd=tp, check=True, capture_output=True, text=True).stdout
+    path = d / 'tasks.jsonl'
+    path.write_text(_json.dumps({'id': 'pt', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'python',
+                                 'problem_statement': 'add subtracts', 'test_patch': tpatch,
+                                 'test_command': 'bash /testbed/mimo_test_command.sh', 'report_kind': 'junit',
+                                 'fail_to_pass': ['tests/test_calc.py::test_add'],
+                                 'pass_to_pass': ['tests/test_calc.py::test_zero']}) + '\n')
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
+                          'require_image_digest': False}), 'pt', str(d)
+
+
+def test_second_check_requires_the_expected_tests_to_pass(tmp_path):
+    env, task, base = _pytest_task(tmp_path)
+    gi = env.grade_inputs(task)
+    assert gi['report_kind'] == 'junit' and gi['fail_to_pass'] == ['tests/test_calc.py::test_add']
+    # honest fix: both expected tests pass -> reward 1 and second_check True
+    s = env.open(env.public_spec(task), lambda image, cwd: LocalSandbox(image, cwd, base_dir=base))
+    s.setup()
+    assert s.sb.execute('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')['returncode'] == 0
+    g = s.grade(gi)
+    s.close()
+    assert g['reward'] == 1.0 and g['second_check'] is True
+    # no fix: test_add fails -> exit nonzero and the second check also fails -> 0
+    s = env.open(env.public_spec(task), lambda image, cwd: LocalSandbox(image, cwd, base_dir=base))
+    s.setup()
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert g['reward'] == 0.0 and g.get('second_check') is False
+
+
 def test_image_whose_tree_differs_from_its_head(tmp_path):
     """Real images (e.g. 001488) ship a working tree that differs from their own HEAD: deleted tracked files,
     edits, extra files. That state is the task, not the model's work: a no-op rollout yields an empty patch, and
