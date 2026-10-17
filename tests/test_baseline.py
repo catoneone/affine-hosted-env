@@ -306,3 +306,27 @@ def test_derive_go_then_grade_with_the_expected_tests(tmp_path, monkeypatch):
     assert g['reward'] == 1.0 and g['second_check'] is True, g.get('grade_detail')
     assert g['go_report_shim'].endswith('/toolchain/go')
     assert grade_after(fix_x)['reward'] == 0.0
+
+
+def test_amend_js_reporter():
+    from hosted_env.baseline import amend_js_reporter as a
+    j = '--json --outputFile="${MIMO_REPORT:-/dev/null}"'
+    assert a('cd /testbed\nnpx jest src/a.test.js --ci\n') == (f'cd /testbed\nnpx jest src/a.test.js --ci {j}\n', 'jest')
+    assert a('yarn jest -t "adds two" 2>&1 | tail -50\n')[0] == f'yarn jest -t "adds two" {j} 2>&1 | tail -50\n'
+    assert a('node_modules/.bin/jest x.test.ts && echo ok')[0] == f'node_modules/.bin/jest x.test.ts {j} && echo ok'
+    assert a('(cd pkg && npx jest a.test.js)')[0] == f'(cd pkg && npx jest a.test.js {j})'
+    assert a('npx jest "a|b.test.js" > out.log')[0] == f'npx jest "a|b.test.js" {j} > out.log'
+    assert a('npx vitest run test/x.spec.ts')[1] == 'junit'
+    assert '--reporter=junit --outputFile=' in a('npx vitest run test/x.spec.ts')[0]
+    new, kind = a('./node_modules/.bin/mocha test/a.js --timeout 5000')
+    assert kind == 'junit' and new.endswith('--timeout 5000 --reporter xunit --reporter-options '
+                                            'output="${MIMO_REPORT:-/dev/null}"')
+    for bad in ('npx jest a.test.js\nnpx jest b.test.js\n',          # two runs would overwrite one report
+                'npx jest a.test.js --json\n',                       # already has a reporter
+                'npx mocha a.js --reporter dot\n',
+                "bash -c 'npx jest a.test.js'\n",                    # inside a quoted string
+                'npx jest \\\n  a.test.js\n',                        # continued on the next line
+                'npm test\n', 'node test/run.js\n', '# npx jest a.test.js\n'):
+        assert a(bad) is None, bad
+    # a comment that only mentions jest does not count as a run
+    assert a('# runs jest on the fixed file\nnpx jest a.test.js\n')[1] == 'jest'

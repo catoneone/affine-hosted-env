@@ -349,6 +349,81 @@ def go_select(names: list[str], patterns: list[str] | None) -> list[str]:
     return sorted(out)
 
 
+_JS_RUNNER_RE = re.compile(r'(?:npx\s+|pnpm\s+exec\s+|yarn\s+(?:exec\s+)?|(?:\./)?node_modules/\.bin/|(?<=[\s;&|(])|^)'
+                           r'(jest|vitest|mocha)(?=\s|$)')
+_JS_HAS_REPORTER_RE = re.compile(r'--json\b|--reporters?[ =]|--outputFile|--reporter-options?\b')
+# what each runner is given so its results land in $MIMO_REPORT (the grader sets it; /dev/null otherwise), and the
+# report kind the grader's second check then parses. mocha's xunit and vitest's junit reporters write JUnit XML.
+_JS_REPORTER_FLAGS = {
+    'jest': ('--json --outputFile="${MIMO_REPORT:-/dev/null}"', 'jest'),
+    'vitest': ('--reporter=junit --outputFile="${MIMO_REPORT:-/dev/null}"', 'junit'),
+    'mocha': ('--reporter xunit --reporter-options output="${MIMO_REPORT:-/dev/null}"', 'junit'),
+}
+
+
+def amend_js_reporter(text: str) -> tuple[str, str] | None:
+    """Rewrite a grading script so its one jest / vitest / mocha run also writes a structured report: the
+    reporter flags are appended to that command, before any pipe, list operator, redirection or closing paren.
+    Returns (new text, report kind), or None when the script is not one we can amend safely -- no run, more than
+    one (they would overwrite one report file), more than one runner kind, a reporter flag already given, the
+    run inside a quoted string (`bash -c '...'`) or continued on the next line. The baseline then gives the task
+    no expected tests and it stays exit-code graded. The amended script is part of the signed task index, so
+    the grader and an offline re-grader run the same one."""
+    hits = []
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith('#'):
+            continue
+        for m in _JS_RUNNER_RE.finditer(line):
+            hits.append((i, m))
+    if len(hits) != 1 or _JS_HAS_REPORTER_RE.search(text):
+        return None
+    i, m = hits[0]
+    line = lines[i]
+    if line.rstrip().endswith('\\'):
+        return None
+    quote, k = None, 0
+    while k < m.start():                      # quote state at the runner: refuse a run inside a string
+        c = line[k]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == '\\' and quote == '"':
+                k += 1
+        elif c in '\'"':
+            quote = c
+        elif c == '\\':
+            k += 1
+        k += 1
+    if quote:
+        return None
+    end, k = len(line), m.end()
+    while k < len(line):                      # end of the runner's simple command
+        c = line[k]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == '\\' and quote == '"':
+                k += 1
+        elif c in '\'"':
+            quote = c
+        elif c == '\\':
+            k += 1
+        elif c in '|&;<>)#' or (c.isdigit() and line[k + 1:k + 2] == '>' and line[k - 1:k].isspace()):
+            if c == '#' and not line[k - 1:k].isspace():
+                k += 1
+                continue
+            end = k
+            break
+        k += 1
+    if quote:
+        return None
+    flags, kind = _JS_REPORTER_FLAGS[m.group(1)]
+    head, rest = line[:end].rstrip(), line[end:].lstrip()
+    lines[i] = f'{head} {flags}' + ('' if not rest else rest if rest.startswith(')') else ' ' + rest)
+    return '\n'.join(lines), kind
+
+
 def _uses_pytest(gi: dict) -> bool:
     return any(_PYTEST_RE.search(t) for _, t in test_patch_scripts(gi['test_patch'])) or bool(
         _PYTEST_RE.search(gi['test_command']))
