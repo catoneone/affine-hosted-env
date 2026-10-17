@@ -326,7 +326,9 @@ def command_repo_paths(test_command: str, cwd: str) -> list[str]:
     """Repo-relative directories put on PATH and scripts invoked directly by the test command: anything the model
     adds or changes under them decides what the grader runs, so they are protected like the test infrastructure.
     Absolute paths outside the repo are ignored. Heuristic over the command string (the inner script of a mimo
-    task lives in the test patch and is reset separately)."""
+    task lives in the test patch and is reset separately). A script invoked INDIRECTLY -- `make test` running a
+    recipe, `python run_tests.py` importing a helper -- is not caught here by design: the entry point itself
+    (Makefile, setup.py, test_*.py) is covered by the protected-name and protected-dir rules instead."""
     out = set()
     for m in _CMD_PATH_RE.findall(test_command):
         for part in m.split(':'):
@@ -422,13 +424,25 @@ _JS_CONFIG_RE = re.compile(r'^(jest\.config\.|vitest\.config\.|vite\.config\.|\.
                            r'tsconfig[^/]*\.json$)')
 
 
+_STATUS_RANK = {'pass': 0, 'skip': 1, 'fail': 2}
+
+
+def _record(out: dict, key: str, status: str) -> None:
+    """Record `key -> status`, keeping the WORST status when a key is seen twice (fail > skip > pass). Several id
+    spellings collapse to one key and a report may carry two cases that share one, so the second check -- a forgery
+    backstop -- must fail closed: a later `pass` never masks an earlier `fail`/`skip` under a shared key."""
+    if key and (key not in out or _STATUS_RANK[status] > _STATUS_RANK[out[key]]):
+        out[key] = status
+
+
 def _junit_results(report: bytes) -> dict:
     """{test id -> 'pass'|'fail'|'skip'} from a JUnit XML report (pytest --junit-xml, jest-junit, go-junit).
     A case with a <failure>/<error> child failed; `skipped` is skip; otherwise pass. pytest roots `classname` at
     the filesystem path (e.g. tmp.abc.tests.test_calc), so for every dotted classname we register nodeids built
     from each path SUFFIX -- `tests/test_calc.py::name`, with the last segment taken as a module or (for class
-    tests) as a class. The report lives in a random directory the model cannot write, so over-generating keys to
-    match a baseline id spelling is safe (there is nothing to forge)."""
+    tests) as a class. Over-generating ids is lossy -- two cases can collapse to one key -- so _record keeps the
+    worst status (a model-added passing case cannot mask the real expected one); the model also cannot inject a
+    pytest-collectable module in the first place, since protected_paths reverts any test_*.py / *_test.py file."""
     import xml.etree.ElementTree as ET
     out: dict[str, str] = {}
     root = ET.fromstring(report)
@@ -448,13 +462,13 @@ def _junit_results(report: bytes) -> dict:
             if len(parts) - k >= 2:                                     # or the last segment is a class
                 keys.add(f'{"/".join(parts[k:-1])}.py::{parts[-1]}::{name}')
         for key in keys:
-            if key:
-                out[key] = status
+            _record(out, key, status)
     return out
 
 
 def _gotest_results(report: bytes) -> dict:
-    """{test id -> status} from `go test -json` output (one JSON object per line, action pass/fail/skip per Test)."""
+    """{test id -> status} from `go test -json` output (one JSON object per line, action pass/fail/skip per Test).
+    _record keeps the worst status so a rerun's later pass cannot mask an earlier fail under the same id."""
     out: dict[str, str] = {}
     for line in report.splitlines():
         line = line.strip()
@@ -466,14 +480,15 @@ def _gotest_results(report: bytes) -> dict:
             continue
         t, act = ev.get('Test'), ev.get('Action')
         if t and act in ('pass', 'fail', 'skip'):
-            out[t] = {'pass': 'pass', 'fail': 'fail', 'skip': 'skip'}[act]
+            _record(out, t, act)
             if ev.get('Package'):
-                out[f"{ev['Package']}::{t}"] = out[t]
+                _record(out, f"{ev['Package']}::{t}", act)
     return out
 
 
 def _jestjson_results(report: bytes) -> dict:
-    """{test id -> status} from `jest --json` output (testResults[].assertionResults[].{fullName,title,status})."""
+    """{test id -> status} from `jest --json` output (testResults[].assertionResults[].{fullName,title,status}).
+    _record keeps the worst status so a later pass cannot mask an earlier fail/skip under a shared id."""
     out: dict[str, str] = {}
     d = json.loads(report.decode('utf-8', 'replace'))
     for suite in d.get('testResults', []):
@@ -481,8 +496,7 @@ def _jestjson_results(report: bytes) -> dict:
             st = {'passed': 'pass', 'failed': 'fail', 'pending': 'skip', 'skipped': 'skip',
                   'todo': 'skip'}.get(a.get('status'), 'fail')
             for key in {a.get('fullName'), a.get('title')}:
-                if key:
-                    out[key] = st
+                _record(out, key, st)
     return out
 
 

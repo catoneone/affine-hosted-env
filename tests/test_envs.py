@@ -419,6 +419,12 @@ def test_report_verdict():
     assert report_verdict('jest', jest, ['s a'], [])[0] is True
     assert report_verdict('jest', jest, ['s a', 's c'], [])[0] is False
     assert report_verdict('whatnot', b'', ['x'], [])[0] is False
+    # a later passing case cannot mask an earlier fail/skip that collapses to the same id (fail-closed)
+    collide = (b'<testsuite><testcase classname="repo.tests.test_calc" name="test_add"><failure/></testcase>'
+               b'<testcase classname="evil.pkg.tests.test_calc" name="test_add"/></testsuite>')
+    assert report_verdict('junit', collide, ['tests/test_calc.py::test_add'], [])[0] is False
+    go2 = b'{"Action":"fail","Test":"TestA"}\n{"Action":"pass","Test":"TestA"}\n'
+    assert report_verdict('gotest', go2, ['TestA'], [])[0] is False
 
 
 def _pytest_task(tmp_path):
