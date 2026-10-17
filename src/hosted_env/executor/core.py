@@ -39,9 +39,18 @@ from .gateway_client import GatewayRejected, GatewayUnavailable, WorkerGatewayCl
 
 log = logging.getLogger('hosted_env.executor')
 # grade() fields the executor log keeps for each finished rollout: how it was graded and what the verifier said
-# (model_patch and test_output are too large for the log)
+# (model_patch and test_output are too large for the log). second_check is the per-test-id verdict on a task with
+# expected tests (absent otherwise), so a live rollout that the exit code passed but the second check failed is
+# visible. The protected files the grader put back are logged as a count plus the first few (_reverted_summary):
+# a patch that touches node_modules/ can revert thousands.
 GRADE_LOG_FIELDS = ('grader', 'grader_parsers', 'grader_user', 'lock_seconds', 'grade_detail', 'verifier_returncode',
-                    'verifier_reason', 'test_seconds')
+                    'verifier_reason', 'test_seconds', 'second_check')
+REVERTED_LOG_HEAD = 5
+
+
+def _reverted_summary(grade: dict) -> dict:
+    rp = grade.get('reverted_paths') or []
+    return {'reverted_count': len(rp), 'reverted_head': sorted(rp)[:REVERTED_LOG_HEAD]} if rp else {}
 
 
 def _build_version() -> str:
@@ -438,7 +447,7 @@ class Worker:
         self._log({'sid': s.sid, 'event': 'finish', 'task': c['task'], 'nonce': c['nonce'], 'outcome': outcome,
                    'detail': detail, 'reward': reward, 'steps': s.steps, 'n_tokens': s.hasher.n_tokens,
                    'wall_seconds': round(time.time() - s.started, 1), **s.stats,
-                   **{k: v for k, v in grade.items() if k in GRADE_LOG_FIELDS}})
+                   **{k: v for k, v in grade.items() if k in GRADE_LOG_FIELDS}, **_reverted_summary(grade)})
         self._teardown(s)
         try:
             self.gw.close(s.sid, outcome, reward, receipt_digest(receipt))   # the group seal lists it
