@@ -477,6 +477,82 @@ def amend_test_patch(test_patch: str, test_command: str) -> dict | None:
     return {'test_patch': ''.join(sections), 'report_kind': kind}
 
 
+def js_cases(kind: str, report: bytes) -> tuple[dict[str, str], int]:
+    """({id: status}, suites that ran no test) from a jest --json or a JUnit (mocha xunit / vitest junit) report.
+    One canonical id per test, in a form the grader's report parser emits: jest `fullName` (describe blocks +
+    title); JUnit `classname::name`. Two cases sharing an id keep the worst status. A jest suite that failed
+    with no assertion results (its file did not load at base, e.g. a TypeScript error against code the fix
+    adds) contributes no id and is only counted -- unlike pytest and Go there is no static fallback yet."""
+    rank = {'pass': 0, 'skip': 1, 'fail': 2}
+    out: dict[str, str] = {}
+    empty = 0
+
+    def put(key, st):
+        if key and (key not in out or rank[st] > rank[out[key]]):
+            out[key] = st
+    if kind == 'jest':
+        d = json.loads(report.decode('utf-8', 'replace'))
+        for suite in d.get('testResults', []):
+            ar = suite.get('assertionResults') or []
+            if not ar and suite.get('status') == 'failed':
+                empty += 1
+            for a in ar:
+                put(a.get('fullName'), {'passed': 'pass', 'failed': 'fail', 'pending': 'skip', 'skipped': 'skip',
+                                        'todo': 'skip'}.get(a.get('status'), 'fail'))
+        return out, empty
+    import xml.etree.ElementTree as ET
+    for tc in ET.fromstring(report).iter('testcase'):
+        name, cls = tc.get('name', ''), tc.get('classname', '')
+        kids = {c.tag for c in tc}
+        put(f'{cls}::{name}' if cls else name,
+            'fail' if {'failure', 'error'} & kids else 'skip' if 'skipped' in kids else 'pass')
+    return out, empty
+
+
+def _derive_js(env, factory, task: str, gi: dict, spec: dict, meta: dict, runs: int) -> dict:
+    """jest / vitest / mocha: the task's one runner run is amended to write a structured report
+    (amend_test_patch), the amended task is baselined like the others, and the amended test patch or test
+    command is returned with the expected tests so the signed task index -- and so the grader -- uses it."""
+    amend = amend_test_patch(gi['test_patch'], gi['test_command'])
+    if amend is None:
+        return {'id': task, 'report_kind': '', 'fail_to_pass': [], 'pass_to_pass': [],
+                'baseline': {**meta, 'runs': 0, 'skipped': 'no amendable jest / vitest / mocha run'}}
+    kind = amend['report_kind']
+    changed = {k: amend[k] for k in ('test_patch', 'test_command') if k in amend}
+    gi2 = {**gi, **changed}
+    t0 = time.time()
+    per_run: list[dict[str, str]] = []
+    rcs, empty = [], 0
+    for _ in range(runs):
+        s = env.open(spec, factory)
+        try:
+            s.setup()
+            g = s.grade({**gi2, 'report_kind': kind, 'collect_report': True})
+        finally:
+            s.close()
+        if g.get('grade_detail'):
+            raise RuntimeError(f'baseline grade of {task} did not run the tests: {g["grade_detail"]}')
+        rcs.append(g.get('verifier_returncode'))
+        rep = (g.get('report') or '').encode()
+        cases, e = js_cases(kind, rep) if rep.strip() else ({}, 0)
+        per_run.append(cases)
+        empty = max(empty, e)
+    ids = set().union(*per_run) if per_run else set()
+    stable = {i: per_run[0][i] for i in ids if all(r.get(i) == per_run[0].get(i) for r in per_run)}
+    f2p = sorted(i for i, st in stable.items() if st == 'fail')
+    p2p = sorted(i for i, st in stable.items() if st == 'pass')
+    meta.update(seconds=round(time.time() - t0, 1), returncodes=rcs, n_fail=len(f2p), n_pass=len(p2p),
+                n_skip=sum(1 for st in stable.values() if st == 'skip'), flaky=sorted(ids - set(stable))[:50],
+                unloaded_suites=empty, amended=sorted(changed))
+    if not f2p:
+        meta['warning'] = 'no failing test at base: an empty patch would pass every expected test'
+    if empty:
+        meta['warning_unloaded'] = f'{empty} suite(s) ran no test at base: their tests are not expected'
+    ok = bool(f2p or p2p)
+    return {'id': task, 'report_kind': kind if ok else '', 'fail_to_pass': f2p, 'pass_to_pass': p2p,
+            **(changed if ok else {}), 'baseline': meta}
+
+
 def _uses_pytest(gi: dict) -> bool:
     return any(_PYTEST_RE.search(t) for _, t in test_patch_scripts(gi['test_patch'])) or bool(
         _PYTEST_RE.search(gi['test_command']))
@@ -566,6 +642,8 @@ def derive(env, factory, task: str, runs: int = 2) -> dict:
     if not _uses_pytest(gi):
         if _uses_gotest(gi):
             return _derive_go(env, factory, task, gi, spec, meta, runs)
+        if _js_runs(gi['test_command']) or any(_js_runs(t) for _, t in test_patch_scripts(gi['test_patch'])):
+            return _derive_js(env, factory, task, gi, spec, meta, runs)
         return {'id': task, 'report_kind': '', 'fail_to_pass': [], 'pass_to_pass': [],
                 'baseline': {**meta, 'runs': 0, 'skipped': 'not a pytest or go test task'}}
     t0 = time.time()

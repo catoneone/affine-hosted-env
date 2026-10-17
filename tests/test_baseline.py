@@ -379,3 +379,69 @@ def test_amend_test_patch_refusals(tmp_path):
     assert amend_test_patch(_patch_adding(tmp_path, {'docs.md': 'run jest here\n'}), 'npx jest t.js')['test_command']
     # the run in the outer test command alone is amended there
     assert amend_test_patch(_patch_adding(tmp_path, {'t.js': 'x\n'}), 'npx vitest run t.js')['report_kind'] == 'junit'
+
+
+FAKE_NPX = r'''#!/bin/bash
+# `npx jest <file> [--json --outputFile=F]`: test "adds" fails until sum.js adds, "keeps" always passes.
+[ "$1" = jest ] || exit 0
+out=""
+for a in "$@"; do case "$a" in --outputFile=*) out="${a#--outputFile=}";; esac; done
+if grep -q 'a + b' sum.js; then s=passed; rc=0; else s=failed; rc=1; fi
+if [ -n "$out" ]; then
+  printf '{"testResults":[{"status":"x","assertionResults":[{"fullName":"sum adds","title":"adds","status":"%s"},{"fullName":"sum keeps","title":"keeps","status":"passed"}]}]}' "$s" > "$out"
+fi
+exit $rc
+'''
+
+
+def test_derive_js_amends_the_harness_then_grades(tmp_path, monkeypatch):
+    """jest: the one `npx jest` run is amended to write --json to $MIMO_REPORT; at base "sum adds" fails (F2P)
+    and "sum keeps" passes (P2P); the amended test patch comes back with them, and grading the amended task
+    with the expected tests scores the fix 1 and the unfixed repo 0."""
+    from hosted_env.baseline import derive
+    bindir = tmp_path / 'node'
+    bindir.mkdir()
+    (bindir / 'npx').write_text(FAKE_NPX)
+    (bindir / 'npx').chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bindir}:{os.environ["PATH"]}')
+    tpl = tmp_path / 'tpl'
+    tpl.mkdir()
+    _run('git init -q -b master && printf "module.exports = (a, b) => a - b\\n" > sum.js && git add -A && '
+         'git commit -qm base', tpl)
+    tp = tmp_path / 'tp'
+    tp.mkdir()
+    (tp / 'sum.test.js').write_text('test("adds", () => {})\n')
+    (tp / 'mimo_test_command.sh').write_text('cd "$(dirname "$0")"\nnpx jest sum.test.js --ci\n')
+    test_patch = _run('git init -q && git add -A && git diff --cached --no-color', tp).stdout
+    path = tmp_path / 'tasks.jsonl'
+    path.write_text(json.dumps({'id': 'jt', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'javascript',
+                                'problem_statement': 'sum subtracts', 'test_patch': test_patch,
+                                'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
+    cfg = {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
+           'require_image_digest': False}
+    env = SweEnv('swe', cfg)
+    base = tmp_path / 'sb'
+    base.mkdir()
+
+    def factory(image, cwd):
+        return LocalSandbox(image, cwd, base_dir=str(base))
+    rec = derive(env, factory, 'jt', runs=2)
+    assert rec['report_kind'] == 'jest', rec
+    assert rec['fail_to_pass'] == ['sum adds'] and rec['pass_to_pass'] == ['sum keeps']
+    assert '--json --outputFile=' in rec['test_patch'] and rec['baseline']['amended'] == ['test_patch']
+    row = json.loads(path.read_text())
+    row.update({k: rec[k] for k in ('report_kind', 'fail_to_pass', 'pass_to_pass', 'test_patch')})
+    path.write_text(json.dumps(row) + '\n')
+    env2 = SweEnv('swe', cfg)
+
+    def grade_after(*cmds):
+        s = env2.open(env2.public_spec('jt'), factory)
+        s.setup()
+        for c in cmds:
+            assert s.sb.execute(c)['returncode'] == 0, c
+        g = s.grade(env2.grade_inputs('jt'))
+        s.close()
+        return g
+    g = grade_after('printf "module.exports = (a, b) => a + b\\n" > sum.js')
+    assert g['reward'] == 1.0 and g['second_check'] is True, g.get('grade_detail')
+    assert grade_after()['reward'] == 0.0

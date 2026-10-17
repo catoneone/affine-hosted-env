@@ -215,6 +215,9 @@ def cmd_baseline(a):
             if rec and rec.get('report_kind') and rec.get('fail_to_pass'):
                 r.update(report_kind=rec['report_kind'], fail_to_pass=rec['fail_to_pass'],
                          pass_to_pass=rec['pass_to_pass'])
+                # a JS task's grading script amended to write the report (baseline.amend_test_patch): the
+                # expected tests only hold for the amended harness, so it replaces the original in the index
+                r.update({k: rec[k] for k in ('test_patch', 'test_command') if rec.get(k)})
         Path(a.tasks_out).write_text(''.join(json.dumps(r) + '\n' for r in rows))
 
 
