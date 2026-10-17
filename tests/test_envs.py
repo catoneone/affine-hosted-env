@@ -3,6 +3,7 @@ directory on the host."""
 import base64
 import os
 import shutil
+import sys
 
 import pytest
 from conftest import make_swe_tasks
@@ -558,7 +559,7 @@ def _pytest_task(tmp_path):
                              'git init -q && mkdir tests && printf "from calc import add\\n'
                              'def test_add(): assert add(2,3)==5\\ndef test_zero(): assert add(0,0)==0\\n" '
                              '> tests/test_calc.py && printf \'cd "$(dirname "$0")" && PYTHONPATH=. '
-                             'python3 -m pytest tests/test_calc.py\\n\' > mimo_test_command.sh && git add -A && '
+                             f'{sys.executable} -m pytest tests/test_calc.py\\n\' > mimo_test_command.sh && git add -A && '
                              'git diff --cached --no-color'], cwd=tp, check=True, capture_output=True, text=True).stdout
     path = d / 'tasks.jsonl'
     path.write_text(_json.dumps({'id': 'pt', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'python',

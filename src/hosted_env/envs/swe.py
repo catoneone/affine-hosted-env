@@ -820,12 +820,21 @@ def report_verdict(report_kind: str, report: bytes, fail_to_pass: list[str], pas
     expected = list(dict.fromkeys([*(fail_to_pass or []), *(pass_to_pass or [])]))
     if not expected:
         return False, 'no expected test ids'
-    missing = [t for t in expected if t not in results]
+
+    def status(t: str) -> str | None:
+        """An id read statically from the test source has no parameters; pytest reports `test_x[a]`, `test_x[b]`:
+        every instance must pass (worst status), and at least one must be there."""
+        if t in results:
+            return results[t]
+        inst = [s for k, s in results.items() if k.startswith(t + '[')]
+        return None if not inst else ('fail' if 'fail' in inst else 'skip' if 'skip' in inst else 'pass')
+    got = {t: status(t) for t in expected}
+    missing = [t for t in expected if got[t] is None]
     if missing:
         return False, f'{len(missing)} expected test(s) not in the report, e.g. {missing[0]}'
-    notpass = [t for t in expected if results[t] != 'pass']
+    notpass = [t for t in expected if got[t] != 'pass']
     if notpass:
-        return False, f'{len(notpass)} expected test(s) not passing (e.g. {notpass[0]}={results[notpass[0]]})'
+        return False, f'{len(notpass)} expected test(s) not passing (e.g. {notpass[0]}={got[notpass[0]]})'
     return True, f'{len(expected)} expected tests passed'
 
 
@@ -1223,14 +1232,25 @@ fi
             test_cmd = gi['test_command']
             expected = list(gi.get('fail_to_pass') or []) + list(gi.get('pass_to_pass') or [])
             report_kind = gi.get('report_kind') or ''
+            collect = bool(gi.get('collect_report'))       # baseline mode (hosted-env baseline): report, no verdict
+            want_report = report_kind in _REPORT_PARSERS and (expected or collect)
             rdir = rpath = pre = ''
-            if expected and report_kind in _REPORT_PARSERS:
+            if want_report:
                 rdir = f'/tmp/mimo-report-{secrets.token_hex(8)}'     # random: the model cannot predict / forge it
                 rpath = f'{rdir}/report.{_REPORT_EXT[report_kind]}'
                 sb.execute(f'rm -rf {rdir} && mkdir -p {rdir} && chmod 777 {rdir}', timeout=60, login=False)
                 if report_kind == 'junit':   # make even an unmodified pytest harness emit the report, config aside
-                    pre = f'PYTEST_ADDOPTS={shlex.quote(f"-o addopts= --junit-xml={rpath}")} '
+                    # xunit1 adds the `file` attribute (an unambiguous node id); the baseline also wants the
+                    # tests of the files that do collect when a new test file does not
+                    opts = f'-o addopts= -o junit_family=xunit1 --junit-xml={rpath}'
+                    if collect:
+                        opts += ' --continue-on-collection-errors'
+                    pre = f'PYTEST_ADDOPTS={shlex.quote(opts)} '
                 pre += f'MIMO_REPORT={shlex.quote(rpath)} '           # harnesses the baseline tool amended honour this
+            if collect:                                     # the test files as the hidden tests see them
+                res['report_test_files'] = {p.decode('utf-8', 'surrogateescape'): self._read_blob(
+                    sb, repo, None, p.decode('utf-8', 'surrogateescape')).decode('utf-8', 'replace')
+                    for p in (test_paths or [])[:200] if p.endswith((b'.py', b'.go', b'.js', b'.ts', b'.tsx', b'.jsx'))}
             if grader == 'nobody':
                 res['lock_seconds'] = self._lock_down(sb, repo, test_paths)
                 test_cmd = as_grader(test_cmd)
@@ -1239,6 +1259,9 @@ fi
             out = {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                    'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
                    'test_output': r['output'][-3000:], 'reverted_paths': reverted}
+            if collect:
+                out['report'] = self._read_abs(sb, rpath).decode('utf-8', 'replace') if want_report else ''
+                return out
             if expected and report_kind in _REPORT_PARSERS:        # second check: the exact tests must be present & pass
                 ok, why = report_verdict(report_kind, self._read_abs(sb, rpath),
                                          gi.get('fail_to_pass') or [], gi.get('pass_to_pass') or [])
