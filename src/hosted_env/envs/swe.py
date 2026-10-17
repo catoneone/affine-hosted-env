@@ -813,6 +813,10 @@ _REPORT_EXT = {'junit': 'xml', 'gotest': 'ndjson', 'jest': 'json'}
 # a parser; 4 call go by absolute path or through $GO and so get no report -- the baseline then derives no
 # expected tests for them and they stay exit-code graded. stdout is buffered to a file beside the report (no
 # pipefail in POSIX sh) and replayed, so the exit status is go test's own.
+# The report itself is writable by the test process (its directory is the grader user's, like the JUnit one),
+# so the model's code can append forged events: a forged `pass` never masks the real `fail` the shim appends
+# after go test exits, because _record keeps the worst status per id. A forged report that lists the expected
+# tests as passing while the real run never reached them is the known limit the patch audit backs up.
 GO_REPORT_SHIM = '''#!/bin/sh
 REAL=__REAL_GO__
 if [ "$1" = test ] && [ -n "$MIMO_GO_REPORT" ]; then

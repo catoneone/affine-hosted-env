@@ -40,6 +40,10 @@ RECEIPT_VERSION = 2
 _HEX = frozenset('0123456789abcdef')
 # Field -> type. *_sha256 fields are lowercase hex SHA-256 or '' (not known: e.g. a rollout that never got graded);
 # start_tree is a 40-hex git tree id or ''; verifier_returncode is None when no verifier ran.
+# Every field is required, and fields have been added within v2 while it runs only on the test deployment
+# (grader_parsers, then expected_tests_sha256 and sandbox_limits): a v2 receipt signed by an older worker fails
+# verification with malformed_receipt ('missing <field>'). Before receipts are relied on outside the test
+# deployment, the next field change bumps RECEIPT_VERSION (and RECEIPT_DOMAIN) instead.
 CONTEXT_FIELDS = {
     'image': str,                   # name@sha256:... the rollout and its grading ran in
     'start_tree': str,              # git tree the model started from (after setup); the patch applies to it
