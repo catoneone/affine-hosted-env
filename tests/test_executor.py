@@ -183,6 +183,26 @@ def test_grade_infra_error_is_signed(rig, monkeypatch):
     assert check_receipt(res[-1], segs, t, 0, wkey)['outcome'] == 'infra_error'
 
 
+def test_sandbox_limit_in_a_tool_call_scores_0_not_void(rig, monkeypatch):
+    """A rollout whose commands blow the sandbox's own memory / disk limit must not be able to void itself."""
+    from hosted_env.envs.base import EnvSession
+    from hosted_env.providers.sandbox import SandboxLimitError
+    w, store, r, rt, session, wkey = rig
+    t, (s,) = session()
+
+    def hog(sess, name, arguments):
+        raise SandboxLimitError('memory limit: container OOMKilled')
+    monkeypatch.setattr(EnvSession, 'call_tool', hog)
+    res = [w.start(s['token']).result(30)]
+    res.append(w.turn(s['token'], 1, enc(r, FIX)).result(30))
+    last = res[-1]
+    assert (last['done'], last['outcome'], last['reward']) == (True, 'unresolved', 0.0)
+    assert last['detail'] == 'sandbox_limit: memory limit: container OOMKilled'
+    segs = [('P', res[0]['prompt_tokens']), ('M', enc(r, FIX))]
+    assert check_receipt(last, segs, t, 0, wkey)['outcome'] == 'unresolved'     # signed, no trailing T segment
+    assert store.db.execute('SELECT state FROM tasks WHERE task_id=?', (t['task_id'],)).fetchone()[0] != 'void'
+
+
 def test_wrong_worker_and_bad_token(rig):
     w, store, r, rt, session, wkey = rig
     _, (s,) = session()

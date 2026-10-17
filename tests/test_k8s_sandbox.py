@@ -6,8 +6,8 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from hosted_env.providers.sandbox import SandboxError
-from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, ensure_network_policies,
+from hosted_env.providers.sandbox import SandboxError, SandboxLimitError
+from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, ensure_network_policies, limit_reason,
                                               network_policy_manifest, pod_manifest)
 
 
@@ -168,6 +168,73 @@ def test_pod_gone_during_exec(tmp_path):
     sb = K8sSandbox('i', str(tmp_path), api=FakeCore(), exec_fn=gone, repair_env=False, poll=0)
     with pytest.raises(SandboxError, match='gone'):
         sb.start()                                              # the `command -v timeout` probe already fails
+
+
+def _dead(reason=None, message='', terminated=None, phase='Failed'):
+    st = NS(waiting=None, terminated=NS(reason=terminated) if terminated else None)
+    return NS(status=NS(phase=phase, reason=reason, message=message, container_statuses=[NS(ready=False, state=st)]))
+
+
+OWN_DISK = 'Pod ephemeral local storage usage exceeds the total limit of containers 1Gi. '   # as seen in EXP-018
+NODE_DISK = 'The node was low on resource: ephemeral-storage. '
+
+
+def test_limit_reason_only_blames_the_pods_own_limits():
+    assert limit_reason(_dead('Evicted', OWN_DISK)).startswith('ephemeral-storage limit: Pod ephemeral')
+    assert limit_reason(_dead('Evicted', 'Container task exceeded its local ephemeral storage limit "10Gi". '))
+    assert limit_reason(_dead(terminated='OOMKilled')) == 'memory limit: container OOMKilled'
+    assert limit_reason(_dead('Evicted', NODE_DISK)) is None       # node pressure: not the sandbox's doing
+    assert limit_reason(_dead(terminated='Error')) is None
+    assert limit_reason(_pod()) is None
+
+
+def scripted(**plan):
+    """offline_exec, except for commands named in plan (argv[-1] -> callable returning an exec result)."""
+    base = offline_exec()
+
+    def run(pod, argv, timeout):
+        act = plan.get(argv[-1])
+        return act() if act else base(pod, argv, timeout)
+    return run
+
+
+def raises(msg):
+    def act():
+        raise SandboxError(msg)
+    return act
+
+
+def started(tmp_path, then, **plan):
+    """A started sandbox whose Pod reads as `then` from now on."""
+    core = FakeCore()
+    sb = make(tmp_path, api=core, exec_fn=scripted(**plan), limit_wait=5)
+    sb.start()
+    core.pods = [then]
+    return sb
+
+
+def test_exec_failure_after_an_own_limit_kill_is_a_limit_error(tmp_path):
+    sb = started(tmp_path, _dead('Evicted', OWN_DISK), work=raises('exec failed: 0 Handshake status 500'))
+    with pytest.raises(SandboxLimitError, match='ephemeral-storage limit'):
+        sb.execute('work')
+    sb = started(tmp_path, _dead('Evicted', NODE_DISK), work=raises('exec failed: 0 Handshake status 500'))
+    with pytest.raises(SandboxError) as e:
+        sb.execute('work')
+    assert not isinstance(e.value, SandboxLimitError)             # node-wide eviction stays an infra error
+    sb = started(tmp_path, _pod(), work=raises('exec failed: 500'))
+    sb.limit_wait = 0
+    with pytest.raises(SandboxError) as e:
+        sb.execute('work')                                        # Pod still running: some other failure
+    assert not isinstance(e.value, SandboxLimitError)
+
+
+def test_sigkilled_command_checks_the_container(tmp_path):
+    oom = _dead(terminated='OOMKilled')
+    sb = started(tmp_path, oom, hog=lambda: (b'', 137, False), true=raises('exec stream failed: KeyError'))
+    with pytest.raises(SandboxLimitError, match='memory limit'):
+        sb.execute('hog')                                         # the container died with the command
+    sb = started(tmp_path, _pod(), hog=lambda: (b'Killed', 137, False))
+    assert sb.execute('hog')['returncode'] == 137                 # only the process died: an ordinary exit status
 
 
 def test_executor_builds_k8s_sandboxes(tmp_path):

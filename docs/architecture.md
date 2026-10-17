@@ -41,7 +41,8 @@ and stay in the coordinator as business rules.
 ### Coordinator
 - Keeps today's store logic: task pool, assignment, quotas, global budget with per-hotkey fair share (equal split
   per hotkey; weighting is a P2 decision), sessions, voiding and refunds.
-- Reads capacity from Kubernetes instead of worker heartbeats: node allocatable CPU and memory, sandbox Pods
+- Reads capacity from Kubernetes instead of worker heartbeats: node allocatable CPU, memory and ephemeral storage
+  (less a reserve for the image cache), sandbox Pods
   already placed, and the images each node has cached (`node.status.images`), so placement stays cache-aware.
 - Places each sandbox Pod itself (`nodeName`). The kubelet refuses a Pod that does not fit (`OutOfcpu`,
   `OutOfmemory`) instead of queueing it, so the coordinator must not over-commit a node.
@@ -66,12 +67,19 @@ Two separate interfaces, because a machine and a sandbox are different products:
 | `SandboxProvider` | one isolated container per rollout: `start`, `execute`, `copy_text_to`, `cleanup` | `k8s` (default), `docker` (single-host dev), `local` (tests); later vendor sandboxes such as Targon Sandbox (template-based, cannot run arbitrary task images) |
 | `MachineProvider` | whole machines: create, list, delete, spec, price, limits; a boot script that joins the cluster | `boat`, `targon` (VM), `static` (machines registered by hand) |
 
-The `k8s` sandbox: one Pod per rollout, CPU and memory limits, no service-account token, and the same environment
+The `k8s` sandbox: one Pod per rollout, CPU, memory and ephemeral-storage limits (`disk`, default 10g), no
+service-account token, and the same environment
 repair as `DockerSandbox` (`ENV_PROBE`). Without that repair Go tasks cannot find their module cache and try to
 download it. Offline sandboxes are denied the network twice: the `gvisor-nonet` RuntimeClass (runsc
 `--network=none`, loopback only, checked after start; a sandbox with any other interface is refused) and a
 default-deny NetworkPolicy. The policy alone is not enough: it is enforced asynchronously, and on a freshly joined
 node the first Pod reached the internet (EXP-018).
+
+A sandbox killed for its own limits (OOMKilled, or evicted for its own ephemeral-storage usage) scores the
+rollout 0 (`sandbox_limit`, `rollout_sandbox_limit` or `grader_sandbox_limit`) instead of an infra error, so a
+model cannot void a rollout it expects to fail by filling the memory or the disk. A node-pressure eviction or any
+other sandbox failure is still an infra error. Under gVisor both limits are enforced (EXP-018): an over-limit
+allocation is SIGKILLed (exit 137) and the container OOMKilled; an over-limit write is evicted ~15-20 s later.
 
 ## Cluster
 - k3s. The control plane runs on a stable dual-stack host. Avoid a boat sandbox for this role: it was IPv6-only

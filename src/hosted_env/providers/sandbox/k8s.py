@@ -21,7 +21,7 @@ import time
 import uuid
 from collections.abc import Callable
 
-from .base import OUTPUT_CAP_BYTES, SandboxError
+from .base import OUTPUT_CAP_BYTES, SandboxError, SandboxLimitError
 from .docker import ENV_PROBE
 
 MANAGED_BY = {'app.kubernetes.io/managed-by': 'hosted-env'}
@@ -30,6 +30,8 @@ CONTAINER = 'task'
 WRITE_CHUNK = 48 * 1024          # bytes of file content per exec when writing files (base64 grows it by 4/3)
 HANDSHAKE_RETRIES, HANDSHAKE_BACKOFF = 3, 1.0     # exec WebSocket handshakes answered with 5xx (see ws_exec)
 DEFAULT_DISK = '10g'             # ephemeral-storage per sandbox; coordinator/nodes.py sizes slots with the same default
+KILLED_RC = (137, -1)            # SIGKILLed, or the exec stream ended without a status: check the container is alive
+LIMIT_WAIT = 45.0                # seconds to wait for the Pod status to show why it died (eviction lands ~20 s late)
 
 # exec_fn(pod, argv, timeout) -> (output bytes with stdout and stderr merged, returncode, timed_out)
 ExecFn = Callable[[str, list[str], float], tuple[bytes, int, bool]]
@@ -121,6 +123,28 @@ def _ready(pod) -> bool:
     return all(cs.ready for cs in (pod.status.container_statuses or [])) and bool(pod.status.container_statuses)
 
 
+# kubelet messages for a Pod evicted over its OWN ephemeral-storage limit (pod-level / container-level). A node-pressure
+# eviction reads "The node was low on resource: ephemeral-storage" and is deliberately not matched.
+_OWN_DISK_EVICTION = ('exceeds the total limit of containers', 'exceeded its local ephemeral storage limit')
+
+
+def limit_reason(pod) -> str | None:
+    """Why the kubelet killed this Pod for a limit set on it alone, if it did: evicted for its own ephemeral-storage
+    usage, or a container OOMKilled. Seen in EXP-018 on boat nodes under gVisor: a 1.5 GiB write into a 1Gi Pod was
+    evicted ~15-20 s later; a 3 GiB allocation in a 512Mi Pod got the command SIGKILLed (exit 137) and the container
+    OOMKilled. Requests equal limits (Guaranteed QoS) and slots are sized to the node, so an OOM kill is taken to be
+    the sandbox's own."""
+    st = pod.status
+    msg = getattr(st, 'message', None) or ''
+    if getattr(st, 'reason', None) == 'Evicted' and any(m in msg for m in _OWN_DISK_EVICTION):
+        return f'ephemeral-storage limit: {msg.strip()[:200]}'
+    for cs in getattr(st, 'container_statuses', None) or []:
+        term = getattr(cs.state, 'terminated', None) if getattr(cs, 'state', None) else None
+        if term is not None and term.reason == 'OOMKilled':
+            return 'memory limit: container OOMKilled'
+    return None
+
+
 def ws_exec(api, namespace: str) -> ExecFn:
     """exec_fn backed by the Kubernetes exec API (needs the `kubernetes` package).
 
@@ -157,6 +181,8 @@ def ws_exec(api, namespace: str) -> ExecFn:
                 if not transient or attempt == HANDSHAKE_RETRIES:
                     raise SandboxError(f'exec failed: {e.status} {e.reason}') from None
                 time.sleep(HANDSHAKE_BACKOFF * (attempt + 1))
+            except Exception as e:  # noqa: BLE001  any other client failure: the command did not run
+                raise SandboxError(f'exec failed: {type(e).__name__}: {e}'[:300]) from None
         buf, deadline, timed_out = bytearray(), time.monotonic() + timeout, False
         try:
             while resp.is_open():
@@ -169,6 +195,8 @@ def ws_exec(api, namespace: str) -> ExecFn:
                     if chunk and len(buf) < OUTPUT_CAP_BYTES:
                         buf.extend(chunk.encode('utf-8', 'replace')[:OUTPUT_CAP_BYTES - len(buf)])
             rc = -1 if timed_out else (resp.returncode if resp.returncode is not None else -1)
+        except Exception as e:  # noqa: BLE001  e.g. a status frame without 'details' from a container that died
+            raise SandboxError(f'exec stream failed: {type(e).__name__}: {e}'[:300]) from None   # mid-exec (KeyError)
         finally:
             resp.close()
         return bytes(buf), rc, timed_out
@@ -181,7 +209,7 @@ class K8sSandbox:
                  cpus: str = '1', memory: str = '2g', disk: str | None = DEFAULT_DISK, network: str = 'none',
                  repair_env: bool = True,
                  offline_check: str = 'interfaces', start_timeout: float = 600, poll: float = 0.5,
-                 delete_timeout: float = 120,
+                 delete_timeout: float = 120, limit_wait: float = LIMIT_WAIT,
                  labels: dict | None = None, **_ignored):
         """runtime_class 'auto': gvisor-nonet for network='none', gvisor otherwise.
         offline_check (network='none' only): 'interfaces' refuses a sandbox that has any interface besides lo;
@@ -205,8 +233,8 @@ class K8sSandbox:
         self.networking_api, self.network, self.offline_check = networking_api, network, offline_check
         self.exec_fn = exec_fn or ws_exec(api, namespace)
         self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env
-        self.delete_timeout = delete_timeout
-        self.started, self.has_timeout = False, False
+        self.delete_timeout, self.limit_wait = delete_timeout, limit_wait
+        self.started, self.has_timeout, self.handed_out = False, False, False
         self.env: dict[str, str] = {}
 
     def start(self):
@@ -240,6 +268,7 @@ class K8sSandbox:
             out = self.execute(ENV_PROBE, timeout=60, raw=True)['output']
             self.env = dict(ln.split('=', 1) for ln in out.splitlines()
                             if '=' in ln and ln.split('=', 1)[0].isupper())
+        self.handed_out = True          # from here on its commands are the caller's: a limit kill is theirs
 
     def _check_offline(self) -> None:
         """Fail closed unless the sandbox has no network interface besides loopback. NetworkPolicy enforcement is
@@ -261,14 +290,49 @@ class K8sSandbox:
 
     def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
                 login: bool = True) -> dict:
-        """Returns {output, returncode, reason}; reason is ok / client_timeout."""
+        """Returns {output, returncode, reason}; reason is ok / client_timeout. Raises SandboxLimitError when the
+        Pod was killed for its own memory or ephemeral-storage limit (by this command or an earlier one), plain
+        SandboxError for any other exec failure."""
         if not self.started:
             raise SandboxError('sandbox not started')
-        out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw, login), timeout + 30)
+        try:
+            out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw, login), timeout + 30)
+        except SandboxError as e:
+            self._raise_if_limited(e)
+            raise
         if self.has_timeout and not raw and rc == 124:
             timed_out = True
+        if rc in KILLED_RC and not timed_out and self.handed_out:
+            self._check_alive()
         return {'output': out[:OUTPUT_CAP_BYTES].decode('utf-8', 'replace'), 'returncode': rc,
                 'reason': 'client_timeout' if timed_out else 'ok'}
+
+    def _check_alive(self) -> None:
+        """A command came back SIGKILLed: an ordinary exit status unless the container itself died with it."""
+        try:
+            self.exec_fn(self.name, ['true'], 30)
+        except SandboxError as e:
+            self._raise_if_limited(e)
+            raise
+
+    def _raise_if_limited(self, err: Exception) -> None:
+        """After a failed exec: raise SandboxLimitError if the Pod status shows (within limit_wait, since the kubelet
+        reports an eviction or OOM kill some seconds late) that its own limit killed it; otherwise return. Before
+        start() hands the sandbox out only our own probes have run, so nothing is attributed then."""
+        if not self.handed_out:
+            return
+        deadline = time.monotonic() + self.limit_wait
+        while True:
+            try:
+                pod = self.api.read_namespaced_pod(self.name, self.ns)
+            except Exception:  # noqa: BLE001  gone or unreadable: cannot be attributed to the sandbox's own limits
+                return
+            why = limit_reason(pod)
+            if why:
+                raise SandboxLimitError(why) from err
+            if pod.status.phase in ('Failed', 'Succeeded') or time.monotonic() > deadline:
+                return
+            time.sleep(self.poll)
 
     def copy_text_to(self, text: str, remote_path: str):
         data = text.encode('utf-8')

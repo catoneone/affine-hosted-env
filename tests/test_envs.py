@@ -9,7 +9,7 @@ from conftest import make_swe_tasks
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, GradeError, truncate_middle
 from hosted_env.envs.swe import future_commits, protected_paths
-from hosted_env.providers.sandbox import LocalSandbox
+from hosted_env.providers.sandbox import LocalSandbox, SandboxLimitError
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
 
 
@@ -190,6 +190,46 @@ def test_patch_problems_are_the_models_own_zero(tmp_path):
     g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
                   'head -c 3000 /dev/urandom > blob.bin')
     assert g['reward'] == 1.0 and 'GIT binary patch' in g['model_patch']   # binary files carry over
+
+
+class LimitedSandbox(LocalSandbox):
+    """LocalSandbox that reports a limit kill (as K8sSandbox does) on one command, or on every command once dead."""
+    def __init__(self, *a, fail_on=None, dead=False, **kw):
+        super().__init__(*a, **kw)
+        self.fail_on, self.dead = fail_on, dead
+
+    def execute(self, command, *a, **kw):
+        if self.dead or command == self.fail_on:
+            raise SandboxLimitError('ephemeral-storage limit: Pod ephemeral local storage usage exceeds the total '
+                                    'limit of containers 10Gi.')
+        return super().execute(command, *a, **kw)
+
+
+def open_limited(env, task, tmp_path, **kw):
+    return env.open(env.public_spec(task), lambda image, cwd: LimitedSandbox(image, cwd, base_dir=str(tmp_path), **kw))
+
+
+def test_rollout_container_killed_for_its_limit_scores_0(tmp_path):
+    env, task = make_task(tmp_path)
+    s = open_limited(env, task, tmp_path)
+    s.setup()
+    s.sb.dead = True                                                   # its commands got it evicted
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert (g['reward'], g['model_patch']) == (0.0, '')
+    assert g['grade_detail'].startswith('rollout_sandbox_limit: ephemeral-storage limit')
+
+
+def test_tests_killed_for_the_grading_containers_limit_score_0(tmp_path):
+    env, task = make_task(tmp_path)
+    gi = env.grade_inputs(task)
+    s = open_limited(env, task, tmp_path, fail_on=gi['test_command'])   # only the hidden tests trip the limit
+    s.setup()
+    assert s.sb.execute('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')['returncode'] == 0
+    g = s.grade(gi)
+    s.close()
+    assert g['reward'] == 0.0 and g['grade_detail'].startswith('grader_sandbox_limit: ephemeral-storage limit')
+    assert 'a + b' in g['model_patch'] and g.get('verifier_returncode') is None
 
 
 def test_protected_paths_rules():

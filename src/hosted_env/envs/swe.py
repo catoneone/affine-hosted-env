@@ -17,6 +17,7 @@ import re
 import shlex
 import time
 
+from ..providers.sandbox.base import SandboxLimitError
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
 
 _RESIDUE_SCRUB_GLOBAL = (
@@ -215,12 +216,14 @@ class SweEnv(DockerTaskEnv):
         repo = s.spec['cwd']
         try:
             end_tree = self._tree(s.sb, repo, s.state['base'])
+            r = s.sb.execute(f'set -o pipefail; git diff --binary --no-color --no-ext-diff --no-textconv '
+                             f'{s.state["start_tree"]} {end_tree} 2>/dev/null '
+                             f'| head -c {MAX_MODEL_PATCH_BYTES + 1} | base64 | tr -d "\\n"',
+                             cwd=repo, timeout=300, login=False)
         except SetupError:
             return b'', 'model_patch_capture_failed'      # e.g. the model deleted .git
-        r = s.sb.execute(f'set -o pipefail; git diff --binary --no-color --no-ext-diff --no-textconv '
-                         f'{s.state["start_tree"]} {end_tree} 2>/dev/null '
-                         f'| head -c {MAX_MODEL_PATCH_BYTES + 1} | base64 | tr -d "\\n"',
-                         cwd=repo, timeout=300, login=False)
+        except SandboxLimitError as e:                    # the model's commands blew its memory / disk limit
+            return b'', f'rollout_sandbox_limit: {e}'
         try:
             data = base64.b64decode(r['output'].strip(), validate=True)
         except ValueError:
@@ -447,7 +450,11 @@ fi
                 res['lock_seconds'] = self._lock_down(sb, repo, test_paths)
                 test_cmd = as_grader(test_cmd)
             t0 = time.time()
-            r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
+            try:
+                r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
+            except SandboxLimitError as e:                  # the tests run the model's code: its limit, its 0
+                return {**res, 'grade_detail': f'grader_sandbox_limit: {e}', 'test_seconds': round(time.time() - t0, 1),
+                        'reverted_paths': reverted}
             return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                     'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
                     'test_output': r['output'][-3000:], 'reverted_paths': reverted}

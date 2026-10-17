@@ -15,6 +15,13 @@ class SandboxError(RuntimeError):
     model's fault."""
 
 
+class SandboxLimitError(SandboxError):
+    """The sandbox was killed for going over a limit set on it alone (memory: OOMKilled; ephemeral storage: evicted
+    for its own usage). Only the commands run inside it could cause that, so a rollout scores 0 instead of being
+    voided as an infra error; otherwise a model could void any rollout it expects to fail by filling the disk or
+    the memory. A node-wide eviction (the node low on a resource) is not this: it stays a plain SandboxError."""
+
+
 class Sandbox(Protocol):
     def start(self) -> None:
         """Create the container and make it ready for commands."""
