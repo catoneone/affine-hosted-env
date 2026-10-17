@@ -9,7 +9,7 @@ from conftest import make_swe_tasks
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, GradeError, truncate_middle
 from hosted_env.envs.swe import TEST_PATCH_REMOTE, future_commits, protected_paths
-from hosted_env.providers.sandbox import LocalSandbox, SandboxLimitError
+from hosted_env.providers.sandbox import LocalSandbox, SandboxCommandError, SandboxLimitError
 from hosted_env.toolcall import parse_tool_calls, split_reasoning
 
 
@@ -193,15 +193,20 @@ def test_patch_problems_are_the_models_own_zero(tmp_path):
 
 
 class LimitedSandbox(LocalSandbox):
-    """LocalSandbox that reports a limit kill (as K8sSandbox does) on one command, or on every command once dead."""
-    def __init__(self, *a, fail_on=None, dead=False, **kw):
+    """LocalSandbox that reports a sandbox failure (`err`, default SandboxLimitError) on one command, or on every
+    command once dead -- as K8sSandbox does for an own-limit kill or a command that cannot launch."""
+    def __init__(self, *a, fail_on=None, dead=False, err=SandboxLimitError, **kw):
         super().__init__(*a, **kw)
-        self.fail_on, self.dead = fail_on, dead
+        self.fail_on, self.dead, self.err = fail_on, dead, err
+
+    def _boom(self):
+        raise self.err('ephemeral-storage limit: Pod ephemeral local storage usage exceeds the total '
+                       'limit of containers 10Gi.' if self.err is SandboxLimitError
+                       else 'command could not start in the container: exec "sh": not found')
 
     def execute(self, command, *a, **kw):
         if self.dead or command == self.fail_on:
-            raise SandboxLimitError('ephemeral-storage limit: Pod ephemeral local storage usage exceeds the total '
-                                    'limit of containers 10Gi.')
+            self._boom()
         return super().execute(command, *a, **kw)
 
 
@@ -218,6 +223,17 @@ def test_rollout_container_killed_for_its_limit_scores_0(tmp_path):
     s.close()
     assert (g['reward'], g['model_patch']) == (0.0, '')
     assert g['grade_detail'].startswith('rollout_sandbox_limit: ephemeral-storage limit')
+
+
+def test_rollout_container_with_a_deleted_shell_scores_0(tmp_path):
+    # the model deleted /bin/sh: reading its tree can't launch -> model_patch_capture_failed, reward 0, not void
+    env, task = make_task(tmp_path)
+    s = open_limited(env, task, tmp_path, err=SandboxCommandError)
+    s.setup()
+    s.sb.dead = True
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert (g['reward'], g['model_patch'], g['grade_detail']) == (0.0, '', 'model_patch_capture_failed')
 
 
 def test_tests_killed_for_the_grading_containers_limit_score_0(tmp_path):

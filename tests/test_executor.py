@@ -203,6 +203,25 @@ def test_sandbox_limit_in_a_tool_call_scores_0_not_void(rig, monkeypatch):
     assert store.db.execute('SELECT state FROM tasks WHERE task_id=?', (t['task_id'],)).fetchone()[0] != 'void'
 
 
+def test_sandbox_command_failure_in_a_tool_call_scores_0_not_void(rig, monkeypatch):
+    """The model deletes a binary exec needs (/bin/sh): the next command cannot launch. That is the model's own
+    doing, so the rollout is unresolved / 0, never voided."""
+    from hosted_env.envs.base import EnvSession
+    from hosted_env.providers.sandbox import SandboxCommandError
+    w, store, r, rt, session, wkey = rig
+    t, (s,) = session()
+
+    def broke_its_shell(sess, name, arguments):
+        raise SandboxCommandError('command could not start in the container: exec "sh": not found')
+    monkeypatch.setattr(EnvSession, 'call_tool', broke_its_shell)
+    res = [w.start(s['token']).result(30)]
+    res.append(w.turn(s['token'], 1, enc(r, FIX)).result(30))
+    last = res[-1]
+    assert (last['done'], last['outcome'], last['reward']) == (True, 'unresolved', 0.0)
+    assert last['detail'].startswith('sandbox_command_failed: ')
+    assert store.db.execute('SELECT state FROM tasks WHERE task_id=?', (t['task_id'],)).fetchone()[0] != 'void'
+
+
 def test_wrong_worker_and_bad_token(rig):
     w, store, r, rt, session, wkey = rig
     _, (s,) = session()

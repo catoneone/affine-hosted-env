@@ -32,7 +32,7 @@ from ..common import canonical, key_id, sha256_hex
 from ..envs import SetupError
 from ..receipt import TrajectoryHasher, receipt_digest, sign_receipt
 from ..render import TemplateRenderer
-from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox, SandboxLimitError
+from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox, SandboxCommandError, SandboxLimitError
 from ..providers.sandbox.k8s import K8sSandbox
 from ..toolcall import parse_tool_calls, split_reasoning
 from .gateway_client import GatewayRejected, GatewayUnavailable, WorkerGatewayClient
@@ -392,6 +392,9 @@ class Worker:
         except SandboxLimitError as e:   # its own commands blew the sandbox's memory / disk limit: scored 0 (the
             log.info('sandbox limit for %s: %s', s.sid, e)   # grader finds the container dead), never voided
             return self._finish(s, seq, 'unresolved', f'sandbox_limit: {e}'[:500])
+        except SandboxCommandError as e:   # the model deleted a binary exec needs (/bin/sh): its own doing, 0 not void
+            log.info('sandbox command failure for %s: %s', s.sid, e)
+            return self._finish(s, seq, 'unresolved', f'sandbox_command_failed: {e}'[:500])
         except Exception as e:  # noqa: BLE001  state already changed, the client must not retry; always record an infra error
             log.exception('turn failed for %s', s.sid)
             return self._finish(s, seq, 'infra_error', f'{type(e).__name__}: {e}'[:500])

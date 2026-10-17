@@ -16,13 +16,14 @@ API object and an `exec_fn`.
 from __future__ import annotations
 
 import base64
+import json
 import re
 import threading
 import time
 import uuid
 from collections.abc import Callable
 
-from .base import OUTPUT_CAP_BYTES, SandboxError, SandboxLimitError
+from .base import OUTPUT_CAP_BYTES, SandboxError, SandboxCommandError, SandboxLimitError
 from .docker import ENV_PROBE
 
 MANAGED_BY = {'app.kubernetes.io/managed-by': 'hosted-env'}
@@ -168,6 +169,45 @@ def limit_reason(pod) -> str | None:
     return None
 
 
+def _parse_exit_status(raw: str) -> int:
+    """A finished exec's exit code, from the error-channel status (JSON) the API server sends at close. Raises
+    SandboxCommandError when the status is a Failure that carries no exit code -- the OCI runtime could not start
+    the program (e.g. its executable was deleted). The kubernetes client's own `returncode` raises KeyError /
+    ValueError on exactly that case, which is why we parse the status ourselves."""
+    if not raw:
+        return 0
+    try:
+        status = json.loads(raw) or {}
+    except ValueError:
+        return 0
+    if status.get('status') == 'Success':
+        return 0
+    for cause in (status.get('details') or {}).get('causes') or []:
+        if cause.get('reason') == 'ExitCode':
+            try:
+                return int(cause.get('message'))
+            except (TypeError, ValueError):
+                break
+    raise SandboxCommandError(f'command could not start in the container: {status.get("message", "exec failed")}'[:200])
+
+
+def _exit_code(resp) -> int:
+    """resp's exit code, reading the exec error channel directly (not resp.returncode, which raises on a launch
+    failure instead of telling it apart from a clean exit)."""
+    try:
+        from kubernetes.stream.ws_client import ERROR_CHANNEL
+        raw = resp.read_channel(ERROR_CHANNEL)
+    except SandboxCommandError:
+        raise
+    except Exception:  # noqa: BLE001  channel API unavailable: fall back to the client's own parse
+        try:
+            rc = resp.returncode
+            return -1 if rc is None else int(rc)
+        except Exception as e:  # noqa: BLE001  the launch-failure case the client cannot parse
+            raise SandboxCommandError(f'command could not start in the container: {e}'[:200]) from None
+    return _parse_exit_status(raw)
+
+
 def ws_exec(api, namespace: str) -> ExecFn:
     """exec_fn backed by the Kubernetes exec API (needs the `kubernetes` package).
 
@@ -217,11 +257,14 @@ def ws_exec(api, namespace: str) -> ExecFn:
                               resp.read_stderr() if resp.peek_stderr() else ''):
                     if chunk and len(buf) < OUTPUT_CAP_BYTES:
                         buf.extend(chunk.encode('utf-8', 'replace')[:OUTPUT_CAP_BYTES - len(buf)])
-            rc = -1 if timed_out else (resp.returncode if resp.returncode is not None else -1)
-        except Exception as e:  # noqa: BLE001  e.g. a status frame without 'details' from a container that died
-            raise SandboxError(f'exec stream failed: {type(e).__name__}: {e}'[:300]) from None   # mid-exec (KeyError)
-        finally:
+            rc = -1 if timed_out else _exit_code(resp)
+        except SandboxCommandError:
             resp.close()
+            raise                                           # the program never launched: not a transport failure
+        except Exception as e:  # noqa: BLE001  the websocket itself dropped mid-stream: transport, infra
+            resp.close()
+            raise SandboxError(f'exec stream failed: {type(e).__name__}: {e}'[:300]) from None
+        resp.close()
         return bytes(buf), rc, timed_out
     return run
 
@@ -321,6 +364,8 @@ class K8sSandbox:
         t0 = time.monotonic()
         try:
             out, rc, timed_out = self.exec_fn(self.name, self._argv(command, cwd, timeout, raw, login), timeout + 30)
+        except SandboxCommandError:
+            raise                                   # the command could not launch (e.g. the model deleted /bin/sh)
         except SandboxError as e:
             self._raise_if_limited(e)
             raise
@@ -332,12 +377,20 @@ class K8sSandbox:
                 'reason': 'client_timeout' if timed_out else 'ok'}
 
     def _check_alive(self) -> None:
-        """A command came back SIGKILLed: an ordinary exit status unless the container itself died with it."""
+        """A command came back SIGKILLed (137): that command's own exit code unless the container itself died.
+        Reads the Pod status rather than exec'ing a probe binary -- the model is root in its rollout container and
+        could delete whatever we probed, turning its own kill into an infra error (void)."""
         try:
-            self.exec_fn(self.name, ['true'], 30)
-        except SandboxError as e:
-            self._raise_if_limited(e)
-            raise
+            pod = self.api.read_namespaced_pod(self.name, self.ns)
+        except Exception:  # noqa: BLE001  status unreadable: treat 137 as the command's own exit code
+            return
+        why = limit_reason(pod)
+        if why:
+            raise SandboxLimitError(why)
+        for cs in getattr(pod.status, 'container_statuses', None) or []:
+            term = getattr(cs.state, 'terminated', None) if getattr(cs, 'state', None) else None
+            if term is not None:                    # the container is gone with no limit reason: an infra failure
+                raise SandboxError(f'container terminated: {term.reason}')
 
     def _raise_if_limited(self, err: Exception) -> None:
         """After a failed exec: raise SandboxLimitError if the Pod status shows (within limit_wait, since the kubelet
@@ -366,6 +419,8 @@ class K8sSandbox:
             argv = ['sh', '-c', f'printf %s "$1" | base64 -d {op} "$2"', 'sh', b64, remote_path]
             try:
                 out, rc, _ = self.exec_fn(self.name, argv, 120)
+            except SandboxCommandError:
+                raise                                    # the shell to write with is gone: the caller's own doing
             except SandboxError as e:                    # like execute: a limit kill is attributed, not hidden
                 self._raise_if_limited(e)
                 raise

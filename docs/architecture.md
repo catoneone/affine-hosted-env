@@ -80,6 +80,9 @@ rollout 0 (`sandbox_limit`, `rollout_sandbox_limit` or `grader_sandbox_limit`) i
 model cannot void a rollout it expects to fail by filling the memory or the disk. A node-pressure eviction or any
 other sandbox failure is still an infra error. Under gVisor both limits are enforced (EXP-018): an over-limit
 allocation is SIGKILLed (exit 137) and the container OOMKilled; an over-limit write is evicted ~15-20 s later.
+A command that cannot be launched because the model deleted a binary exec needs (e.g. /bin/sh) is likewise the
+model's own doing, not an infra error. This attribution assumes gVisor, where an overrun OOMKills the whole
+container; under runc an OOM may kill only the offending process.
 
 ## Cluster
 - k3s. The control plane runs on a stable dual-stack host. Avoid a boat sandbox for this role: it was IPv6-only

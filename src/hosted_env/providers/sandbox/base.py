@@ -22,6 +22,13 @@ class SandboxLimitError(SandboxError):
     the memory. A node-wide eviction (the node low on a resource) is not this: it stays a plain SandboxError."""
 
 
+class SandboxCommandError(SandboxError):
+    """A command could not be LAUNCHED in the container -- the OCI runtime refused to start it, e.g. its executable
+    was deleted. The container and the transport are fine; only this command never ran. After the sandbox is
+    handed out this is the caller's own doing (a model that is root in its rollout container can delete /bin/sh),
+    so it scores the rollout 0 rather than voiding it. Before hand-out it means the image is broken (infra)."""
+
+
 class Sandbox(Protocol):
     def start(self) -> None:
         """Create the container and make it ready for commands."""

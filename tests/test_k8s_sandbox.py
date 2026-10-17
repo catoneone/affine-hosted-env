@@ -6,9 +6,9 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from hosted_env.providers.sandbox import SandboxError, SandboxLimitError
-from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, ensure_network_policies, limit_reason,
-                                              network_policy_manifest, pod_manifest)
+from hosted_env.providers.sandbox import SandboxError, SandboxCommandError, SandboxLimitError
+from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, _parse_exit_status, ensure_network_policies,
+                                              limit_reason, network_policy_manifest, pod_manifest)
 
 
 class ApiErr(Exception):
@@ -204,6 +204,12 @@ def raises(msg):
     return act
 
 
+def raises_cmd(msg):
+    def act():
+        raise SandboxCommandError(msg)
+    return act
+
+
 def started(tmp_path, then, **plan):
     """A started sandbox whose Pod reads as `then` from now on."""
     core = FakeCore()
@@ -272,6 +278,51 @@ def test_zero_disk_and_units():
         'resources']['limits']
     lim = pod_manifest('p', 'i', '/w', namespace='n', memory='2G', disk='10G')['spec']['containers'][0]['resources']
     assert lim['limits'] == {'cpu': '1', 'memory': '2G', 'ephemeral-storage': '10G'}   # upper case: k8s decimal
+
+
+def test_parse_exit_status():
+    assert _parse_exit_status('') == 0
+    assert _parse_exit_status('{"status":"Success"}') == 0
+    nonzero = '{"status":"Failure","reason":"NonZeroExitCode","details":{"causes":[{"reason":"ExitCode","message":"137"}]}}'
+    assert _parse_exit_status(nonzero) == 137
+    oci = ('{"status":"Failure","message":"OCI runtime exec failed: exec failed: unable to start container '
+           'process: exec: \\"sh\\": executable file not found in $PATH","reason":"InternalError"}')
+    with pytest.raises(SandboxCommandError, match='could not start'):
+        _parse_exit_status(oci)
+
+
+def test_command_that_cannot_launch_is_a_command_error_not_infra(tmp_path):
+    # the model deleted /bin/sh: exec cannot start, but the Pod is alive -- not an infra failure, and no limit poll
+    sb = started(tmp_path, _pod(), gone=raises_cmd('command could not start in the container: ... "sh" ...'))
+    sb.limit_wait = 999                                           # must NOT be reached: a command error does not poll
+    with pytest.raises(SandboxCommandError):
+        sb.execute('gone')
+
+
+def test_check_alive_reads_status_not_a_probe_binary(tmp_path):
+    # 137 with a live container: that command's own exit code (no exec of a model-deletable probe)
+    sb = started(tmp_path, _pod(), kill=lambda: (b'', 137, False))
+    assert sb.execute('kill')['returncode'] == 137
+    # 137 with the container OOMKilled: a limit kill
+    sb = started(tmp_path, _dead(terminated='OOMKilled'), kill=lambda: (b'', 137, False))
+    with pytest.raises(SandboxLimitError):
+        sb.execute('kill')
+    # 137 with the container terminated for another reason: infra
+    sb = started(tmp_path, _dead(terminated='Error'), kill=lambda: (b'', 137, False))
+    with pytest.raises(SandboxError) as e:
+        sb.execute('kill')
+    assert not isinstance(e.value, SandboxLimitError)
+
+
+def test_copy_text_to_passes_a_command_error_through(tmp_path):
+    def copy_cannot_launch(pod, argv, timeout):
+        if 'base64 -d' in argv[2]:
+            raise SandboxCommandError('command could not start in the container')
+        return offline_exec()(pod, argv, timeout)
+    sb = make(tmp_path, exec_fn=copy_cannot_launch, limit_wait=999)
+    sb.start()
+    with pytest.raises(SandboxCommandError):
+        sb.copy_text_to('x', '/tmp/f')
 
 
 def test_executor_builds_k8s_sandboxes(tmp_path):

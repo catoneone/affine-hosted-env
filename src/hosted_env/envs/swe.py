@@ -17,7 +17,7 @@ import re
 import shlex
 import time
 
-from ..providers.sandbox.base import SandboxLimitError
+from ..providers.sandbox.base import SandboxCommandError, SandboxLimitError
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
 
 _RESIDUE_SCRUB_GLOBAL = (
@@ -222,6 +222,8 @@ class SweEnv(DockerTaskEnv):
                              cwd=repo, timeout=300, login=False)
         except SetupError:
             return b'', 'model_patch_capture_failed'      # e.g. the model deleted .git
+        except SandboxCommandError:
+            return b'', 'model_patch_capture_failed'      # the model deleted a binary exec needs (/bin/sh, git)
         except SandboxLimitError as e:                    # the model's commands blew its memory / disk limit
             return b'', f'rollout_sandbox_limit: {e}'
         try:
@@ -461,6 +463,11 @@ fi
             if not untrusted:                               # only our own setup had run: not the model's doing
                 raise GradeError(f'grading container hit a limit during setup: {e}') from None
             return {**res, 'grade_detail': f'grader_sandbox_limit: {e}', 'reverted_paths': reverted,
+                    **({'test_seconds': round(time.time() - t0, 1)} if t0 else {})}
+        except SandboxCommandError as e:
+            if not untrusted:                               # a broken grading image, before any model bytes: infra
+                raise GradeError(f'grading container command would not start during setup: {e}') from None
+            return {**res, 'grade_detail': f'grader_sandbox_command_failed: {e}', 'reverted_paths': reverted,
                     **({'test_seconds': round(time.time() - t0, 1)} if t0 else {})}
         except SetupError as e:
             raise GradeError(f'grading container setup failed: {e}') from None
