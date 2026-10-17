@@ -15,10 +15,10 @@ def _run(c, cwd):
     return subprocess.run(['bash', '-c', c], cwd=cwd, check=True, capture_output=True, text=True, env=GIT_ENV)
 
 
-def make_swe_tasks(tmp_path, n=1):
+def make_swe_tasks(tmp_path, n=1, script=None):
     """The initial commit's calc.py has a bug; refs/remotes/origin/master points at the "future" fix commit
-    (simulating a class C image leak). test_patch adds hidden tests and mimo_test_command.sh. Returns
-    (task file path, [task ids]); each task's image is the template directory."""
+    (simulating a class C image leak). test_patch adds hidden tests and mimo_test_command.sh (`script` replaces
+    its default body). Returns (task file path, [task ids]); each task's image is the template directory."""
     tpl = tmp_path / 'tpl'
     tpl.mkdir(exist_ok=True)
     _run('git init -q -b master && printf "def add(a, b):\\n    return a - b\\n" > calc.py && git add -A && '
@@ -27,9 +27,9 @@ def make_swe_tasks(tmp_path, n=1):
          'git branch -D fix -q', tpl)
     tp = tmp_path / 'tp'
     tp.mkdir(exist_ok=True)
+    (tp / 'mimo_test_command.sh').write_text(script or 'cd "$(dirname "$0")" && PYTHONPATH=. python3 tests/test_calc.py\n')
     test_patch = _run('git init -q && mkdir tests && '
                       'printf \'from calc import add\\nassert add(2, 3) == 5\\nprint("ok")\\n\' > tests/test_calc.py && '
-                      'printf \'cd "$(dirname "$0")" && PYTHONPATH=. python3 tests/test_calc.py\\n\' > mimo_test_command.sh && '
                       'git add -A && git diff --cached --no-color', tp).stdout
     ids = [f'fake-{i}' for i in range(n)]
     path = tmp_path / 'tasks.jsonl'
