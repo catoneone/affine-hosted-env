@@ -37,7 +37,7 @@ class InProcGateway:
 @pytest.fixture
 def rig(tmp_path):
     path, ids = make_swe_tasks(tmp_path, n=4)
-    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}
+    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root', 'require_image_digest': False}
     gkey, wkey = SigningKey.generate(), SigningKey.generate()
     store = Store(str(tmp_path / 'g.db'), {'swe': SweEnv('swe', cfg)}, gkey, Limits())
     r = CharRenderer()

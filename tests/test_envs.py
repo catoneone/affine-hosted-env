@@ -63,7 +63,8 @@ def test_tool_schema_matches_official():
 
 def make_task(tmp_path):
     path, ids = make_swe_tasks(tmp_path)
-    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root'}), ids[0]
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root',
+                          'require_image_digest': False}), ids[0]
 
 
 def open_local(env, task, tmp_path):
@@ -455,7 +456,8 @@ def _rich_task(tmp_path):
     path.write_text(json.dumps({'id': 'rich', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'python',
                                 'problem_statement': 'add() subtracts', 'test_patch': test_patch,
                                 'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
-    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root'}), 'rich'
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
+                          'require_image_digest': False}), 'rich'
 
 
 @pytest.mark.parametrize('shape', [

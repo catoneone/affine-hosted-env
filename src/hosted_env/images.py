@@ -3,8 +3,8 @@ regrade) runs the exact same bytes: a tag can be moved, `name@sha256:...` cannot
 
 `pin_tasks` rewrites a task file's `image` from `name:tag` to `name@sha256:<digest>` (keeping the tag as
 `image_tag`), asking the registry for the manifest digest with a HEAD request (Docker Registry HTTP API v2,
-anonymous token for Docker Hub). Already pinned rows are left alone. Envs can refuse unpinned images with
-`require_image_digest = true`.
+anonymous token for Docker Hub). Already pinned rows are left alone. Envs refuse unpinned images by default
+(`require_image_digest`, default true); set it to false only for local development with tag images.
 """
 from __future__ import annotations
 

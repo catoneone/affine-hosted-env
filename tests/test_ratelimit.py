@@ -72,7 +72,7 @@ def gw(tmp_path):
     p = tmp_path / 't.jsonl'
     p.write_text(json.dumps({'id': 't0', 'image': 'img', 'cwd': '/w', 'problem_statement': 'p',
                              'test_command': 'true'}) + '\n')
-    env = DockerTaskEnv('env', {'tasks': str(p), 'group_size': 8})
+    env = DockerTaskEnv('env', {'tasks': str(p), 'group_size': 8, 'require_image_digest': False})
     miner = SigningKey.generate()
     roster = tmp_path / 'roster.json'
     roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {'5H0': {'uid': 0,
