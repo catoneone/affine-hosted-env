@@ -119,7 +119,8 @@ def graded(tmp_path, *cmds, in_place_check=False, image_prep=None):
 def test_honest_fix_scores_and_is_kept(tmp_path):
     g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
                   'printf "notes\\n" > NOTES.md', 'mkdir -p pkg && printf "x = 1\\n" > pkg/helper.py')
-    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v2' and g['reverted_paths'] == []
+    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v3' and g['reverted_paths'] == []
+    assert g['grader_parsers'].startswith('py')
     assert g['grader_user'] == 'root' and 'lock_seconds' not in g
     assert 'a + b' in g['model_patch'] and 'pkg/helper.py' in g['model_patch']
 
@@ -303,9 +304,176 @@ def test_limit_kill_before_any_model_bytes_is_an_infra_error(tmp_path):
 def test_protected_paths_rules():
     assert protected_paths(['src/app.py', 'src/conftest.py', 'lib/util.go', 'lib/util_test.go', 'README.md',
                             'tests/helpers.py', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
-                            'src/setupTests.ts', 'go.mod']) == [
-        'src/conftest.py', 'lib/util_test.go', 'tests/test_a.py', 'a/b.test.tsx', 'jest.config.js', '.env.test',
-        'src/setupTests.ts', 'go.mod']
+                            'src/setupTests.ts', 'go.mod', 'package.json', 'pkg/testdata/f.bin',
+                            'web/node_modules/.bin/jest', 'vendor/x/y.go', 'setup.py', 'CMakeLists.txt',
+                            'cmake/m.cmake', 'build.gradle.kts', 'test/helpers.js', 'src/vendored/ok.py']) == [
+        'src/conftest.py', 'lib/util_test.go', 'tests/helpers.py', 'tests/test_a.py', 'a/b.test.tsx',
+        'jest.config.js', '.env.test', 'src/setupTests.ts', 'pkg/testdata/f.bin',
+        'web/node_modules/.bin/jest', 'vendor/x/y.go', 'setup.py', 'CMakeLists.txt', 'cmake/m.cmake',
+        'build.gradle.kts', 'test/helpers.js']    # go.mod / package.json: structured, not blanket-reverted here
+
+
+def test_manifest_reverts():
+    from hosted_env.envs.swe import manifest_reverts
+    # package.json: a dependency bump is kept; a change to scripts / jest config reverts
+    base = b'{"name":"p","version":"1.0.0","dependencies":{"left-pad":"1.0.0"},"scripts":{"test":"jest"}}'
+    assert manifest_reverts('package.json', base,
+                            base.replace(b'"left-pad":"1.0.0"', b'"left-pad":"1.3.0"')) is False
+    assert manifest_reverts('package.json', base, base.replace(b'"test":"jest"', b'"test":"true"')) is True
+    assert manifest_reverts('package.json', base, b'{"name":"p"}') is True            # scripts removed
+    assert manifest_reverts('package.json', base, b'not json') is True                # unparseable -> revert
+    # pyproject.toml: a dependency change is kept; a [tool.pytest.ini_options] change reverts
+    tb = b'[project]\nname="p"\ndependencies=["requests==2.0"]\n[tool.pytest.ini_options]\naddopts="-x"\n'
+    assert manifest_reverts('pyproject.toml', tb, tb.replace(b'2.0', b'2.1')) is False
+    assert manifest_reverts('pyproject.toml', tb, tb.replace(b'"-x"', b'"-p no:cacheprovider"')) is True
+    # go.mod: a new require is kept; changing go / toolchain / replace reverts
+    gb = b'module m\n\ngo 1.21\n\nrequire example.com/x v1.2.3\n'
+    assert manifest_reverts('go.mod', gb, gb + b'require example.com/y v0.1.0\n') is False
+    assert manifest_reverts('go.mod', gb, gb.replace(b'go 1.21', b'go 1.22')) is True
+    assert manifest_reverts('go.mod', gb, gb + b'replace example.com/x => ./local\n') is True
+    # setup.cfg: a dependency change kept; a [tool:pytest] change reverts
+    cb = b'[metadata]\nname = p\n[options]\ninstall_requires =\n    requests\n[tool:pytest]\naddopts = -q\n'
+    assert manifest_reverts('setup.cfg', cb, cb.replace(b'requests', b'requests\n    urllib3')) is False
+    assert manifest_reverts('setup.cfg', cb, cb.replace(b'-q', b'-s')) is True
+    # a newly added manifest (no base) with a test-relevant key reverts
+    assert manifest_reverts('package.json', b'', b'{"jest":{"setupFiles":["x"]}}') is True
+    assert manifest_reverts('go.mod', b'', b'module m\ngo 1.21\n') is True            # a new go directive
+
+
+def test_structured_manifest_dependency_change_is_kept(tmp_path):
+    prep = ('printf \'{"name":"p","dependencies":{"left-pad":"1.0.0"},"scripts":{"test":"jest"}}\\n\' '
+            '> package.json')
+    fix = 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'
+    g, _ = graded(tmp_path, fix, 'sed -i.bak "s/1.0.0/1.3.0/" package.json && rm package.json.bak', image_prep=prep)
+    assert g['reward'] == 1.0 and 'package.json' not in g['reverted_paths']    # a dependency bump is kept
+    assert '"left-pad":"1.3.0"' in g['model_patch'] and g['grader_parsers'].startswith('py')
+    g, _ = graded(tmp_path, fix, 'sed -i.bak "s/jest/true/" package.json && rm package.json.bak', image_prep=prep)
+    assert g['reward'] == 1.0 and 'package.json' in g['reverted_paths']        # a scripts change is reverted
+
+
+def test_shadow_added():
+    from hosted_env.envs.swe import shadow_added
+    imp = {'numpy', 'requests'}
+    assert shadow_added(['pytest.py', 'x/pytest.py', '_pytest/foo.py', 'requests.py', 'pkg/helper.py',
+                         'notes.txt', 'pytest_plug.py', 'app.py'], imp) == [
+        'pytest.py', '_pytest/foo.py', 'requests.py', 'pytest_plug.py']
+    assert shadow_added(['sitecustomize.py'], set()) == []        # not importable and not a pytest internal here
+    assert shadow_added(['numpy/__init__.py'], imp) == ['numpy/__init__.py']   # a new top-level numpy/ package
+
+
+def test_command_repo_paths():
+    from hosted_env.envs.swe import command_repo_paths
+    assert command_repo_paths('bash /workspace/repo/mimo_test_command.sh', '/workspace/repo') == \
+        ['mimo_test_command.sh']
+    assert command_repo_paths('cd /testbed && PATH=./bin:$PATH exec bash ./run.sh', '/testbed') == ['bin', 'run.sh']
+    assert command_repo_paths('bash /other/x.sh', '/testbed') == []          # outside the repo
+    assert command_repo_paths('go test ./...', '/workspace/repo') == []
+
+
+def test_shadow_module_at_repo_root_is_reset(tmp_path):
+    fix = 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'
+    g, _ = graded(tmp_path, fix, 'printf "import os\\nos._exit(0)\\n" > pytest.py')   # shadow the test runner
+    assert g['reward'] == 1.0 and 'pytest.py' in g['reverted_paths']
+
+
+def test_jsts_config_refs():
+    from hosted_env.envs.swe import jsts_config_refs
+    pkg = b'{"name":"p","jest":{"setupFiles":["<rootDir>/t/s.js"],"moduleNameMapper":{"^x$":"./t/x.js"},' \
+          b'"testEnvironment":"./t/env.js","reporters":["default",["jest-junit",{}]]}}'
+    assert jsts_config_refs('package.json', pkg, '') == ['t/env.js', 't/s.js', 't/x.js']
+    jc = b'{"setupFilesAfterEnv":["./setup.ts"],"transform":{"^.+\\\\.ts$":"./tools/tr.js"}}'
+    assert jsts_config_refs('jest.config.json', jc, 'web') == ['web/setup.ts', 'web/tools/tr.js']
+    ts = b'{"compilerOptions":{"paths":{"@app/*":["./src/app/*"],"util":["./src/util.ts"]}}}'
+    assert jsts_config_refs('tsconfig.json', ts, '') == ['src/util.ts']   # the glob entry is skipped, the file kept
+    js = b'module.exports = { setupFiles: ["./jest.setup.js"], globalSetup: "<rootDir>/g.js" };'
+    assert jsts_config_refs('jest.config.js', js, '') == ['g.js', 'jest.setup.js']
+    assert jsts_config_refs('package.json', b'{"name":"p"}', '') == []     # no jest config
+
+
+def test_config_referenced_setup_file_is_reset(tmp_path):
+    prep = ('mkdir -p t && printf \'{"name":"p","jest":{"setupFiles":["./t/s.js"]}}\\n\' > package.json; '
+            'printf "// real setup\\n" > t/s.js')
+    fix = 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak'
+    g, _ = graded(tmp_path, fix, 'printf "process.exit(0)\\n" > t/s.js', image_prep=prep)   # edit a referenced setup
+    assert g['reward'] == 1.0 and 't/s.js' in g['reverted_paths']
+
+
+def test_report_verdict():
+    from hosted_env.envs.swe import report_verdict
+    junit = (b'<testsuite><testcase classname="t.test_m" name="test_a"/>'
+             b'<testcase classname="t.test_m" name="test_b"><failure/></testcase>'
+             b'<testcase classname="t.test_m" name="test_c"><skipped/></testcase></testsuite>')
+    assert report_verdict('junit', junit, ['t.test_m::test_a'], [])[0] is True
+    assert report_verdict('junit', junit, ['t.test_m::test_b'], [])[0] is False   # failed
+    assert report_verdict('junit', junit, ['t.test_m::test_c'], [])[0] is False   # skipped != pass
+    assert report_verdict('junit', junit, ['t.test_m::test_missing'], [])[0] is False  # absent
+    assert report_verdict('junit', b'not xml', ['x'], [])[0] is False             # forged / unparseable
+    assert report_verdict('junit', junit, [], [])[0] is False                     # no expected ids
+    go = (b'{"Action":"pass","Test":"TestA"}\n{"Action":"fail","Test":"TestB"}\n'
+          b'{"Action":"skip","Test":"TestC"}\n')
+    assert report_verdict('gotest', go, ['TestA'], [])[0] is True
+    assert report_verdict('gotest', go, ['TestA', 'TestB'], [])[0] is False
+    jest = (b'{"testResults":[{"assertionResults":['
+            b'{"fullName":"s a","status":"passed"},{"fullName":"s b","status":"failed"},'
+            b'{"fullName":"s c","status":"pending"}]}]}')
+    assert report_verdict('jest', jest, ['s a'], [])[0] is True
+    assert report_verdict('jest', jest, ['s a', 's c'], [])[0] is False
+    assert report_verdict('whatnot', b'', ['x'], [])[0] is False
+    # a later passing case cannot mask an earlier fail/skip that collapses to the same id (fail-closed)
+    collide = (b'<testsuite><testcase classname="repo.tests.test_calc" name="test_add"><failure/></testcase>'
+               b'<testcase classname="evil.pkg.tests.test_calc" name="test_add"/></testsuite>')
+    assert report_verdict('junit', collide, ['tests/test_calc.py::test_add'], [])[0] is False
+    go2 = b'{"Action":"fail","Test":"TestA"}\n{"Action":"pass","Test":"TestA"}\n'
+    assert report_verdict('gotest', go2, ['TestA'], [])[0] is False
+
+
+def _pytest_task(tmp_path):
+    """A task whose hidden tests run under pytest, with a JUnit second check and expected test ids."""
+    import json as _json
+    import subprocess
+    from hosted_env.envs import SweEnv
+    d = tmp_path / f'pt{len(list(tmp_path.iterdir()))}'
+    d.mkdir()
+    tpl = d / 'tpl'
+    tpl.mkdir()
+    subprocess.run(['bash', '-c',
+                    'git init -q -b master && printf "def add(a, b):\\n    return a - b\\n" > calc.py && '
+                    'git add -A && git -c user.email=t@t -c user.name=t commit -qm base'], cwd=tpl, check=True)
+    tp = d / 'tp'
+    tp.mkdir()
+    tpatch = subprocess.run(['bash', '-c',
+                             'git init -q && mkdir tests && printf "from calc import add\\n'
+                             'def test_add(): assert add(2,3)==5\\ndef test_zero(): assert add(0,0)==0\\n" '
+                             '> tests/test_calc.py && printf \'cd "$(dirname "$0")" && PYTHONPATH=. '
+                             'python3 -m pytest tests/test_calc.py\\n\' > mimo_test_command.sh && git add -A && '
+                             'git diff --cached --no-color'], cwd=tp, check=True, capture_output=True, text=True).stdout
+    path = d / 'tasks.jsonl'
+    path.write_text(_json.dumps({'id': 'pt', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'python',
+                                 'problem_statement': 'add subtracts', 'test_patch': tpatch,
+                                 'test_command': 'bash /testbed/mimo_test_command.sh', 'report_kind': 'junit',
+                                 'fail_to_pass': ['tests/test_calc.py::test_add'],
+                                 'pass_to_pass': ['tests/test_calc.py::test_zero']}) + '\n')
+    return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
+                          'require_image_digest': False}), 'pt', str(d)
+
+
+def test_second_check_requires_the_expected_tests_to_pass(tmp_path):
+    env, task, base = _pytest_task(tmp_path)
+    gi = env.grade_inputs(task)
+    assert gi['report_kind'] == 'junit' and gi['fail_to_pass'] == ['tests/test_calc.py::test_add']
+    # honest fix: both expected tests pass -> reward 1 and second_check True
+    s = env.open(env.public_spec(task), lambda image, cwd: LocalSandbox(image, cwd, base_dir=base))
+    s.setup()
+    assert s.sb.execute('sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')['returncode'] == 0
+    g = s.grade(gi)
+    s.close()
+    assert g['reward'] == 1.0 and g['second_check'] is True
+    # no fix: test_add fails -> exit nonzero and the second check also fails -> 0
+    s = env.open(env.public_spec(task), lambda image, cwd: LocalSandbox(image, cwd, base_dir=base))
+    s.setup()
+    g = s.grade(env.grade_inputs(task))
+    s.close()
+    assert g['reward'] == 0.0 and g.get('second_check') is False
 
 
 def test_image_whose_tree_differs_from_its_head(tmp_path):

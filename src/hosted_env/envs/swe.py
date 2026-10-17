@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
+import secrets
 import shlex
+import sys
 import time
 
 from ..providers.sandbox.base import SandboxCommandError, SandboxLimitError
@@ -116,7 +119,7 @@ GRADER_UID = 65534                     # nobody: the hidden tests run without ro
 DROP_PRIVS = f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups --no-new-privs --'
 GRADER_BASH = 'bash --noprofile --norc -c'   # the drop probes run under exactly what the test command runs under
 MAX_MODEL_PATCH_BYTES = 2_000_000
-GRADER_VERSION = 'isolated-v2'         # v1: isolated container, tests as root; v2: tests as GRADER_UID unless opted out
+GRADER_VERSION = 'isolated-v3'         # v1: tests as root; v2: tests as GRADER_UID; v3: structured manifests, wider revert
 
 
 def as_grader(command: str) -> str:
@@ -130,26 +133,399 @@ def as_grader(command: str) -> str:
 # These are files that decide how tests are collected, configured or reported rather than the code under test.
 _PROTECTED_NAMES = {
     # python: pytest/tox/nox configuration, conftest plugins, interpreter start-up hooks
-    'conftest.py', 'pytest.ini', '.pytest.ini', 'tox.ini', 'setup.cfg', 'pyproject.toml', 'noxfile.py',
+    'conftest.py', 'pytest.ini', '.pytest.ini', 'tox.ini', 'noxfile.py',
     'sitecustomize.py', 'usercustomize.py',
-    # go: module graph (replace directives) and workspace
-    'go.mod', 'go.sum', 'go.work', 'go.work.sum',
-    # js/ts: package scripts and test-runner / transpiler configuration
-    'package.json', '.npmrc', '.babelrc', '.babelrc.json', '.babelrc.js',
+    # go: the workspace graph (go.mod is handled structurally; go.sum is never reverted -- it can only break a build)
+    'go.work', 'go.work.sum',
+    # js/ts: test-runner / transpiler configuration (package.json is handled structurally)
+    '.npmrc', '.yarnrc', '.yarnrc.yml', '.babelrc', '.babelrc.json', '.babelrc.js',
+    # build files that are code (a fix does not need to change how the project builds)
+    'setup.py', 'CMakeLists.txt', 'build.gradle', 'build.gradle.kts',
     # generic: the grading entry points, build entry points, attributes that change how patches apply
     'mimo_test_command.sh', 'test_commands.json', 'Makefile', 'makefile', 'GNUmakefile', '.gitattributes',
     '.gitmodules',
 }
+# a path with any of these as a DIRECTORY component is test infrastructure or a vendored dependency tree, which a
+# correct fix never needs to change; the whole subtree is reset to the base commit before the hidden tests run.
+_PROTECTED_DIRS = {'tests', 'test', 'testdata', '__tests__', '__mocks__',
+                   'node_modules', 'vendor', 'site-packages', '.venv'}
 _PROTECTED_RE = re.compile(
     r'(^|/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*\.pth|[^/]*_test\.go'
     r'|[^/]*\.(test|spec)\.[cm]?[jt]sx?'
     r'|(jest|vitest|vite|ava|babel)\.(config|setup|workspace)\.[^/]*|setupTests\.[^/]*|karma\.conf\.[^/]*'
-    r'|\.mocharc[^/]*|\.env[^/]*)$'
+    r'|\.mocharc[^/]*|\.env[^/]*|[^/]*\.cmake)$'
     r'|(^|/)(__tests__|__mocks__)/')
 
 
 def protected_paths(files: list[str]) -> list[str]:
-    return [f for f in files if f.rsplit('/', 1)[-1] in _PROTECTED_NAMES or _PROTECTED_RE.search(f)]
+    out = []
+    for f in files:
+        name = f.rsplit('/', 1)[-1]
+        if (name in _PROTECTED_NAMES or _PROTECTED_RE.search(f)
+                or any(seg in _PROTECTED_DIRS for seg in f.split('/')[:-1])):
+            out.append(f)
+    return out
+
+
+# Manifest files are NOT reverted wholesale (a correct fix often must bump a dependency or a build directive);
+# only the fields that decide how tests are collected / run are protected. Both the base and the model's version
+# are parsed in the executor (never in the model's container), the test-relevant projection compared, and the
+# file reset only if that projection changed or either version fails to parse. Parsers are pinned so an offline
+# re-grade reaches the same keep/revert verdict (GRADER_PARSERS, recorded with the grade).
+STRUCTURED_MANIFESTS = {'pyproject.toml', 'setup.cfg', 'package.json', 'go.mod', 'Cargo.toml', 'pom.xml'}
+GRADER_PARSERS = (f'py{sys.version_info.major}.{sys.version_info.minor}:tomllib+json+configparser'
+                  ';gomod=v1;cargo=tomllib;pom=xml.etree-v1')
+_EMPTY_SRC = {'pyproject.toml': b'', 'setup.cfg': b'', 'package.json': b'{}', 'go.mod': b'',
+              'Cargo.toml': b'', 'pom.xml': b'<project/>'}
+
+
+def _pyproject_test_keys(b: bytes):
+    import tomllib
+    d = tomllib.loads(b.decode('utf-8'))
+    eps = ((d.get('project') or {}).get('entry-points') or {}).get('pytest11')
+    return ((d.get('tool') or {}).get('pytest'), d.get('build-system'), eps)
+
+
+def _setupcfg_test_keys(b: bytes):
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.read_string(b.decode('utf-8'))
+    pytest = dict(cp['tool:pytest']) if cp.has_section('tool:pytest') else None
+    eps = dict(cp['options.entry_points']) if cp.has_section('options.entry_points') else {}
+    return (pytest, eps.get('pytest11'))
+
+
+def _packagejson_test_keys(b: bytes):
+    import json as _json
+    d = _json.loads(b.decode('utf-8'))
+    return {k: d.get(k) for k in ('scripts', 'jest', 'mocha', 'ava', 'nyc', 'c8', 'babel')}
+
+
+def _gomod_test_keys(b: bytes):
+    """`go`, `toolchain` and every `replace` directive (single-line and block form). Arbos gates these: a fix may
+    add a dependency (require), but changing the toolchain or redirecting a module can change what runs."""
+    go = toolchain = None
+    replaces, in_replace = [], False
+    for raw in b.decode('utf-8', 'replace').splitlines():
+        line = raw.split('//', 1)[0].strip()
+        if not line:
+            continue
+        if in_replace:
+            if line == ')':
+                in_replace = False
+            else:
+                replaces.append(line)
+            continue
+        if line.startswith('replace (') or line == 'replace (':
+            in_replace = True
+        elif line.startswith('replace '):
+            replaces.append(line[len('replace '):].strip())
+        elif line.startswith('go '):
+            go = line[3:].strip()
+        elif line.startswith('toolchain '):
+            toolchain = line[len('toolchain '):].strip()
+    return (go, toolchain, sorted(replaces))
+
+
+def _cargo_test_keys(b: bytes):
+    import tomllib
+    d = tomllib.loads(b.decode('utf-8'))
+    tests = d.get('test')
+    harness = sorted((t.get('name'), t.get('harness')) for t in tests) if isinstance(tests, list) else None
+    return (d.get('patch'), d.get('replace'), (d.get('package') or {}).get('build'), harness)
+
+
+def _pom_test_keys(b: bytes):
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(b)
+
+    def strip(t):
+        return t.rsplit('}', 1)[-1]
+    plugins, flags = [], []
+    for el in root.iter():
+        if strip(el.tag) == 'plugin':
+            art = next((c.text for c in el if strip(c.tag) == 'artifactId'), '') or ''
+            if 'surefire' in art or 'failsafe' in art:
+                cfg = next((c for c in el if strip(c.tag) == 'configuration'), None)
+                plugins.append(ET.tostring(cfg, encoding='unicode') if cfg is not None else '')
+        if strip(el.tag) in ('skipTests', 'testFailureIgnore', 'maven.test.skip', 'skip'):
+            flags.append((strip(el.tag), (el.text or '').strip()))
+    return (sorted(plugins), sorted(flags))
+
+
+_MANIFEST_KEYS = {'pyproject.toml': _pyproject_test_keys, 'setup.cfg': _setupcfg_test_keys,
+                  'package.json': _packagejson_test_keys, 'go.mod': _gomod_test_keys,
+                  'Cargo.toml': _cargo_test_keys, 'pom.xml': _pom_test_keys}
+
+
+def manifest_reverts(name: str, base: bytes, cur: bytes) -> bool:
+    """True if a structured manifest must be reset to base: a test-relevant key changed, or either version does
+    not parse (fail closed -- a model cannot smuggle a config change through a file that only one side can read)."""
+    fn = _MANIFEST_KEYS[name]
+    try:
+        bk = fn(base if base.strip() else _EMPTY_SRC[name])
+        ck = fn(cur)
+    except Exception:  # noqa: BLE001  unparseable on either side: revert
+        return True
+    return bk != ck
+
+
+_ALWAYS_SHADOW = {'pytest', '_pytest', 'py', 'pluggy'}   # internals of the test runner itself, by name
+
+
+def shadow_added(added: list[str], importable: set[str]) -> list[str]:
+    """Model-ADDED paths that would shadow an importable top-level module. `python -m pytest` runs with the repo on
+    sys.path, so a new root file `pytest.py` or a new root directory `_pytest/` is imported before the real one
+    (verified in EXP-018). The shadow is the top-level component: a root `*.py` file by its stem, or the first
+    directory of a deeper path. A name is a shadow if it is importable on the image, is a pytest internal, or
+    matches `pytest_*`. Files inside an existing package import as a submodule, not a top-level shadow, and are
+    left to the name / structured rules."""
+    out = []
+    for p in added:
+        segs = p.split('/')
+        if len(segs) == 1:
+            if not segs[0].endswith('.py'):
+                continue
+            mod = segs[0][:-3]
+        else:
+            mod = segs[0]                                 # a new top-level directory == an importable package name
+        if not mod or '.' in mod:
+            continue
+        if mod in importable or mod in _ALWAYS_SHADOW or mod.startswith('pytest_'):
+            out.append(p)
+    return out
+
+
+_CMD_PATH_RE = re.compile(r'PATH=([^\s;"\']+)')
+_CMD_INVOKE_RE = re.compile(r'(?:^|[\s;&|(])(?:exec\s+)?(?:bash|sh)\s+(\S+\.sh)'
+                            r'|(?:^|[\s;&|(])(\./[^\s;&|)]+)')
+
+
+def _repo_rel(p: str, cwd: str) -> str | None:
+    """`p` as a path relative to the repo `cwd`, or None when it is outside the repo. Relative paths are taken as
+    repo-relative; an absolute path is kept only if it is under cwd."""
+    p = p.strip().strip('"\'')
+    if not p or p in ('.', './'):
+        return None
+    if p.startswith('/'):
+        pre = cwd.rstrip('/') + '/'
+        if not p.startswith(pre):
+            return None
+        p = p[len(pre):]
+    elif p.startswith('./'):
+        p = p[2:]
+    if not p or p.startswith('../') or '/../' in p:
+        return None
+    p = p.rstrip('/')
+    if any(seg in ('.', '..', '...') for seg in p.split('/')):   # e.g. go's ./... wildcard is not a path
+        return None
+    return p
+
+
+def command_repo_paths(test_command: str, cwd: str) -> list[str]:
+    """Repo-relative directories put on PATH and scripts invoked directly by the test command: anything the model
+    adds or changes under them decides what the grader runs, so they are protected like the test infrastructure.
+    Absolute paths outside the repo are ignored. Heuristic over the command string (the inner script of a mimo
+    task lives in the test patch and is reset separately). A script invoked INDIRECTLY -- `make test` running a
+    recipe, `python run_tests.py` importing a helper -- is not caught here by design: the entry point itself
+    (Makefile, setup.py, test_*.py) is covered by the protected-name and protected-dir rules instead."""
+    out = set()
+    for m in _CMD_PATH_RE.findall(test_command):
+        for part in m.split(':'):
+            rel = _repo_rel(part, cwd)
+            if rel is not None and not rel.startswith('$'):
+                out.add(rel)
+    for sh, dot in _CMD_INVOKE_RE.findall(test_command):
+        rel = _repo_rel(sh or dot, cwd)
+        if rel is not None and '$' not in rel:
+            out.add(rel)
+    return sorted(out)
+
+
+# test-runner config keys whose values name files the runner loads before / around the tests; a model that edits
+# one of those files changes what runs even when the config itself is unchanged, so the referenced files are reset.
+_JS_REF_KEYS = ('setupFiles', 'setupFilesAfterEnv', 'setupFilesAfterEach', 'globalSetup', 'globalTeardown',
+                'testEnvironment', 'reporters', 'transform', 'moduleNameMapper', 'setupFiles')
+_JSON_CONFIGS = ('.json',)                       # jest.config.json, .mocharc.json, tsconfig*.json, ...
+_JS_REF_RE = re.compile(r'''['"]((?:\./|\.\./|<rootDir>/)[^'"]+)['"]''')
+
+
+def _strip_jsonc(text: str) -> str:
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    text = re.sub(r'(^|[^:])//[^\n]*', r'\1', text)       # // comments (tsconfig is JSONC), keep ://  in strings-ish
+    return re.sub(r',(\s*[}\]])', r'\1', text)            # trailing commas
+
+
+def _resolve_ref(ref: str, config_dir: str) -> str | None:
+    if not ref.startswith(('./', '../', '<rootDir>')):   # a bare specifier (a package, 'node', 'default') is not a repo file
+        return None
+    ref = ref.replace('<rootDir>/', '').replace('<rootDir>', '')
+    if not ref or ref.rsplit('/', 1)[-1].count('*'):      # a glob pattern, not one file
+        return None
+    joined = f'{config_dir}/{ref}' if config_dir and not ref.startswith('/') else ref
+    parts: list[str] = []
+    for seg in joined.split('/'):
+        if seg in ('', '.'):
+            continue
+        if seg == '..':
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    rel = '/'.join(parts)
+    return rel if rel and 'node_modules' not in parts else None
+
+
+def _collect_strings(v, out: set):
+    if isinstance(v, str):
+        out.add(v)
+    elif isinstance(v, list):
+        for x in v:
+            _collect_strings(x, out)
+    elif isinstance(v, dict):
+        for x in v.values():
+            _collect_strings(x, out)
+
+
+def jsts_config_refs(name: str, content: bytes, config_dir: str) -> list[str]:
+    """Repo-relative files a jest / vitest / mocha / babel config, or a tsconfig `paths` map, points at. These are
+    reset if the model touched them, because an unchanged config can still load an editable setup/transform file
+    (EXP-018 review). JSON configs are parsed; .js/.ts/.cjs/.mjs/.yml configs are scanned for quoted ./ , ../ and
+    <rootDir>/ paths (best effort -- a config that computes a path at runtime is not caught, and the after-the-fact
+    patch audit backs this up)."""
+    raws: set = set()
+    text = content.decode('utf-8', 'replace')
+    is_json = name.endswith('.json') or name == 'package.json'
+    if is_json:
+        try:
+            d = json.loads(_strip_jsonc(text))
+        except ValueError:
+            d = None
+        if isinstance(d, dict):
+            if name.startswith('tsconfig'):
+                _collect_strings((d.get('compilerOptions') or {}).get('paths'), raws)
+            else:
+                cfg = d.get('jest') if name == 'package.json' else d
+                for k in _JS_REF_KEYS:
+                    _collect_strings((cfg or {}).get(k), raws)
+    else:
+        raws.update(_JS_REF_RE.findall(text))
+    out = set()
+    for r in raws:
+        rel = _resolve_ref(r, config_dir)
+        if rel is not None:
+            out.add(rel)
+    return sorted(out)
+
+
+_JS_CONFIG_NAMES = ('package.json', 'jest.config.json', '.mocharc.json', 'vitest.config.json')
+_JS_CONFIG_RE = re.compile(r'^(jest\.config\.|vitest\.config\.|vite\.config\.|\.mocharc|babel\.config\.|'
+                           r'tsconfig[^/]*\.json$)')
+
+
+_STATUS_RANK = {'pass': 0, 'skip': 1, 'fail': 2}
+
+
+def _record(out: dict, key: str, status: str) -> None:
+    """Record `key -> status`, keeping the WORST status when a key is seen twice (fail > skip > pass). Several id
+    spellings collapse to one key and a report may carry two cases that share one, so the second check -- a forgery
+    backstop -- must fail closed: a later `pass` never masks an earlier `fail`/`skip` under a shared key."""
+    if key and (key not in out or _STATUS_RANK[status] > _STATUS_RANK[out[key]]):
+        out[key] = status
+
+
+def _junit_results(report: bytes) -> dict:
+    """{test id -> 'pass'|'fail'|'skip'} from a JUnit XML report (pytest --junit-xml, jest-junit, go-junit).
+    A case with a <failure>/<error> child failed; `skipped` is skip; otherwise pass. pytest roots `classname` at
+    the filesystem path (e.g. tmp.abc.tests.test_calc), so for every dotted classname we register nodeids built
+    from each path SUFFIX -- `tests/test_calc.py::name`, with the last segment taken as a module or (for class
+    tests) as a class. Over-generating ids is lossy -- two cases can collapse to one key -- so _record keeps the
+    worst status (a model-added passing case cannot mask the real expected one); the model also cannot inject a
+    pytest-collectable module in the first place, since protected_paths reverts any test_*.py / *_test.py file."""
+    import xml.etree.ElementTree as ET
+    out: dict[str, str] = {}
+    root = ET.fromstring(report)
+    for tc in root.iter('testcase'):
+        name, cls, fil = tc.get('name', ''), tc.get('classname', ''), tc.get('file', '')
+        children = {c.tag for c in tc}
+        status = 'fail' if {'failure', 'error'} & children else ('skip' if 'skipped' in children else 'pass')
+        keys = {name}
+        if cls:
+            keys |= {f'{cls}::{name}', f'{cls}.{name}'}
+        if fil:
+            keys.add(f'{fil}::{name}')
+        parts = cls.split('.') if cls else []
+        for k in range(len(parts)):
+            mod = '/'.join(parts[k:])
+            keys.add(f'{mod}.py::{name}')                               # last segment is the module file
+            if len(parts) - k >= 2:                                     # or the last segment is a class
+                keys.add(f'{"/".join(parts[k:-1])}.py::{parts[-1]}::{name}')
+        for key in keys:
+            _record(out, key, status)
+    return out
+
+
+def _gotest_results(report: bytes) -> dict:
+    """{test id -> status} from `go test -json` output (one JSON object per line, action pass/fail/skip per Test).
+    _record keeps the worst status so a rerun's later pass cannot mask an earlier fail under the same id."""
+    out: dict[str, str] = {}
+    for line in report.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        t, act = ev.get('Test'), ev.get('Action')
+        if t and act in ('pass', 'fail', 'skip'):
+            _record(out, t, act)
+            if ev.get('Package'):
+                _record(out, f"{ev['Package']}::{t}", act)
+    return out
+
+
+def _jestjson_results(report: bytes) -> dict:
+    """{test id -> status} from `jest --json` output (testResults[].assertionResults[].{fullName,title,status}).
+    _record keeps the worst status so a later pass cannot mask an earlier fail/skip under a shared id."""
+    out: dict[str, str] = {}
+    d = json.loads(report.decode('utf-8', 'replace'))
+    for suite in d.get('testResults', []):
+        for a in suite.get('assertionResults', []):
+            st = {'passed': 'pass', 'failed': 'fail', 'pending': 'skip', 'skipped': 'skip',
+                  'todo': 'skip'}.get(a.get('status'), 'fail')
+            for key in {a.get('fullName'), a.get('title')}:
+                _record(out, key, st)
+    return out
+
+
+_REPORT_PARSERS = {'junit': _junit_results, 'gotest': _gotest_results, 'jest': _jestjson_results}
+_REPORT_EXT = {'junit': 'xml', 'gotest': 'ndjson', 'jest': 'json'}
+
+
+def report_verdict(report_kind: str, report: bytes, fail_to_pass: list[str], pass_to_pass: list[str]) -> tuple[bool, str]:
+    """The second check: every expected test id (the tests the fix must make pass, plus those that must stay
+    passing) is present in the structured report AND passed; a skip never counts as a pass. Returns (ok, detail).
+    This is on top of the exit code -- a model that forces exit 0 but did not actually pass the tests fails here,
+    as long as the ids come from our own baseline, not the model."""
+    parse = _REPORT_PARSERS.get(report_kind)
+    if parse is None:
+        return False, f'unknown report_kind {report_kind!r}'
+    try:
+        results = parse(report)
+    except Exception as e:  # noqa: BLE001  a malformed / forged report is not a pass
+        return False, f'report unparseable: {type(e).__name__}'
+    expected = list(dict.fromkeys([*(fail_to_pass or []), *(pass_to_pass or [])]))
+    if not expected:
+        return False, 'no expected test ids'
+    missing = [t for t in expected if t not in results]
+    if missing:
+        return False, f'{len(missing)} expected test(s) not in the report, e.g. {missing[0]}'
+    notpass = [t for t in expected if results[t] != 'pass']
+    if notpass:
+        return False, f'{len(notpass)} expected test(s) not passing (e.g. {notpass[0]}={results[notpass[0]]})'
+    return True, f'{len(expected)} expected tests passed'
 
 
 class SweEnv(DockerTaskEnv):
@@ -163,7 +539,8 @@ class SweEnv(DockerTaskEnv):
 
     def grade_inputs(self, task: str) -> dict:
         r = self._load()[task]
-        return {**super().grade_inputs(task), 'test_patch': r['test_patch']}
+        extra = {k: r[k] for k in ('fail_to_pass', 'pass_to_pass', 'report_kind') if r.get(k)}
+        return {**super().grade_inputs(task), 'test_patch': r['test_patch'], **extra}
 
     def _prepare_repo(self, sb, repo: str, lang: str) -> str:
         """Bring a fresh container's repo to the base state the model starts from (also used for the grading
@@ -264,7 +641,7 @@ class SweEnv(DockerTaskEnv):
         return out
 
     def _changed_paths(self, sb, repo: str, start: str, path: str,
-                       keep_deleted: bool = True) -> tuple[list[bytes] | None, str]:
+                       keep_deleted: bool = True, added_only: bool = False) -> tuple[list[bytes] | None, str]:
         """Every path whose content or mode the patch at `path` changes relative to the tree `start`, with renames
         and copies counted as their separate deletes and adds. The patch is applied to a throwaway index holding
         `start` by the grading container's own git and compared with --no-renames, so a protected file the model
@@ -283,7 +660,7 @@ class SweEnv(DockerTaskEnv):
         if ap['returncode'] != 0:
             sb.execute(f'rm -f {TREE_INDEX_REMOTE}', timeout=60, login=False)
             return None, ap['output'][-300:] or f'git apply --cached exited {ap["returncode"]}'
-        only = '' if keep_deleted else '--diff-filter=d '
+        only = '--diff-filter=A ' if added_only else ('' if keep_deleted else '--diff-filter=d ')
         r = sb.execute(f'set -o pipefail; {idx} git diff --cached --no-renames --no-ext-diff --name-only -z {only}'
                        f'{start} '
                        f'2>/dev/null | base64 | tr -d "\\n"; rc=$?; rm -f {TREE_INDEX_REMOTE}; exit $rc', cwd=repo,
@@ -291,6 +668,65 @@ class SweEnv(DockerTaskEnv):
         if r['returncode'] != 0:
             raise GradeError(f'cannot list the paths {path} changes: ' + r['output'][-300:])
         return [p for p in base64.b64decode(r['output'].strip(), validate=True).split(b'\0') if p], ''
+
+    def _base_config_files(self, sb, repo: str, start: str) -> list[str]:
+        """Test-runner / tsconfig config files present in the base tree (filtered in the shell so a huge repo does
+        not blow the output cap). Their referenced files are protected whether or not the model changed the config."""
+        pat = r'(^|/)(package\.json|jest\.config\.|vitest\.config\.|vite\.config\.|\.mocharc|babel\.config\.|tsconfig)'
+        r = sb.execute(f'set -o pipefail; git ls-tree -r --name-only {start} 2>/dev/null | grep -E {shlex.quote(pat)}'
+                       ' | head -c 200000 | base64 | tr -d "\\n"', cwd=repo, timeout=120, login=False)
+        try:
+            names = base64.b64decode(r['output'].strip(), validate=True).decode('utf-8', 'replace').splitlines()
+        except ValueError:
+            return []
+        out = []
+        for p in names:
+            b = p.rsplit('/', 1)[-1]
+            if b == 'package.json' or _JS_CONFIG_RE.match(b):
+                out.append(p)
+        return out[:300]
+
+    def _importable_modules(self, sb, repo: str) -> set[str]:
+        """Top-level module names importable on the image (builtins + everything on the default sys.path), used to
+        decide which model-added top-level names shadow a real module. Run from `/`, never the repo, so the repo's
+        own modules are not counted. Empty when no python is on the image (then only the pytest internals apply)."""
+        probe = ('import sys,pkgutil,json;'
+                 "m=set(sys.builtin_module_names);"
+                 "m|={x.name for x in pkgutil.iter_modules() if '.' not in x.name};"
+                 'print(json.dumps(sorted(m)))')
+        for py in ('python3', 'python'):
+            r = sb.execute(f'{py} -c {shlex.quote(probe)}', cwd='/', timeout=120, login=False)
+            if r['returncode'] == 0 and r['output'].strip():
+                try:
+                    return set(json.loads(r['output'].strip().splitlines()[-1]))
+                except ValueError:
+                    pass
+        return set()
+
+    def _read_abs(self, sb, path: str) -> bytes:
+        """Raw bytes of an absolute file (a structured test report in a random dir), base64 so binary is safe."""
+        if not path:
+            return b''
+        q = shlex.quote(path)
+        r = sb.execute(f'set -o pipefail; [ -f {q} ] && base64 < {q} | tr -d "\\n" || true', timeout=120, login=False)
+        try:
+            return base64.b64decode(r['output'].strip(), validate=True) if r['output'].strip() else b''
+        except ValueError:
+            return b''
+
+    def _read_blob(self, sb, repo: str, ref: str | None, rel: str) -> bytes:
+        """Raw bytes of `rel` at git ref `ref` (base tree), or from the working file when ref is None (the model's
+        version, after its patch was applied). Missing on either side -> b''. base64 so binary is safe. Read in the
+        executor, not parsed in the container, so a crafted manifest cannot run code during grading."""
+        q = shlex.quote(rel)
+        src = (f'export GIT_LITERAL_PATHSPECS=1; git cat-file -e {ref}:{q} 2>/dev/null && git show {ref}:{q}'
+               if ref else f'[ -f {q} ] && cat {q}')
+        r = sb.execute(f'set -o pipefail; {{ {src}; }} 2>/dev/null | base64 | tr -d "\\n"', cwd=repo, timeout=120,
+                       login=False)
+        try:
+            return base64.b64decode(r['output'].strip(), validate=True) if r['output'].strip() else b''
+        except ValueError:
+            return b''
 
     def _reset_paths(self, sb, repo: str, start: str, paths: list[bytes]) -> None:
         """Put each path back to the start tree, or delete it when the start tree does not have it (NUL-separated,
@@ -425,7 +861,11 @@ fi
                 # to gigabytes in `git apply` (review of PR #15). A limit kill from now on is the model's: 0.
                 untrusted = True
                 touched, why = self._changed_paths(sb, repo, start, MODEL_PATCH_REMOTE)   # first: changes nothing
+                added: list[str] = []
                 if touched is not None:
+                    added = [p.decode('utf-8', 'surrogateescape')          # new files, read before the patch is gone
+                             for p in (self._changed_paths(sb, repo, start, MODEL_PATCH_REMOTE,
+                                                           added_only=True)[0] or [])]
                     ap = sb.execute(f'git apply --binary --whitespace=nowarn {MODEL_PATCH_REMOTE}', cwd=repo,
                                     timeout=300, login=False)
                     why = '' if ap['returncode'] == 0 else (ap['output'][-300:] or f'exit {ap["returncode"]}')
@@ -433,7 +873,28 @@ fi
                 if touched is None or why:                  # same start tree, so only the patch can be at fault
                     return {**res, 'grade_detail': 'model_patch_does_not_apply: ' + why}
                 prot = protected_paths([p.decode('utf-8', 'surrogateescape') for p in touched])
-                reverted = sorted(set(prot))
+                reverted = set(prot)
+                for p in touched:
+                    rel = p.decode('utf-8', 'surrogateescape')
+                    if rel in reverted or rel.rsplit('/', 1)[-1] not in STRUCTURED_MANIFESTS:
+                        continue
+                    name = rel.rsplit('/', 1)[-1]
+                    if manifest_reverts(name, self._read_blob(sb, repo, start, rel),
+                                        self._read_blob(sb, repo, None, rel)):
+                        reverted.add(rel)         # a test-relevant key changed, or it does not parse: reset to base
+                reverted.update(shadow_added(added, self._importable_modules(sb, repo) if added else set()))
+                cmd_dirs = command_repo_paths(gi['test_command'], repo)
+                if cmd_dirs:                       # files under a PATH dir / a script the command runs directly
+                    reverted.update(f for f in (p.decode('utf-8', 'surrogateescape') for p in touched)
+                                    if any(f == d or f.startswith(d + '/') for d in cmd_dirs))
+                touched_set = {p.decode('utf-8', 'surrogateescape') for p in touched}
+                cfg_refs: set = set()
+                for cfgpath in self._base_config_files(sb, repo, start):
+                    cdir, _, cname = cfgpath.rpartition('/')
+                    cfg_refs.update(jsts_config_refs(cname, self._read_blob(sb, repo, start, cfgpath), cdir))
+                reverted.update(touched_set & cfg_refs)   # a file a test-runner config loads: reset even if unchanged config
+                res['grader_parsers'] = GRADER_PARSERS
+                reverted = sorted(reverted)
                 self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])
             sb.copy_text_to(gi['test_patch'], TEST_PATCH_REMOTE)
             test_paths = self._changed_paths(sb, repo, base, TEST_PATCH_REMOTE)[0] if base else None
@@ -451,14 +912,31 @@ fi
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
             test_cmd = gi['test_command']
+            expected = list(gi.get('fail_to_pass') or []) + list(gi.get('pass_to_pass') or [])
+            report_kind = gi.get('report_kind') or ''
+            rdir = rpath = pre = ''
+            if expected and report_kind in _REPORT_PARSERS:
+                rdir = f'/tmp/mimo-report-{secrets.token_hex(8)}'     # random: the model cannot predict / forge it
+                rpath = f'{rdir}/report.{_REPORT_EXT[report_kind]}'
+                sb.execute(f'rm -rf {rdir} && mkdir -p {rdir} && chmod 777 {rdir}', timeout=60, login=False)
+                if report_kind == 'junit':   # make even an unmodified pytest harness emit the report, config aside
+                    pre = f'PYTEST_ADDOPTS={shlex.quote(f"-o addopts= --junit-xml={rpath}")} '
+                pre += f'MIMO_REPORT={shlex.quote(rpath)} '           # harnesses the baseline tool amended honour this
             if grader == 'nobody':
                 res['lock_seconds'] = self._lock_down(sb, repo, test_paths)
                 test_cmd = as_grader(test_cmd)
             untrusted, t0 = True, time.time()               # the tests run the model's code
-            r = sb.execute(test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
-            return {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
-                    'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
-                    'test_output': r['output'][-3000:], 'reverted_paths': reverted}
+            r = sb.execute(pre + test_cmd, cwd=repo, timeout=gi['verifier_timeout'], login=False)
+            out = {**res, 'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
+                   'verifier_reason': r['reason'], 'test_seconds': round(time.time() - t0, 1),
+                   'test_output': r['output'][-3000:], 'reverted_paths': reverted}
+            if expected and report_kind in _REPORT_PARSERS:        # second check: the exact tests must be present & pass
+                ok, why = report_verdict(report_kind, self._read_abs(sb, rpath),
+                                         gi.get('fail_to_pass') or [], gi.get('pass_to_pass') or [])
+                out['second_check'] = ok
+                if not ok:
+                    return {**out, 'reward': 0.0, 'grade_detail': 'second_check: ' + why}
+            return out
         except SandboxLimitError as e:
             if not untrusted:                               # only our own setup had run: not the model's doing
                 raise GradeError(f'grading container hit a limit during setup: {e}') from None

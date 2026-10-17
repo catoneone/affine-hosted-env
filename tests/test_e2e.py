@@ -106,7 +106,7 @@ def test_group_end_to_end(stack):
     assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
     assert all(sum(m) > 0 for m in v['loss_masks'])
     c0 = v['claims'][0]                                                # receipt v2 context, set by the worker
-    assert (c0['grader'], c0['grader_user'], c0['renderer']) == ('isolated-v2', 'root', 'char/v1/enable_thinking=false')
+    assert (c0['grader'], c0['grader_user'], c0['renderer']) == ('isolated-v3', 'root', 'char/v1/enable_thinking=false')
     assert len(c0['model_patch_sha256']) == len(c0['test_patch_sha256']) == len(c0['tokenizer_sha256']) == 64
     assert c0['image'] and c0['verifier_returncode'] == 0 and c0['started_at_ms'] <= c0['issued_at_ms']
     assert len(c0['start_tree']) == 40
@@ -128,7 +128,7 @@ def test_group_end_to_end(stack):
     log = (stack['tmp'] / 'logs' / 'exec-w1.jsonl').read_text().splitlines()
     assert sum(json.loads(x)['event'] == 'finish' for x in log) == 8
     fin = [json.loads(x) for x in log if json.loads(x)['event'] == 'finish']   # how each rollout was graded
-    assert all(f['grader'] == 'isolated-v2' and f['grader_user'] == 'root' for f in fin)
+    assert all(f['grader'] == 'isolated-v3' and f['grader_user'] == 'root' for f in fin)
 
 def test_smoke_replies_end_to_end(stack):
     """The EXP-014 smoke script: timeout, malformed call, unknown tool, truncation, submit, over the full HTTP path."""
