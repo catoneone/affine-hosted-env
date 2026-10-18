@@ -3,6 +3,7 @@ real go, so it runs without a Go toolchain."""
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 
@@ -89,13 +90,24 @@ class _Sb:
         self.path = path
 
     def execute(self, cmd, cwd=None, timeout=60, login=False):
-        p = subprocess.run(['sh', '-c', cmd], cwd=cwd, env={'PATH': self.path, 'HOME': '/tmp'},
+        p = subprocess.run(['/bin/sh', '-c', cmd], cwd=cwd, env={'PATH': self.path, 'HOME': '/tmp'},
                            capture_output=True, text=True)
         return {'returncode': p.returncode, 'output': p.stdout + p.stderr}
 
     def copy_text_to(self, text, remote_path):
         with open(remote_path, 'w') as f:
             f.write(text)
+
+
+def _tools(tmp_path):
+    """Only the utilities the install and the shim call, symlinked into one dir: the host's /usr/bin may hold a
+    real go (GitHub's ubuntu runners do), which would make a 'no go on PATH' case find one."""
+    tools = tmp_path / 'tools'
+    if not tools.exists():
+        tools.mkdir()
+        for name in ('cat', 'rm', 'mkdir', 'chmod'):
+            (tools / name).symlink_to(shutil.which(name))
+    return str(tools)
 
 
 def _install(tmp_path, path_dirs):
@@ -105,7 +117,7 @@ def _install(tmp_path, path_dirs):
     rdir = tmp_path / 'mimo-report-abc'
     rdir.mkdir(exist_ok=True)
     rpath, res = str(rdir / 'report.ndjson'), {}
-    sb = _Sb(':'.join([*path_dirs, '/usr/bin', '/bin']))
+    sb = _Sb(':'.join([*path_dirs, _tools(tmp_path)]))
     pre = SweEnv._install_go_shim(object(), sb, str(repo), str(rdir), rpath, res)
     return sb, repo, rpath, res, pre
 
