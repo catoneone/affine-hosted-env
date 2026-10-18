@@ -67,6 +67,8 @@ hotkey_data = [200, 400]
 kind = "mimo_swe"
 tasks = "tasks.jsonl"
 require_image_digest = true              # default: refuse task rows whose image is not name@sha256:... (`hosted-env pin-images`)
+require_expected_tests = true            # default: offer only tasks with fail_to_pass + report_kind (`hosted-env baseline --tasks-out`);
+                                         # an exit-code-only task is won by code that exits 0. false only for local development
 group_size = 8
 success_reward = 1.0
 sandbox = "docker"

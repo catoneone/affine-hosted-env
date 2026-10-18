@@ -873,13 +873,32 @@ def report_verdict(report_kind: str, report: bytes, fail_to_pass: list[str], pas
 
 
 class SweEnv(DockerTaskEnv):
-    """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error').
+    """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error'),
+    require_expected_tests (on by default; false only for local development and the baseline tool).
 
     Grading never trusts the rollout container: the model's changes are captured as a git patch, that container is
     destroyed, and the hidden tests run in a fresh container from the same image with only the patch applied,
     the test infrastructure reset (`protected_paths`), and a non-login shell (no profile or rc file is read)."""
 
     kind = 'mimo_swe'
+
+    def _load(self) -> dict[str, dict]:
+        """Only tasks with a second check are offered (require_expected_tests, default on). On a task graded by the
+        exit code alone the model wins by making the run exit 0 without passing anything -- a Go init() that calls
+        os.Exit(0), a JS module that calls process.exit(0) when the tests import it -- and no revert rule can stop
+        that, since it edits the very code the fix must edit (EXP-018 cheat matrix; Affine review 2026-10-18: the
+        per-test-id check gates going live). So a task needs fail_to_pass ids from `hosted-env baseline` and a
+        report kind the grader parses; the rest stay out of the pool until the baseline covers them."""
+        if self._rows is None:
+            rows = super()._load()
+            if self.cfg.get('require_expected_tests', True):
+                kept = {k: r for k, r in rows.items() if r.get('fail_to_pass') and r.get('report_kind') in _REPORT_PARSERS}
+                if rows and not kept:
+                    raise RuntimeError(f'env {self.env_id}: none of the {len(rows)} tasks has expected tests '
+                                       '(fail_to_pass + report_kind); run `hosted-env baseline --tasks-out`, or set '
+                                       'require_expected_tests = false for local development')
+                self._rows = kept
+        return self._rows
 
     def grade_inputs(self, task: str) -> dict:
         r = self._load()[task]

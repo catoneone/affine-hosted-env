@@ -58,7 +58,8 @@ class Server:
 @pytest.fixture
 def stack(tmp_path):
     path, ids = make_swe_tasks(tmp_path, n=2)
-    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root', 'require_image_digest': False}
+    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root', 'require_image_digest': False,
+           'require_expected_tests': False}
     gkey, wkey = SigningKey.generate(), SigningKey.generate()
     miners = {'5H0': SigningKey.generate(), '5H1': SigningKey.generate()}
     roster = tmp_path / 'roster.json'
@@ -189,7 +190,8 @@ def test_single_process_group_and_data_plane_limit(tmp_path):
             return wait
 
     path, ids = make_swe_tasks(tmp_path, n=1)
-    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root', 'require_image_digest': False}
+    cfg = {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root', 'require_image_digest': False,
+           'require_expected_tests': False}
     gkey, wkey, miner = SigningKey.generate(), SigningKey.generate(), SigningKey.generate()
     roster = tmp_path / 'roster.json'
     roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {'5H0': {'uid': 0,
@@ -252,8 +254,33 @@ def test_sandbox_limits_names_what_was_enforced():
 
     def rt(kind, **o):
         return SimpleNamespace(sandbox=kind, sandbox_opts=o)
-    assert _sandbox_limits(rt('k8s')) == f'k8s:cpus=1;memory=2g;disk={DEFAULT_DISK}'
-    assert _sandbox_limits(rt('k8s', cpus='2', memory='4g', disk='20g')) == 'k8s:cpus=2;memory=4g;disk=20g'
-    assert _sandbox_limits(rt('k8s', disk='0')) == _sandbox_limits(rt('k8s', disk=None)) == 'k8s:cpus=1;memory=2g;disk=none'
-    assert _sandbox_limits(rt('docker', memory='8g', disk='10g')) == 'docker:cpus=1;memory=8g;disk=unenforced'
+    assert _sandbox_limits(rt('k8s')) == f'k8s:cpus=1;memory=2g;disk={DEFAULT_DISK};threads=1'
+    assert _sandbox_limits(rt('k8s', cpus='2', memory='4g', disk='20g')) == 'k8s:cpus=2;memory=4g;disk=20g;threads=1'
+    assert (_sandbox_limits(rt('k8s', disk='0')) == _sandbox_limits(rt('k8s', disk=None))
+            == 'k8s:cpus=1;memory=2g;disk=none;threads=1')
+    assert _sandbox_limits(rt('docker', memory='8g', disk='10g')) == 'docker:cpus=1;memory=8g;disk=unenforced;threads=1'
     assert _sandbox_limits(rt('local', memory='8g')) == 'local'
+
+
+def test_every_sandbox_command_runs_with_the_thread_caps(tmp_path):
+    """OMP / OpenBLAS / MKL are capped at 1 thread in every command, so numpy-heavy tests in a 1-CPU sandbox do
+    not start one thread per HOST core and run into the pid limit (a correct fix would then grade 0)."""
+    from hosted_env.providers.sandbox import LocalSandbox
+    from hosted_env.providers.sandbox.base import THREAD_CAPS
+    from hosted_env.providers.sandbox.docker import DockerSandbox
+    from hosted_env.providers.sandbox.k8s import K8sSandbox
+    assert THREAD_CAPS == {'OMP_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
+    img = tmp_path / 'img'
+    img.mkdir()
+    sb = LocalSandbox(str(img), '/testbed')
+    sb.start()
+    try:
+        r = sb.execute('echo "$OMP_NUM_THREADS $OPENBLAS_NUM_THREADS $MKL_NUM_THREADS"')
+        assert r['output'].split() == ['1', '1', '1']
+    finally:
+        sb.cleanup()
+    assert DockerSandbox('img', '/testbed').env == THREAD_CAPS          # before start: applied from the first exec
+    k = K8sSandbox.__new__(K8sSandbox)
+    k.env, k.has_timeout, k.cwd = dict(THREAD_CAPS), False, '/testbed'
+    argv = k._argv('true', None, 60, raw=True)
+    assert all(f'{n}=1' in argv for n in THREAD_CAPS)

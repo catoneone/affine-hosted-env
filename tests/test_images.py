@@ -61,7 +61,8 @@ def test_env_requires_pinned_images_by_default(tmp_path):
     from hosted_env.envs import SweEnv
     path = tmp_path / 't.jsonl'
     path.write_text(json.dumps({'id': 'a', 'image': 'x/y:tag', 'cwd': '/w', 'problem_statement': 'p',
-                                'test_command': 'true', 'test_patch': ''}) + '\n')
+                                'test_command': 'true', 'test_patch': '', 'report_kind': 'junit',
+                                'fail_to_pass': ['t.py::test_a']}) + '\n')
     assert SweEnv('swe', {'tasks': str(path), 'require_image_digest': False}).task_ids() == ['a']   # explicit opt-out
     with pytest.raises(RuntimeError, match='not pinned by digest'):
         SweEnv('swe', {'tasks': str(path)}).task_ids()                                      # on by default
@@ -70,3 +71,23 @@ def test_env_requires_pinned_images_by_default(tmp_path):
     path.write_text(path.read_text().replace('x/y:tag', f'x/y@{D1}'))
     assert SweEnv('swe', {'tasks': str(path)}).task_ids() == ['a']
     assert SweEnv('swe', {'tasks': str(path), 'require_image_digest': True}).task_ids() == ['a']
+
+
+def test_env_offers_only_tasks_with_a_second_check_by_default(tmp_path):
+    """A task graded by the exit code alone is beaten by code that exits 0 (Go init(), JS process.exit), so by
+    default only tasks with expected tests and a report kind the grader parses are offered."""
+    from hosted_env.envs import SweEnv
+    base = {'image': f'x/y@{D1}', 'cwd': '/w', 'problem_statement': 'p', 'test_command': 'true', 'test_patch': ''}
+    rows = [{'id': 'ok', **base, 'report_kind': 'gotest', 'fail_to_pass': ['m/x::TestA']},
+            {'id': 'none', **base},                                                    # exit code only
+            {'id': 'p2p_only', **base, 'report_kind': 'junit', 'pass_to_pass': ['t.py::test_b']},
+            {'id': 'no_kind', **base, 'fail_to_pass': ['t.py::test_a']},
+            {'id': 'bad_kind', **base, 'report_kind': 'tap', 'fail_to_pass': ['x']}]
+    path = tmp_path / 't.jsonl'
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    assert SweEnv('swe', {'tasks': str(path)}).task_ids() == ['ok']
+    assert SweEnv('swe', {'tasks': str(path), 'require_expected_tests': True}).task_ids() == ['ok']
+    assert len(SweEnv('swe', {'tasks': str(path), 'require_expected_tests': False}).task_ids()) == 5
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows[1:]))
+    with pytest.raises(RuntimeError, match='none of the 4 tasks has expected tests'):
+        SweEnv('swe', {'tasks': str(path)}).task_ids()

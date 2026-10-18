@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 
-from .base import OUTPUT_CAP_BYTES
+from .base import OUTPUT_CAP_BYTES, THREAD_CAPS
 
 
 class LocalSandbox:
@@ -22,7 +22,7 @@ class LocalSandbox:
         home = self.root + '-home'          # next to the repo, never inside it (git add -A would pick it up)
         self.env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': home, 'GIT_CONFIG_NOSYSTEM': '1',
                     'GIT_CEILING_DIRECTORIES': os.path.dirname(self.root), 'PYTHONDONTWRITEBYTECODE': '1',
-                    'LANG': 'C.UTF-8'}
+                    'LANG': 'C.UTF-8', **THREAD_CAPS}
 
     def _map(self, s: str) -> str:
         # One pass, so the replacement text (which may itself live under /tmp, e.g. on Linux CI) is never

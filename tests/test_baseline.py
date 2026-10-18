@@ -86,7 +86,7 @@ def _task(tmp_path, base_extra='', calc_test=None, select='-k "add or zero or mu
                                 'problem_statement': 'add subtracts; add mul', 'test_patch': test_patch,
                                 'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
     env = SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
-                         'require_image_digest': False})
+                         'require_image_digest': False, 'require_expected_tests': False})
     base = tmp_path / 'sb'
     base.mkdir()
     return env, path, lambda image, cwd: LocalSandbox(image, cwd, base_dir=str(base))
@@ -288,7 +288,7 @@ def _go_task(tmp_path, monkeypatch):
                                 'problem_statement': 'Add subtracts; add Mul', 'test_patch': test_patch,
                                 'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
     env = SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
-                         'require_image_digest': False})
+                         'require_image_digest': False, 'require_expected_tests': False})
     base = tmp_path / 'sb'
     base.mkdir()
     return env, path, lambda image, cwd: LocalSandbox(image, cwd, base_dir=str(base))
@@ -437,7 +437,7 @@ def test_derive_js_amends_the_harness_then_grades(tmp_path, monkeypatch):
                                 'problem_statement': 'sum subtracts', 'test_patch': test_patch,
                                 'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
     cfg = {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
-           'require_image_digest': False}
+           'require_image_digest': False, 'require_expected_tests': False}
     env = SweEnv('swe', cfg)
     base = tmp_path / 'sb'
     base.mkdir()

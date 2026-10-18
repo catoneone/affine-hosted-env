@@ -179,6 +179,8 @@ def cmd_baseline(a):
     from .envs import make_env
     cfgp = Path(a.config).resolve()
     ecfg = _envs(tomllib.loads(cfgp.read_text()), cfgp.parent)[a.env]
+    # the baseline derives the expected tests, so it must see the tasks that do not have them yet
+    ecfg = {**ecfg, 'require_expected_tests': False}
     env = make_env(a.env, ecfg)
     opts = dict(ecfg.get('sandbox_opts') or {})
     kind = ecfg.get('sandbox', 'docker')

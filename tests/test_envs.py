@@ -66,7 +66,7 @@ def test_tool_schema_matches_official():
 def make_task(tmp_path, script=None):
     path, ids = make_swe_tasks(tmp_path, script=script)
     return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': path, 'cleanup': False, 'grader_user': 'root',
-                          'require_image_digest': False}), ids[0]
+                          'require_image_digest': False, 'require_expected_tests': False}), ids[0]
 
 
 def open_local(env, task, tmp_path):
@@ -568,7 +568,7 @@ def _pytest_task(tmp_path):
                                  'fail_to_pass': ['tests/test_calc.py::test_add'],
                                  'pass_to_pass': ['tests/test_calc.py::test_zero']}) + '\n')
     return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
-                          'require_image_digest': False}), 'pt', str(d)
+                          'require_image_digest': False, 'require_expected_tests': False}), 'pt', str(d)
 
 
 def test_second_check_requires_the_expected_tests_to_pass(tmp_path):
@@ -847,7 +847,7 @@ def _rich_task(tmp_path):
                                 'problem_statement': 'add() subtracts', 'test_patch': test_patch,
                                 'test_command': 'bash /testbed/mimo_test_command.sh'}) + '\n')
     return SweEnv('swe', {'kind': 'mimo_swe', 'tasks': str(path), 'cleanup': False, 'grader_user': 'root',
-                          'require_image_digest': False}), 'rich'
+                          'require_image_digest': False, 'require_expected_tests': False}), 'rich'
 
 
 @pytest.mark.parametrize('shape', [
