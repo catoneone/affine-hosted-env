@@ -25,7 +25,8 @@ from collections.abc import Mapping
 
 from nacl.signing import VerifyKey
 
-from .receipt import (ReceiptError, as_segments, check_expect, loss_mask, receipt_digest, verify_group_seal,
+from .receipt import (EnvReceiptSpec, ReceiptError, as_segments, check_expect, loss_mask, receipt_digest,
+                      verify_group_seal,
                       verify_receipt)
 
 GROUP_ATTACHMENT_VERSION = 'hosted-env-group-v2'
@@ -47,13 +48,14 @@ def _model_patch(r: Mapping, claims: Mapping) -> bytes:
 
 
 def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, gateway_key: VerifyKey, epoch: str,
-                 hotkey: str, env_id: str, task: str, group_size: int = 8, success_reward: float = 1.0,
-                 expect: Mapping | None = None) -> dict:
+                 hotkey: str, env_id: str, task: str, spec: EnvReceiptSpec, group_size: int = 8,
+                 success_reward: float = 1.0, expect: Mapping | None = None) -> dict:
     """On success returns {'claims': [receipt contents ordered by nonce], 'loss_masks': [...], 'segments': [...],
     'model_patches': [patch bytes ...], 'seal': seal contents}. trusted_keys are the worker keys, gateway_key the
-    key that signs group seals (both from the epoch's opening). expect is passed to every verify_receipt (e.g. the
-    task's image and test hashes from the verifier's own task pool, its tokenizer_sha256)."""
-    check_expect(expect)
+    key that signs group seals (both from the epoch's opening). spec is the receipt spec of the environment kind
+    serving env_id (hosted_env.envs.receipt_spec; /v1/info names the kind). expect is passed to every
+    verify_receipt (e.g. the task's image and test hashes from the verifier's own task pool, its tokenizer_sha256)."""
+    check_expect(expect, spec)
     if not isinstance(attachment, Mapping) or attachment.get('version') != GROUP_ATTACHMENT_VERSION:
         raise ReceiptError('bad_attachment_version')
     if attachment.get('env_id') != env_id or attachment.get('task') != task:
@@ -83,7 +85,7 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
         except (KeyError, TypeError, ValueError):
             raise ReceiptError('malformed_trajectory') from None
         claims.append(verify_receipt(r.get('receipt') or {}, s, trusted_keys, epoch=epoch, hotkey=hotkey,
-                                     env_id=env_id, task=task, nonce=n, expect=expect))
+                                     env_id=env_id, task=task, nonce=n, spec=spec, expect=expect))
         patches.append(_model_patch(r, claims[-1]))
         segs.append(s)
         masks.append(loss_mask(s))

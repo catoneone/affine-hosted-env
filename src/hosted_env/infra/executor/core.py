@@ -15,7 +15,6 @@ the same result (safe for network retries), and non-consecutive seqs are rejecte
 from __future__ import annotations
 
 import concurrent.futures as cf
-import hashlib
 import json
 import logging
 import os
@@ -23,6 +22,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from nacl.signing import SigningKey, VerifyKey
 
@@ -30,7 +30,7 @@ from ... import __version__
 from ..auth import AuthError, verify_token
 from ..common import canonical, key_id, sha256_hex
 from ...envs import SetupError
-from ..receipt import TrajectoryHasher, expected_tests_digest, receipt_digest, sign_receipt
+from ..receipt import TrajectoryHasher, receipt_digest, sign_receipt
 from ..render import TemplateRenderer
 from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox, SandboxCommandError, SandboxLimitError
 from ..providers.sandbox.k8s import K8sSandbox
@@ -38,19 +38,6 @@ from ..toolcall import parse_tool_calls, split_reasoning
 from .gateway_client import GatewayRejected, GatewayUnavailable, WorkerGatewayClient
 
 log = logging.getLogger('hosted_env.executor')
-# grade() fields the executor log keeps for each finished rollout: how it was graded and what the verifier said
-# (model_patch and test_output are too large for the log). second_check is the per-test-id verdict on a task with
-# expected tests (absent otherwise), so a live rollout that the exit code passed but the second check failed is
-# visible. The protected files the grader put back are logged as a count plus the first few (_reverted_summary):
-# a patch that touches node_modules/ can revert thousands.
-GRADE_LOG_FIELDS = ('grader', 'grader_parsers', 'grader_user', 'lock_seconds', 'grade_detail', 'verifier_returncode',
-                    'verifier_reason', 'test_seconds', 'second_check')
-REVERTED_LOG_HEAD = 5
-
-
-def _reverted_summary(grade: dict) -> dict:
-    rp = grade.get('reverted_paths') or []
-    return {'reverted_count': len(rp), 'reverted_head': sorted(rp)[:REVERTED_LOG_HEAD]} if rp else {}
 
 
 def _sandbox_limits(rt) -> str:
@@ -81,8 +68,11 @@ def _build_version() -> str:
         return subprocess.run(['git', *args], capture_output=True, text=True, timeout=5, cwd=here)
     try:
         top = git('rev-parse', '--show-toplevel').stdout.strip()
-        mine = os.path.join(top, 'src', 'hosted_env', 'executor', 'core.py')
-        if not top or not os.path.isfile(mine) or not os.path.samefile(mine, __file__):
+        # this package's own checkout: <top>/src/hosted_env is the package this file belongs to (resolved from
+        # __file__, not a fixed path -- a fixed one went stale when executor/ moved under infra/, PR #23)
+        pkg = Path(__file__).resolve().parents[2]
+        mine = os.path.join(top, 'src', 'hosted_env')
+        if not top or not os.path.isdir(mine) or not os.path.samefile(mine, pkg):
             return __version__
         sha = git('rev-parse', '--short=12', 'HEAD').stdout.strip()
         st = git('status', '--porcelain', '--untracked-files=no')
@@ -90,10 +80,6 @@ def _build_version() -> str:
         return __version__
     mark = '.unknown' if st.returncode != 0 else '.dirty' if st.stdout.strip() else ''   # never claim clean unchecked
     return f'{__version__}+g{sha}{mark}' if sha else __version__
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest() if text else ''
 
 
 class WorkerError(Exception):
@@ -433,25 +419,12 @@ class Worker:
         return {'status': 'ok', 'seq': seq, 'done': False, 'tool_tokens': delta}
 
     def _receipt_context(self, s: RolloutSession, gi: dict, grade: dict) -> dict:
-        """receipt.CONTEXT_FIELDS for this rollout. Grading fields are empty ('' / None) when it was not graded."""
+        """receipt.CORE_FIELDS for this rollout plus the fields its environment declares (env.RECEIPT), which the
+        environment fills (env.receipt_context; gi and grade are {} when the rollout was not graded)."""
         r = s.rt.renderer
-        spec = s.envsess.spec if s.envsess is not None else {}
-        rc = grade.get('verifier_returncode')
-        state = s.envsess.state if s.envsess is not None else {}
-        return {'image': str(spec.get('image', '')), 'start_tree': str(state.get('start_tree', '')),
-                'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
-                'test_command_sha256': _sha256_text(gi.get('test_command', '')),
-                'grader': str(grade.get('grader', '')), 'grader_parsers': str(grade.get('grader_parsers', '')),
-                # the expected tests the grader was handed (gi is {} when the rollout was not graded -> '')
-                'expected_tests_sha256': expected_tests_digest(gi.get('fail_to_pass') or [],
-                                                               gi.get('pass_to_pass') or [],
-                                                               gi.get('report_kind') or ''),
-                'sandbox_limits': _sandbox_limits(s.rt),
-                'grader_user': str(grade.get('grader_user', '')),
-                'model_patch_sha256': str(grade.get('model_patch_sha256', '')),
-                'verifier_returncode': rc if type(rc) is int else None,
-                'model_id': r.model_id, 'model_revision': r.model_revision, **r.identity,
-                'executor_version': self.build_version, 'started_at_ms': int(s.started * 1000)}
+        core = {'sandbox_limits': _sandbox_limits(s.rt), 'model_id': r.model_id, 'model_revision': r.model_revision,
+                **r.identity, 'executor_version': self.build_version, 'started_at_ms': int(s.started * 1000)}
+        return {**s.rt.env.receipt_context(s.envsess, gi, grade), **core}
 
     def _finish(self, s: RolloutSession, seq: int, outcome: str, detail: str) -> dict:
         """Grade -> sign receipt -> report to gateway -> return."""
@@ -467,11 +440,10 @@ class Worker:
         receipt = sign_receipt(self.key, self.key_id, epoch=c['epoch'], hotkey=c['hotkey'], env_id=c['env_id'],
                                task=c['task'], nonce=c['nonce'], trajectory_sha256=s.hasher.hexdigest(),
                                n_tokens=s.hasher.n_tokens, outcome=outcome, reward=reward,
-                               context=self._receipt_context(s, gi, grade))
+                               context=self._receipt_context(s, gi, grade), spec=s.rt.env.RECEIPT)
         self._log({'sid': s.sid, 'event': 'finish', 'task': c['task'], 'nonce': c['nonce'], 'outcome': outcome,
                    'detail': detail, 'reward': reward, 'steps': s.steps, 'n_tokens': s.hasher.n_tokens,
-                   'wall_seconds': round(time.time() - s.started, 1), **s.stats,
-                   **{k: v for k, v in grade.items() if k in GRADE_LOG_FIELDS}, **_reverted_summary(grade)})
+                   'wall_seconds': round(time.time() - s.started, 1), **s.stats, **s.rt.env.log_fields(grade)})
         self._teardown(s)
         try:
             self.gw.close(s.sid, outcome, reward, receipt_digest(receipt))   # the group seal lists it

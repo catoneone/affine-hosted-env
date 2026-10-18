@@ -76,6 +76,7 @@ def cmd_mine(a):
 def cmd_verify(a):
     import httpx
 
+    from .envs import receipt_spec
     from .infra.common import verify_key_from_hex
     from .infra.receipt import ReceiptError
     from .infra.verify import verify_group
@@ -86,7 +87,8 @@ def cmd_verify(a):
     try:
         v = verify_group(att, keys, gateway_key=verify_key_from_hex(info['gateway_public_key']),
                          epoch=a.epoch or info['epoch'], hotkey=a.hotkey, env_id=att['env_id'],
-                         task=att['task'], group_size=env['group_size'], success_reward=env['success_reward'])
+                         task=att['task'], spec=receipt_spec(env['kind']), group_size=env['group_size'],
+                         success_reward=env['success_reward'])
     except ReceiptError as e:
         print(json.dumps({'ok': False, 'error': e.code}))
         sys.exit(1)

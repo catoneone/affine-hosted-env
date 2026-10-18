@@ -6,12 +6,13 @@ import json
 import pytest
 from nacl.signing import SigningKey
 
+from hosted_env.envs.swe.receipt import SPEC, expected_tests_digest
 from hosted_env.infra.common import b64u, unb64u
-from hosted_env.infra.receipt import (ReceiptError, TrajectoryHasher, expected_tests_digest, loss_mask, sign_receipt,
-                                trajectory_sha256, verify_receipt)
+from hosted_env.infra.receipt import (ReceiptError, TrajectoryHasher, loss_mask, sign_receipt, trajectory_sha256,
+                                      verify_receipt)
 from hosted_env.infra.verify import GROUP_ATTACHMENT_VERSION, verify_group
 
-ID = dict(epoch='e000001', hotkey='5Hotkey0', env_id='mimo_swe', task='002119', nonce=3)
+ID = dict(epoch='e000001', hotkey='5Hotkey0', env_id='mimo_swe', task='002119', nonce=3, spec=SPEC)
 SEGS = [('P', [151644, 8948, 198]), ('M', [40, 1184, 311, 1349]), ('T', [27, 14172, 9, 29]),
         ('M', [785, 5046, 151645])]
 CTX = {'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64, 'start_tree': '9' * 40,
@@ -199,7 +200,8 @@ def _seal(receipts, **kw):
     return sign_group_seal(GW, **{**args, **kw})
 
 
-GID = dict(epoch=ID['epoch'], hotkey=ID['hotkey'], env_id=ID['env_id'], task=ID['task'], gateway_key=GW.verify_key)
+GID = dict(epoch=ID['epoch'], hotkey=ID['hotkey'], env_id=ID['env_id'], task=ID['task'], gateway_key=GW.verify_key,
+           spec=SPEC)
 
 
 def test_group_ok_and_gate():
