@@ -35,7 +35,7 @@ Coordinator side (the task pool; no sandbox involved):
 
 | Member | Used for |
 |---|---|
-| `task_ids()` | the pool. Filter here what must not be offered: SWE drops tasks without expected tests (`require_expected_tests`) and unpinned images (`require_image_digest`); `indices` restricts the pool to the epoch's opening |
+| `task_ids()` | the pool. Filter what must not be offered in `_load` (which `task_ids`, `image_of`, `public_spec` and `grade_inputs` all read): the base drops unpinned images (`require_image_digest`) and keeps only the epoch's opening (`indices`); SWE also drops tasks without expected tests (`require_expected_tests`) |
 | `image_of(task)` | cache-aware placement |
 | `public_spec(task)` | what the executor gets when a rollout opens: `image`, `cwd`, the prompt material. **Nothing that grades** |
 | `grade_inputs(task)` | the grading material (hidden tests, expected results), sent to the executor only when it grades |
@@ -100,8 +100,9 @@ MY_SPEC = EnvReceiptSpec(
 
 - `fields` must not reuse a core or payload key (the constructor refuses). `*_sha256` fields must be lowercase
   hex of 64 characters or `''`.
-- `receipt_context(session, gi, grade)` returns exactly those fields for one rollout. `session` is `None` and
-  `gi` / `grade` are `{}` when the rollout never got that far, so every value needs a default.
+- `receipt_context(session, gi, grade)` returns exactly those fields for one rollout, from the session (its
+  `spec`, and `state` that `setup` filled, e.g. SWE's `start_tree`), the grade inputs and the grade. `session` is
+  `None` and `gi` / `grade` are `{}` when the rollout never got that far, so every value needs a default.
 - `artifacts(grade)` returns `{name: base64}` for each declared artifact; the miner's attachment carries them, and
   `verify_group` checks each against its sha256 field and size, then returns them. SWE ships the graded patch
   (`model_patch`), which is what makes an offline re-grade possible.
@@ -127,6 +128,10 @@ MY_SPEC = EnvReceiptSpec(
    group_size = 8
    sandbox = "k8s"
    ```
+
+   The whole table reaches the class as `cfg`; the executor-side keys (`sandbox`, `sandbox_opts`, `renderer`,
+   context and step limits) are shown in `examples/server.toml`, and an environment's own keys (SWE:
+   `grader_user`, `require_expected_tests`, ...) are read in its class.
 
 ## Tests to write
 
