@@ -23,8 +23,19 @@ from ..base import DockerTaskEnv, EnvSession, GradeError, SetupError
 from .cleanup import anti_hack_cleanup, future_commits, git_strip
 from .protect import (_JS_CONFIG_RE, GRADER_PARSERS, STRUCTURED_MANIFESTS, jsts_config_refs, manifest_reverts,
                       protected_paths, shadow_added)
+from .receipt import SPEC as RECEIPT_SPEC
+from .receipt import expected_tests_digest
 from .reports import _REPORT_EXT, _REPORT_PARSERS, GO_REPORT_SHIM, report_verdict
 from .scripts import command_repo_paths, script_named_files, script_protected, test_patch_scripts
+
+# grade() fields the executor's per-rollout log line keeps (SweEnv.log_fields), and how many reverted paths it lists
+GRADE_LOG_FIELDS = ('grader', 'grader_parsers', 'grader_user', 'lock_seconds', 'grade_detail', 'verifier_returncode',
+                    'verifier_reason', 'test_seconds', 'second_check')
+REVERTED_LOG_HEAD = 5
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest() if text else ''
 
 
 TEST_PATCH_REMOTE = '/tmp/_hosted_env_test.patch'
@@ -79,6 +90,38 @@ class SweEnv(DockerTaskEnv):
         r = self._load()[task]
         extra = {k: r[k] for k in ('fail_to_pass', 'pass_to_pass', 'report_kind') if r.get(k)}
         return {**super().grade_inputs(task), 'test_patch': r['test_patch'], **extra}
+
+    # ------------------------------------------------ what the infrastructure signs and logs (envs.swe.receipt)
+    RECEIPT = RECEIPT_SPEC
+
+    def receipt_context(self, s: EnvSession | None, gi: dict, grade: dict) -> dict:
+        """SPEC's fields for one rollout: the task the reward is a function of (image, start tree, the hidden test
+        patch and command, the expected tests the second check used) and how it was graded. Grading fields are
+        '' / None when the rollout was not graded (gi and grade are {})."""
+        spec = s.spec if s is not None else {}
+        state = s.state if s is not None else {}
+        rc = grade.get('verifier_returncode')
+        return {'image': str(spec.get('image', '')), 'start_tree': str(state.get('start_tree', '')),
+                'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
+                'test_command_sha256': _sha256_text(gi.get('test_command', '')),
+                'grader': str(grade.get('grader', '')), 'grader_parsers': str(grade.get('grader_parsers', '')),
+                'expected_tests_sha256': expected_tests_digest(gi.get('fail_to_pass') or [],
+                                                               gi.get('pass_to_pass') or [],
+                                                               gi.get('report_kind') or ''),
+                'grader_user': str(grade.get('grader_user', '')),
+                'model_patch_sha256': str(grade.get('model_patch_sha256', '')),
+                'verifier_returncode': rc if type(rc) is int else None}
+
+    def log_fields(self, grade: dict) -> dict:
+        """How the rollout was graded and what the verifier said (model_patch and test_output are too large for
+        the log). second_check is the per-test-id verdict on a task with expected tests (absent otherwise), so a
+        live rollout that the exit code passed but the second check failed is visible. The protected files the
+        grader put back are a count plus the first few: a patch that touches node_modules/ can revert thousands."""
+        out = {k: grade[k] for k in GRADE_LOG_FIELDS if k in grade}
+        rp = grade.get('reverted_paths') or []
+        if rp:
+            out.update(reverted_count=len(rp), reverted_head=sorted(rp)[:REVERTED_LOG_HEAD])
+        return out
 
     def _prepare_repo(self, sb, repo: str, lang: str) -> str:
         """Bring a fresh container's repo to the base state the model starts from (also used for the grading

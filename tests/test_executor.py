@@ -74,7 +74,8 @@ def run(w, tok, *turns):
 
 def check_receipt(res, segs, t, nonce, wkey):
     return verify_receipt(res['receipt'], segs, {key_id(wkey.verify_key): wkey.verify_key}, epoch=EPOCH,
-                          hotkey='5H0', env_id='swe', task=t['task'], nonce=nonce)
+                          hotkey='5H0', env_id='swe', task=t['task'], nonce=nonce,
+                          spec=SweEnv.RECEIPT)
 
 
 def test_fix_and_submit(rig):

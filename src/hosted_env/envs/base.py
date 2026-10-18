@@ -12,9 +12,12 @@ The gateway and the worker use the same class:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
+
+from ..infra.receipt import EnvReceiptSpec
 
 # The bash tool and observation format follow Xiaomi mimoagent's bash-only config (copied verbatim by the
 # EXP-014 harness, MIT)
@@ -215,3 +218,21 @@ class DockerTaskEnv:
         r = s.sb.execute(gi['test_command'], cwd=s.spec['cwd'], timeout=gi['verifier_timeout'])
         return {'reward': 1.0 if r['returncode'] == 0 else 0.0, 'verifier_returncode': r['returncode'],
                 'verifier_reason': r['reason'], 'test_output': r['output'][-3000:]}
+
+    # ------------------------------------------------ what the infrastructure signs and logs
+    # RECEIPT names the context fields this kind adds to every receipt (the infrastructure adds its own core
+    # fields); receipt_context fills exactly those for one rollout, from its session (None when setup never
+    # produced one), the grade inputs and the grade ({} when the rollout was not graded).
+    RECEIPT = EnvReceiptSpec(fields={'image': str, 'test_command_sha256': str,
+                                     'verifier_returncode': (int, type(None))})
+
+    def receipt_context(self, s: EnvSession | None, gi: dict, grade: dict) -> dict:
+        rc = grade.get('verifier_returncode')
+        cmd = gi.get('test_command', '')
+        return {'image': str((s.spec if s is not None else {}).get('image', '')),
+                'test_command_sha256': hashlib.sha256(cmd.encode()).hexdigest() if cmd else '',
+                'verifier_returncode': rc if type(rc) is int else None}
+
+    def log_fields(self, grade: dict) -> dict:
+        """Grade details for the executor's per-rollout log line (small values only, never test output)."""
+        return {k: grade[k] for k in ('verifier_returncode', 'verifier_reason', 'grade_detail') if k in grade}

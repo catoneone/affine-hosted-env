@@ -106,7 +106,7 @@ def test_group_end_to_end(stack):
     info, keys = trusted(stack)
     assert key_id(stack['wkey'].verify_key) in keys and info['envs']['swe']['group_size'] == 8
     att = json.loads(json.dumps(res['attachment']))                    # round-trip through JSON, same as reading it back after upload
-    v = verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
+    v = verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', spec=SweEnv.RECEIPT, task=res['task']['task'])
     assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
     assert all(sum(m) > 0 for m in v['loss_masks'])
     c0 = v['claims'][0]                                                # receipt v2 context, set by the worker
@@ -121,9 +121,9 @@ def test_group_end_to_end(stack):
     assert seg['src'] == 'T'
     seg['ids'][3] = r.encode('!')[0]                                   # tamper with tool output
     with pytest.raises(ReceiptError, match='trajectory_mismatch'):
-        verify_group(bad, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', task=res['task']['task'])
+        verify_group(bad, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', spec=SweEnv.RECEIPT, task=res['task']['task'])
     with pytest.raises(ReceiptError, match='identity_mismatch'):        # someone else claims this group
-        verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H1', env_id='swe', task=res['task']['task'])
+        verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H1', env_id='swe', spec=SweEnv.RECEIPT, task=res['task']['task'])
 
     # a qualified task is not assigned again this epoch; the remaining one goes to someone else
     gw1 = GatewayClient(stack['gw'].url, '5H1', stack['miners']['5H1'])
@@ -148,7 +148,7 @@ def test_smoke_replies_end_to_end(stack):
     assert '[TRUNCATION WARNING]' in tool_texts[4]
     info, keys = trusted(stack)
     with pytest.raises(ReceiptError, match='group_gate_failed'):         # all completed but none correct: group not qualified
-        verify_group(res['attachment'], keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe',
+        verify_group(res['attachment'], keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', spec=SweEnv.RECEIPT,
                      task=res['task']['task'])
 
 
@@ -218,7 +218,7 @@ def test_single_process_group_and_data_plane_limit(tmp_path):
         from hosted_env.infra.common import verify_key_from_hex
         keys = {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
         v = verify_group(json.loads(json.dumps(res['attachment'])), keys, gateway_key=gw_key(info), epoch=EPOCH,
-                         hotkey='5H0', env_id='swe', task=res['task']['task'])
+                         hotkey='5H0', env_id='swe', spec=SweEnv.RECEIPT, task=res['task']['task'])
         assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
         assert httpx.get(gw.url + '/v1/health').json()['worker_id'] == 'local'
         bad = httpx.post(gw.url + '/v1/start', json={}, headers={'Authorization': 'Bearer nope'})
@@ -231,17 +231,18 @@ def test_receipt_context_binds_expected_tests():
     from types import SimpleNamespace
 
     from hosted_env.infra.executor.core import Worker
-    from hosted_env.infra.receipt import expected_tests_digest
+    from hosted_env.envs.swe.receipt import expected_tests_digest
     rend = SimpleNamespace(model_id='m', model_revision='r', identity={'tokenizer_sha256': '', 'chat_template_sha256': '',
                                                                      'renderer': 'char'})
-    s = SimpleNamespace(rt=SimpleNamespace(renderer=rend, sandbox='local', sandbox_opts={}), envsess=None,
-                        started=1.0)
+    s = SimpleNamespace(rt=SimpleNamespace(renderer=rend, sandbox='local', sandbox_opts={}, env=SweEnv('swe', {})),
+                        envsess=None, started=1.0)
     me = SimpleNamespace(build_version='t')
     gi = {'test_patch': 'p', 'test_command': 'c', 'report_kind': 'junit',
           'fail_to_pass': ['tests/test_a.py::t1'], 'pass_to_pass': ['tests/test_a.py::t0']}
     ctx = Worker._receipt_context(me, s, gi, {'grader': 'isolated-v3'})
     assert ctx['expected_tests_sha256'] == expected_tests_digest(['tests/test_a.py::t1'], ['tests/test_a.py::t0'],
                                                                 'junit') != ''
+    assert set(ctx) == set(SweEnv.RECEIPT.context_fields())       # infra's core fields + the env's, nothing else
     assert Worker._receipt_context(me, s, {}, {})['expected_tests_sha256'] == ''
 
 
