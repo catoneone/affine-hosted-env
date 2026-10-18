@@ -61,7 +61,7 @@ def cmd_baseline(a):
 
 def register(sub) -> None:
     bl = sub.add_parser('baseline', help='Derive each task\'s expected tests (fail_to_pass / pass_to_pass) by grading '
-                                         'an empty rollout with the real grader (pytest, go test, jest/vitest/mocha)')
+                                         'an empty rollout with the real grader (pytest tasks for now)')
     bl.add_argument('--config', required=True, help='the server / worker config whose [envs] has the env')
     bl.add_argument('--env', required=True)
     bl.add_argument('--out', required=True, help='append one JSON record per task here')

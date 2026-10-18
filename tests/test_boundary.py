@@ -70,6 +70,16 @@ def test_infra_code_names_no_swe_concept():
     assert not hits, 'SWE concepts in infra code:\n' + '\n'.join(hits)
 
 
+def test_importing_the_registry_stays_light():
+    """A validator imports hosted_env.envs (receipt_spec) to verify attachments; the environments' CLI helpers
+    registered there (pin-images talks to registries) must not pull an HTTP client in at import time."""
+    import subprocess
+    import sys
+    r = subprocess.run([sys.executable, '-c', 'import sys, hosted_env.envs; print("httpx" in sys.modules)'],
+                       capture_output=True, text=True, check=True)
+    assert r.stdout.strip() == 'False'
+
+
 def test_the_checks_catch_a_violation(tmp_path, monkeypatch):
     """The two checks above would fail on the shapes they guard against (a lazy import of envs.swe, a field name
     in a string), so passing them means something."""

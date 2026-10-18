@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:          # httpx is imported where it is used: `import hosted_env.envs` (validators) needs none
+    import httpx
 
 MANIFEST_TYPES = ', '.join((
     'application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json',
@@ -46,7 +48,9 @@ def split_ref(image: str) -> tuple[str, str, str]:
 def resolve_digest(image: str, http: httpx.Client | None = None) -> str:
     """The registry's content digest for `image` (`name:tag`)."""
     registry, repo, tag = split_ref(image)
-    http = http or httpx.Client(timeout=30, follow_redirects=True)
+    if http is None:
+        import httpx
+        http = httpx.Client(timeout=30, follow_redirects=True)
     headers = {'Accept': MANIFEST_TYPES}
     if registry == 'registry-1.docker.io':
         t = http.get('https://auth.docker.io/token',
