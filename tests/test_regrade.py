@@ -39,16 +39,17 @@ def test_regrade_reproduces_the_grade(tmp_path):
         env.regrade(task, b'x' * 2_000_001, start, factory)
 
 
-def _cli(tmp_path, stack, att, tasks):  # noqa: F811
+def _cli(tmp_path, stack, att, tasks, sandbox='local', extra=()):  # noqa: F811
     from hosted_env.cli import main
     (tmp_path / 'att.json').write_text(json.dumps(att))
     cfg = tmp_path / 'regrade.toml'
-    cfg.write_text(f'[envs.swe]\nkind = "mimo_swe"\ntasks = "{tasks}"\nsandbox = "local"\ngrader_user = "root"\n'
+    # no grader_user: the re-grade grades as the receipts say the rollouts were graded (root in this stack)
+    cfg.write_text(f'[envs.swe]\nkind = "mimo_swe"\ntasks = "{tasks}"\nsandbox = "{sandbox}"\n'
                    f'require_image_digest = false\ncleanup = false\n[envs.swe.sandbox_opts]\n'
                    f'base_dir = "{tmp_path}"\n')
     with pytest.raises(SystemExit) as e:
         main(['regrade', '--attachment', str(tmp_path / 'att.json'), '--gateway', stack['gw'].url, '--tasks', tasks,
-              '--config', str(cfg)])
+              '--config', str(cfg), *extra])
     return e.value.code
 
 
@@ -75,3 +76,43 @@ def test_regrade_cli_end_to_end(stack, tmp_path, capsys):  # noqa: F811
     mine.write_text(''.join(json.dumps({**x, 'problem_statement': 'edited'}) + '\n' for x in rows))
     assert _cli(tmp_path, stack, att, str(mine)) == 1
     assert json.loads(capsys.readouterr().out.splitlines()[-1])['error'] == 'task_hash_mismatch'
+
+
+def _group(stack, fixed):  # noqa: F811
+    from conftest import FIX as ROLLOUT_FIX
+
+    from hosted_env.infra.client import GatewayClient
+    r = CharRenderer()
+    gw = GatewayClient(stack['gw'].url, '5H0', stack['miners']['5H0'])
+    sampler = ScriptedSampler(r.encode, r.turn_end_id, {n: [ROLLOUT_FIX, 'Fixed.'] if n in fixed else ['Nothing.']
+                                                        for n in range(8)})
+    return run_task(gw, EPOCH, 'swe', sampler)['attachment'], stack['store']._env('swe').cfg['tasks']
+
+
+def test_regrade_grades_only_verified_patches(stack, tmp_path, capsys):  # noqa: F811
+    """A group that fails only the pass/fail gate (here: every rollout fixed) is still re-graded -- but only from
+    verified data: a patch swapped into its attachment is refused, never graded."""
+    import base64
+    att, tasks = _group(stack, fixed=set(range(8)))
+    capsys.readouterr()
+    assert _cli(tmp_path, stack, att, tasks) == 0                    # gate fails, every rollout still re-graded
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])['regraded'] == 8
+    bad = json.loads(json.dumps(att))
+    bad['rollouts'][0]['artifacts']['model_patch'] = base64.b64encode(b'diff --git a/x b/x\n').decode()
+    assert _cli(tmp_path, stack, bad, tasks) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])['error'] == 'artifact_mismatch'
+
+
+def test_regrade_refuses_other_sandbox_limits(stack, tmp_path, capsys):  # noqa: F811
+    att, tasks = _group(stack, fixed={0})
+    capsys.readouterr()
+    assert _cli(tmp_path, stack, att, tasks, sandbox='docker') == 1  # receipts say 'local'; nothing is graded
+    out = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert out['error'] == 'sandbox_limits_mismatch' and out['receipt'] == 'local'
+
+
+def test_regrade_refuses_a_grader_user_typo(tmp_path):
+    env, task, factory, patch, start = _captured(tmp_path, lambda sb: sb.execute(FIX, cwd='/testbed'))
+    env.cfg['grader_user'] = 'noboby'
+    with pytest.raises(GradeError, match='grader_user'):
+        env.regrade(task, patch, start, factory)

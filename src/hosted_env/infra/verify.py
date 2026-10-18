@@ -57,7 +57,7 @@ def _artifacts(r: Mapping, claims: Mapping, spec: EnvReceiptSpec) -> dict[str, b
 
 def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, gateway_key: VerifyKey, epoch: str,
                  hotkey: str, env_id: str, task: str, spec: EnvReceiptSpec | None = None, group_size: int = 8,
-                 success_reward: float = 1.0, expect: Mapping | None = None) -> dict:
+                 success_reward: float = 1.0, expect: Mapping | None = None, require_gate: bool = True) -> dict:
     """On success returns {'claims': [receipt contents ordered by nonce], 'loss_masks': [...], 'segments': [...],
     'artifacts': [{name: bytes} per nonce], 'seal': seal contents}. trusted_keys are the worker keys, gateway_key
     the key that signs group seals (both from the epoch's opening). spec optionally pins the receipt spec of the
@@ -65,7 +65,9 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
     gateway's /v1/info); omitted, each receipt's env_spec is looked up in receipt.SPECS. Either way every receipt
     of the group must name the same env_spec and carry exactly its fields, so another environment's spec rejects
     it rather than checking less. expect is passed to every verify_receipt (e.g. the task_hash, image and test
-    hashes from the verifier's own task pool, its tokenizer_sha256)."""
+    hashes from the verifier's own task pool, its tokenizer_sha256). require_gate=False skips only the two
+    group-level rules (no infra error, one pass and one fail) -- for a re-grade, which needs every rollout's
+    verified receipt and artifacts whatever the group's outcome; everything else is checked the same."""
     if spec is not None:
         check_expect(expect, spec)
     if not isinstance(attachment, Mapping) or attachment.get('version') != GROUP_ATTACHMENT_VERSION:
@@ -105,9 +107,12 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
         artifacts.append(_artifacts(r, claims[-1], resolve_spec(claims[-1], spec)))
         segs.append(s)
         masks.append(loss_mask(s))
+    result = {'claims': claims, 'loss_masks': masks, 'segments': segs, 'artifacts': artifacts, 'seal': seal}
+    if not require_gate:
+        return result
     if any(c['outcome'] == 'infra_error' for c in claims):
         raise ReceiptError('infra_error_in_group')
     done = [c for c in claims if c['outcome'] == 'completed']
     if not (any(c['reward'] >= success_reward for c in done) and any(c['reward'] < success_reward for c in done)):
         raise ReceiptError('group_gate_failed')     # at least one completed and correct, one completed and wrong
-    return {'claims': claims, 'loss_masks': masks, 'segments': segs, 'artifacts': artifacts, 'seal': seal}
+    return result

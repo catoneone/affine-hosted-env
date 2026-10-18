@@ -480,6 +480,8 @@ fi
 
     def _grade_patch(self, s: EnvSession, gi: dict, patch: bytes, res: dict) -> dict:
         """The captured patch, graded in a fresh container, and a pass checked again by the canary."""
+        if res['grader_user'] not in ('root', 'nobody'):    # a typo must not silently pick one (grade and regrade)
+            raise GradeError(f'grader_user must be "root" or "nobody", not {res["grader_user"]!r}')
         out = self._grade_fresh(s, gi, patch, res)
         if (self.cfg.get('canary', True) and out.get('reward') == 1.0 and out.get('second_check') is True
                 and gi.get('report_kind') in CANARY_KINDS and not gi.get('collect_report')):

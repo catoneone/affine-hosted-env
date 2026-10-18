@@ -405,3 +405,19 @@ def test_a_group_has_one_env_spec():
     no_spec = {k: v for k, v in GID.items() if k != 'spec'}
     with pytest.raises(ReceiptError, match='env_spec_mismatch'):
         verify_group(g, keys, **no_spec)
+
+
+def test_require_gate_false_skips_only_the_group_rules():
+    """A re-grade needs the verified claims and artifacts of a group whatever its outcome: require_gate=False skips
+    the pass/fail and infra-error rules and nothing else."""
+    import base64
+    wk = SigningKey.generate()
+    keys = {'w1': wk.verify_key}
+    allpass = _group(wk, [('completed', 1.0)] * 8)
+    with pytest.raises(ReceiptError, match='group_gate_failed'):
+        verify_group(allpass, keys, **GID)
+    v = verify_group(allpass, keys, **GID, require_gate=False)
+    assert [c['reward'] for c in v['claims']] == [1.0] * 8 and v['artifacts'][0]['model_patch']
+    allpass['rollouts'][3]['artifacts']['model_patch'] = base64.b64encode(b'other').decode()
+    with pytest.raises(ReceiptError, match='artifact_mismatch'):     # still checked
+        verify_group(allpass, keys, **GID, require_gate=False)
