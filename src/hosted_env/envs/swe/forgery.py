@@ -8,9 +8,14 @@ trustworthy; they make the cheap forgeries fail and leave a verifier the same ru
 - patch_audit: the graded patch may not add test-framework output to the code it keeps (the literal forms a forge
   prints or writes), unless the base repository already has that text (a repo that is itself a test reporter), and
   may not name our report plumbing at all.
-- canary: a rollout that passes is graded once more in a fresh container with one randomly chosen fail_to_pass test
-  edited to fail at its first statement. A real run reports that test failed; a forge that reports "passed" for
-  the tests it finds, or exits before they run, does not. To beat it a forge has to spot the edit at run time.
+- canary: a rollout that passes is graded once more in a fresh container with every expected test edited to fail
+  at its first statement. A real run reports each of them failed; a forge that reports "passed" for the tests it
+  finds, or exits before they run, does not. To beat it a forge has to spot the edits at run time.
+  Known costs: the re-run uses the same limits and timeout, and any way it ends other than "every edited test
+  failed" scores 0 (a forge that spots the canary could otherwise just make that run fail some other way), so an
+  honest pass whose re-run hits the timeout or a flaky infrastructure limit loses it. Tests that cannot be edited
+  (xfail files, a def found twice, a Go brace not on the signature line) are not checked; jest / vitest / mocha
+  have no canary yet.
 """
 from __future__ import annotations
 
@@ -120,6 +125,8 @@ def edit_python(src: str, classes: list[str], func: str, stmt: str) -> str | Non
     return '\n'.join([*lines[:i], before.decode() + stmt, *lines[i:]])
 
 
+# the brace on the signature line, as gofmt writes it; a test written otherwise is not edited (not checked, never a
+# false fail)
 _GO_FUNC = r'^func\s+{name}\s*\(\s*(\w+)\s+\*\s*testing\.T\s*\)\s*\{{'
 
 
