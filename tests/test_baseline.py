@@ -464,3 +464,35 @@ def test_derive_js_amends_the_harness_then_grades(tmp_path, monkeypatch):
     g = grade_after('printf "module.exports = (a, b) => a + b\\n" > sum.js')
     assert g['reward'] == 1.0 and g['second_check'] is True, g.get('grade_detail')
     assert grade_after()['reward'] == 0.0
+
+
+def test_amended_rows_record_their_source_and_can_be_checked(tmp_path):
+    """A JS row whose harness the baseline amended says which source row it came from (its task_hash) and by which
+    rule; check_amendment re-runs the rule on the source row and accepts only that exact change. A non-amended
+    row gets the expected tests and nothing else."""
+    from hosted_env.envs.swe.baseline import AMEND_RULE, amend_test_patch, check_amendment, merge_baseline
+    from hosted_env.infra.receipt import task_hash
+    script = 'set -e\ncd /testbed\nnpx jest src/a.test.js --ci\n'
+    tp = _patch_adding(tmp_path, {'src/a.test.js': 'test("x", () => {})\n', 'mimo_test_command.sh': script})
+    src = {'id': '002080', 'image': 'x@sha256:' + '0' * 64, 'test_patch': tp,
+           'test_command': 'bash /testbed/mimo_test_command.sh', 'problem_statement': 'p'}
+    amended = amend_test_patch(src['test_patch'], src['test_command'])
+    rec = {'report_kind': 'jest', 'fail_to_pass': ['a x'], 'pass_to_pass': [], 'test_patch': amended['test_patch']}
+    row = merge_baseline(src, rec)
+    assert row['amended_from'] == {'task_hash': task_hash(src), 'rule': AMEND_RULE, 'fields': ['test_patch']}
+    assert row['test_patch'] == amended['test_patch'] and row['test_command'] == src['test_command']
+    assert check_amendment(src, row) is None
+    assert task_hash(row) != task_hash(src)                       # the receipt binds the amended row
+    for bad, why in (({**row, 'test_patch': row['test_patch'].replace('--json', '--json --silent')}, 'test_patch'),
+                     ({**row, 'problem_statement': 'q'}, 'problem_statement'),
+                     ({**row, 'extra': 1}, 'extra'),
+                     ({**row, 'amended_from': {**row['amended_from'], 'task_hash': '0' * 64}}, 'source row'),
+                     ({**row, 'amended_from': {**row['amended_from'], 'rule': 'other'}}, 'rule'),
+                     ({**row, 'report_kind': 'junit'}, 'report_kind')):
+        assert why in (check_amendment(src, bad) or '')
+    assert 'not the source row' in check_amendment({**src, 'problem_statement': 'other'}, row)
+    py = {'id': '000320', 'test_patch': 'diff', 'test_command': 'pytest'}
+    got = merge_baseline(py, {'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': ['t::b']})
+    assert got == {**py, 'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': ['t::b']}
+    assert merge_baseline(py, {'report_kind': '', 'fail_to_pass': []}) is py   # nothing derived: unchanged
+    assert 'not amended' in check_amendment(py, got)

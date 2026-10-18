@@ -47,15 +47,10 @@ def cmd_baseline(a):
                              {'f2p': len(rec.get('fail_to_pass') or []), 'p2p': len(rec.get('pass_to_pass') or [])}),
                   flush=True)
     if a.tasks_out:
+        from .baseline import merge_baseline
         rows = [json.loads(x) for x in Path(ecfg['tasks']).read_text().splitlines() if x.strip()]
-        for r in rows:
-            rec = done.get(str(r['id']))
-            if rec and rec.get('report_kind') and rec.get('fail_to_pass'):
-                r.update(report_kind=rec['report_kind'], fail_to_pass=rec['fail_to_pass'],
-                         pass_to_pass=rec['pass_to_pass'])
-                # a JS task's grading script amended to write the report (baseline.amend_test_patch): the
-                # expected tests only hold for the amended harness, so it replaces the original in the index
-                r.update({k: rec[k] for k in ('test_patch', 'test_command') if rec.get(k)})
+        # expected tests, and for a JS task the amended harness they hold for (with its provenance)
+        rows = [merge_baseline(r, done.get(str(r['id'])) or {}) for r in rows]
         Path(a.tasks_out).write_text(''.join(json.dumps(r) + '\n' for r in rows))
 
 

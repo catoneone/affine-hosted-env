@@ -91,13 +91,16 @@ It is the minimal example and a test fixture, not something to pay rewards on.
 A receipt binds the infrastructure's core fields plus the fields the environment declares:
 
 ```python
-MY_SPEC = EnvReceiptSpec(
+MY_SPEC = register_spec(EnvReceiptSpec(
+    id='my_env/1',                                                 # signed in every receipt as env_spec
     fields={'image': str, 'answer_sha256': str, 'checker': str},   # all required, typed, signed flat
     hex_lengths={},                                                # non-*_sha256 hex fields and their length
     artifacts={'answer': ('answer_sha256', 64 * 1024)},            # attachment name -> (its sha256 field, max bytes)
-)
+))
 ```
 
+- `id` is `<name>/<version>`. `register_spec` adds the spec to `receipt.SPECS`, where a verifier that passes no
+  `spec=` finds it by the receipt's `env_spec`; it refuses a different spec under an id already registered.
 - `fields` must not reuse a core or payload key (the constructor refuses). `*_sha256` fields must be lowercase
   hex of 64 characters or `''`.
 - `receipt_context(session, gi, grade)` returns exactly those fields for one rollout, from the session (its
@@ -107,11 +110,13 @@ MY_SPEC = EnvReceiptSpec(
   `verify_group` checks each against its sha256 field and size, then returns them. SWE ships the graded patch
   (`model_patch`), which is what makes an offline re-grade possible.
 - `log_fields(grade)` picks small values for the executor's per-rollout log line (never test output).
-- Verifiers call `receipt_spec(kind)` (kind from the gateway's `/v1/info`), so the spec must import cheaply:
-  keep it in its own module with standard-library imports only (`envs/swe/receipt.py`). A receipt checked with
-  another environment's spec fails in both directions.
-- Changing a spec changes the wire format: validators need the new code before receipts carrying it are
-  submitted. Pin it with a test (`test_swe_receipt_fields_unchanged`).
+- Verifiers find the spec by `env_spec` or call `receipt_spec(kind)` (kind from the gateway's `/v1/info`), and
+  `hosted_env` imports the registry so the specs are registered: the spec must import cheaply. Keep it in its own
+  module with standard-library imports only (`envs/swe/receipt.py`). A receipt checked with another environment's
+  spec fails in both directions (`env_spec_mismatch`, and the exact field set behind it).
+- Changing a spec's fields is a new spec version (`my_env/2`): keep the old spec registered so receipts signed
+  under it still verify, and never change the fields under an existing id. Pin each version with a test
+  (`test_swe_receipt_fields_unchanged`). The rules are in [formats.md](formats.md).
 
 ## Registering it
 

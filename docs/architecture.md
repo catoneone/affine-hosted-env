@@ -33,8 +33,10 @@ The code is split in two (since 2026-10-18):
 
 The seams are small: the coordinator calls `task_ids` / `image_of` / `public_spec` / `grade_inputs`; the executor
 calls `open`, the session's `setup` / `call_tool` / `grade`, then `receipt_context`, `log_fields` and
-`artifacts`; `sign_receipt`, `verify_receipt` and `verify_group` take the environment's spec, which verifiers get
-from `hosted_env.envs.receipt_spec(kind)`. An exception out of `setup` or `grade` voids the rollout, so deciding
+`artifacts`; `sign_receipt` takes the environment's spec and stamps its id in the receipt (`env_spec`), and
+`verify_receipt` / `verify_group` find the spec by that id among the registered ones or take a pinned one
+(`hosted_env.envs.receipt_spec(kind)`; formats in [formats.md](formats.md)). An exception out of `setup` or
+`grade` voids the rollout, so deciding
 what is the model's fault (score 0) is the environment's job. `tests/test_boundary.py` fails if infra imports a
 concrete environment or names SWE concepts. How to add one: [adding-an-environment.md](adding-an-environment.md).
 

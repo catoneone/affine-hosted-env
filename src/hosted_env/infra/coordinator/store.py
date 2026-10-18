@@ -448,7 +448,7 @@ class Store:
             node = cur.execute('SELECT node FROM tasks WHERE task_id=?', (task_id,)).fetchone()[0]
         env = self._env(env_id)
         return {'env_id': env_id, 'task': task, 'group_size': env.group_size, 'spec': env.public_spec(task),
-                'node': node}
+                'task_hash': env.task_hash(task), 'node': node}
 
     def worker_grade_inputs(self, worker_id: str, session_id: str) -> dict:
         with self._tx() as cur:

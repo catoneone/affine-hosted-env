@@ -130,7 +130,7 @@ The miner uploads the group's 8 rollouts through the existing complete-group flo
 Implemented in `src/hosted_env/infra/receipt.py` and `src/hosted_env/infra/verify.py` (tests: `tests/test_receipt.py`).
 
 - **Trajectory hash**: the worker incrementally hashes `[(source, token ids)...]`. Each segment is encoded as 1 byte of source + segment length u32 + each token id as u32 (little-endian); it must start with P, and adjacent segments must have different sources.
-- **Receipt content**: epoch, hotkey, env_id, task, nonce, trajectory hash, token count, outcome (completed / unresolved / infra_error), reward, worker key id, issue time, signed with the worker's Ed25519 key.
+- **Receipt content**: epoch, hotkey, env_id, task, nonce, trajectory hash, token count, outcome (completed / unresolved / infra_error), reward, worker key id, issue time, the environment field set (`env_spec`) and what the reward depends on (the served task row's `task_hash`, model and sandbox context, the environment's grading fields), signed with the worker's Ed25519 key. Version 3; the frozen field tables and versioning rules are in [formats.md](formats.md).
 - **Worker public keys**: registered with the gateway at boot, rotated every 24 hours, and signed into each epoch's opening by the operator authority. Validators already trust the authority.
 - **Verification**: one `verify_receipt` call per rollout:
   1. The signature is valid and the key is in this epoch's trusted list;

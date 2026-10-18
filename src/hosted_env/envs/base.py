@@ -17,7 +17,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from ..infra.receipt import EnvReceiptSpec
+from ..infra.receipt import EnvReceiptSpec, register_spec, task_hash
 
 # The bash tool and observation format follow Xiaomi mimoagent's bash-only config (copied verbatim by the
 # EXP-014 harness, MIT)
@@ -222,6 +222,12 @@ class DockerTaskEnv:
     def image_of(self, task: str) -> str | None:
         return self._load()[task].get('image')
 
+    def task_hash(self, task: str) -> str:
+        """infra.receipt.task_hash of the task-index row exactly as loaded (every field, including derived ones
+        such as expected tests and an amended harness): the receipt's task_hash, which a verifier recomputes from
+        its own copy of the index."""
+        return task_hash(self._load()[task])
+
     def public_spec(self, task: str) -> dict:
         r = self._load()[task]
         return {'id': str(r['id']), 'image': r['image'], 'cwd': r['cwd'], 'lang': r.get('lang', ''),
@@ -260,8 +266,8 @@ class DockerTaskEnv:
     # RECEIPT names the context fields this kind adds to every receipt (the infrastructure adds its own core
     # fields); receipt_context fills exactly those for one rollout, from its session (None when setup never
     # produced one), the grade inputs and the grade ({} when the rollout was not graded).
-    RECEIPT = EnvReceiptSpec(fields={'image': str, 'test_command_sha256': str,
-                                     'verifier_returncode': (int, type(None))})
+    RECEIPT = register_spec(EnvReceiptSpec(id='docker_task/1', fields={
+        'image': str, 'test_command_sha256': str, 'verifier_returncode': (int, type(None))}))
 
     def receipt_context(self, s: EnvSession | None, gi: dict, grade: dict) -> dict:
         rc = grade.get('verifier_returncode')

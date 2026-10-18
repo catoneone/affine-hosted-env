@@ -15,7 +15,8 @@ from hosted_env.infra.verify import GROUP_ATTACHMENT_VERSION, verify_group
 ID = dict(epoch='e000001', hotkey='5Hotkey0', env_id='mimo_swe', task='002119', nonce=3, spec=SPEC)
 SEGS = [('P', [151644, 8948, 198]), ('M', [40, 1184, 311, 1349]), ('T', [27, 14172, 9, 29]),
         ('M', [785, 5046, 151645])]
-CTX = {'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64, 'start_tree': '9' * 40,
+CTX = {'task_hash': '7' * 64, 'image': 'docker.io/xiaomimimo/mimo-v2.6-rl-oss@sha256:' + 'c' * 64,
+       'start_tree': '9' * 40,
        'test_patch_sha256': 'a' * 64,
        'test_command_sha256': 'b' * 64, 'grader': 'isolated-v3', 'grader_parsers': 'py3.12:tomllib+json+configparser',
        'expected_tests_sha256': '',
@@ -42,17 +43,17 @@ def setup():
 def test_roundtrip(setup):
     _, keys, r = setup
     c = verify_receipt(r, SEGS, keys, **ID)
-    assert (c['outcome'], c['reward'], c['n_tokens'], c['v']) == ('completed', 1.0, 14, 2)
+    assert (c['outcome'], c['reward'], c['n_tokens'], c['v'], c['env_spec']) == ('completed', 1.0, 14, 3, 'swe/1')
     assert {k: c[k] for k in CTX} == CTX and c['issued_at_ms'] == 1_800_000_123_456
 
 
 def test_context_is_complete_and_typed():
-    """The worker cannot sign a v2 receipt that leaves out what the reward depends on, or adds to it."""
+    """The worker cannot sign a receipt that leaves out what the reward depends on, or adds to it."""
     wk = SigningKey.generate()
     for bad in ({k: v for k, v in CTX.items() if k != 'image'}, {**CTX, 'extra': 'x'},
                 {**CTX, 'verifier_returncode': '0'}, {**CTX, 'started_at_ms': True},
                 {**CTX, 'tokenizer_sha256': 'E' * 64}, {**CTX, 'model_patch_sha256': 'abc'},
-                {**CTX, 'start_tree': '9' * 64}):
+                {**CTX, 'start_tree': '9' * 64}, {**CTX, 'task_hash': ''}, {**CTX, 'task_hash': '7' * 40}):
         with pytest.raises(ValueError, match='bad receipt context'):
             _sign(wk, ctx=bad)
     _sign(wk, ctx={**CTX, 'verifier_returncode': None, 'model_patch_sha256': ''})   # an ungraded rollout
@@ -75,12 +76,15 @@ def test_expect_pins_context(setup):
 
 
 def test_v1_and_hand_made_payloads_are_rejected(setup):
-    """A v1 payload, or a v2 payload with a context field dropped, fails even when signed by a trusted key."""
+    """An older version's payload, or a payload with a context field dropped, fails even when signed by a trusted
+    key."""
     from hosted_env.infra.common import canonical, sign
     from hosted_env.infra.receipt import RECEIPT_DOMAIN
     wk, keys, r = setup
     body = json.loads(unb64u(r['payload']))
-    for forged, code in (({**body, 'v': 1}, 'identity_mismatch'),
+    for forged, code in (({**body, 'v': 1}, 'unsupported_receipt_version'),
+                         ({**body, 'v': 2}, 'unsupported_receipt_version'),
+                         ({**body, 'v': '3'}, 'unsupported_receipt_version'),
                          ({k: v for k, v in body.items() if k != 'grader'}, 'malformed_receipt'),
                          ({**body, 'started_at_ms': body['issued_at_ms'] + 1}, 'malformed_receipt')):
         raw = canonical(forged)
@@ -273,8 +277,10 @@ def test_group_carries_the_graded_patch():
     with pytest.raises(ReceiptError, match='bad_attachment_version'):
         verify_group(v2, keys, **GID)
     from hosted_env.envs import DockerTaskEnv          # another environment's spec rejects the group outright
-    with pytest.raises(ReceiptError, match='malformed_receipt'):
+    with pytest.raises(ReceiptError, match='env_spec_mismatch'):
         verify_group(g, keys, **{**GID, 'spec': DockerTaskEnv.RECEIPT})
+    no_spec = {k: v for k, v in GID.items() if k != 'spec'}   # found from the receipts' env_spec
+    assert verify_group(g, keys, **no_spec)['artifacts'][0] == v['artifacts'][0]
 
 
 def test_group_seal_binds_the_receipts_and_the_gateway():
@@ -318,3 +324,84 @@ def test_receipt_requires_expected_tests_field():
         _sign(wk, ctx=ctx)
     with pytest.raises(ValueError):
         _sign(wk, ctx={**CTX, 'expected_tests_sha256': 'not-hex'})
+
+
+def test_task_hash_is_verifiers_task_key():
+    """task_hash is verifiers' task_key (sha256 of json.dumps(data, sort_keys=True), DEFAULT separators,
+    ensure_ascii) over the served row with None-valued keys dropped, as model_dump(exclude_none=True) drops them.
+    Pinned to a fixed vector: the compact-separator encoding gives another hash and must never be used."""
+    import hashlib
+
+    from hosted_env.infra.receipt import task_hash
+    row = {'id': '000860', 'image': 'x@sha256:' + '0' * 64, 'problem_statement': 'Fix \u00e9',
+           'fail_to_pass': ['a::b'], 'pass_to_pass': [], 'verifier_timeout_sec': None}
+    assert task_hash(row) == '67d785949e03bda59affb797bb16777ee8c82d2c97da5038bcbe9210eb22415f'
+    assert task_hash(dict(reversed(list(row.items())))) == task_hash(row)          # field order does not matter
+    compact = {k: v for k, v in row.items() if v is not None}
+    assert task_hash(row) != hashlib.sha256(json.dumps(compact, sort_keys=True, separators=(',', ':'))
+                                            .encode()).hexdigest()
+    assert task_hash({**row, 'pass_to_pass': None}) != task_hash(row)               # only None is dropped, not []
+    with pytest.raises(TypeError):
+        task_hash(['not', 'a', 'row'])
+
+
+def test_spec_is_found_from_the_receipt_or_pinned(setup):
+    """With no spec= the receipt's env_spec picks the registered spec; a pinned spec must be the one the receipt
+    names; an env_spec nobody registered is refused rather than checked loosely."""
+    from hosted_env.envs.base import DockerTaskEnv
+    from hosted_env.infra.common import canonical, sign
+    from hosted_env.infra.receipt import RECEIPT_DOMAIN, SPECS
+    wk, keys, r = setup
+    no_spec = {k: v for k, v in ID.items() if k != 'spec'}
+    assert SPECS['swe/1'] is SPEC
+    assert verify_receipt(r, SEGS, keys, **no_spec)['env_spec'] == 'swe/1'
+    with pytest.raises(ReceiptError, match='env_spec_mismatch'):
+        verify_receipt(r, SEGS, keys, **no_spec, spec=DockerTaskEnv.RECEIPT)
+    body = json.loads(unb64u(r['payload']))
+    for env_spec, code in (('swe/2', 'unknown_env_spec'), (None, 'unknown_env_spec'), (['swe/1'], 'unknown_env_spec'),
+                           ('docker_task/1', 'malformed_receipt')):   # SWE fields under docker_task's id: exact set
+        raw = canonical({**body, 'env_spec': env_spec})
+        with pytest.raises(ReceiptError, match=code):
+            verify_receipt({'payload': b64u(raw), 'sig': b64u(sign(wk, RECEIPT_DOMAIN, raw))}, SEGS, keys, **no_spec)
+    with pytest.raises(ValueError, match='not receipt context fields'):           # expect is still typo-checked
+        verify_receipt(r, SEGS, keys, **no_spec, expect={'tokenizer_sha': 'e' * 64})
+    verify_receipt(r, SEGS, keys, **no_spec, expect={'task_hash': '7' * 64})
+    with pytest.raises(ReceiptError, match='context_mismatch'):                    # the verifier's own task row
+        verify_receipt(r, SEGS, keys, **no_spec, expect={'task_hash': '8' * 64})
+
+
+def test_a_v2_signed_receipt_is_refused_by_version(setup):
+    """A receipt signed under the v2 domain says why it fails instead of looking like a bad signature."""
+    from hosted_env.infra.common import canonical, sign
+    wk, keys, r = setup
+    body = {**json.loads(unb64u(r['payload'])), 'v': 2}
+    raw = canonical(body)
+    v2 = {'payload': b64u(raw), 'sig': b64u(sign(wk, b'affine-hosted-env-receipt-v2|', raw))}
+    with pytest.raises(ReceiptError, match='unsupported_receipt_version'):
+        verify_receipt(v2, SEGS, keys, **ID)
+
+
+def test_spec_ids_name_one_field_set():
+    from hosted_env.infra.receipt import EnvReceiptSpec, register_spec
+    for bad in ('', 'swe', 'swe/0', 'Swe/1', 'swe/1/2', 'swe/v1'):
+        with pytest.raises(ValueError, match='spec id'):
+            EnvReceiptSpec(id=bad, fields={'x': str})
+    assert register_spec(SPEC) is SPEC                                              # idempotent
+    with pytest.raises(ValueError, match='bump its version'):
+        register_spec(EnvReceiptSpec(id='swe/1', fields={'image': str}))
+
+
+def test_a_group_has_one_env_spec():
+    """With no spec pinned, one rollout signed under another environment's spec cannot join an SWE group."""
+    from hosted_env.envs import DockerTaskEnv
+    wk = SigningKey.generate()
+    keys = {'w1': wk.verify_key}
+    g = _group(wk, [('completed', 1.0), ('completed', 0.0)] + [('unresolved', 0.0)] * 6)
+    segs = [('P', [1, 2]), ('M', [3, 17]), ('T', [5]), ('M', [6, 7])]
+    dctx = {k: CTX[k] for k in DockerTaskEnv.RECEIPT.context_fields()}
+    other = _sign(wk, segs, 'unresolved', 0.0, nonce=7, ctx=dctx, spec=DockerTaskEnv.RECEIPT)
+    g['rollouts'][7].update(receipt=other, artifacts={})
+    g['seal'] = _seal([r['receipt'] for r in g['rollouts']])
+    no_spec = {k: v for k, v in GID.items() if k != 'spec'}
+    with pytest.raises(ReceiptError, match='env_spec_mismatch'):
+        verify_group(g, keys, **no_spec)
