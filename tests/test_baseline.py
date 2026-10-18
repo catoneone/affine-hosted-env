@@ -216,6 +216,25 @@ def test_go_test_commands_follow_the_scripts_own_directory():
     assert go_patterns_for_dir(cmds, 'x') == []          # the test command's own dir is the repo root: '..' leaves it
 
 
+def test_go_test_commands_see_through_command_prefixes():
+    """exec / timeout / VAR=value / if ! / time in front of go test (EXP-018 pilot 001712 runs
+    `exec go test ./usercase-test-coderl/...`); before, such a command was not seen at all, so an unbuilt package
+    got no static ids. Across the 705 MiMo tasks that run go test this finds commands in 700 instead of 521."""
+    from hosted_env.baseline import go_patterns_for_dir, go_test_commands
+    script = ('cd /workspace/repo\n'
+              'exec go test -mod=mod -v -count=1 ./usercase-test-coderl/...\n'
+              'timeout 600 go test -run TestA ./a\n'
+              'GOFLAGS=-mod=mod CGO_ENABLED=0 go test -run TestB ./b\n'
+              'if ! go test -run TestC ./c; then exit 1; fi\n'
+              'time go test ./d/...\n'
+              'export GOWORK=off\n')
+    cmds = go_test_commands([('mimo_test_command.sh', script)], '/workspace/repo')
+    assert [specs for specs, _ in cmds] == [[('tree', 'usercase-test-coderl')], [('dir', 'a')], [('dir', 'b')],
+                                            [('dir', 'c')], [('tree', 'd')]]
+    assert go_patterns_for_dir(cmds, 'usercase-test-coderl') is None      # covered, no -run: every test runs
+    assert go_patterns_for_dir(cmds, 'a') == ['TestA'] and go_patterns_for_dir(cmds, 'c') == ['TestC']
+
+
 FAKE_GO_TOOLCHAIN = r'''#!/bin/bash
 # `go test` for the fake module example.com/m: package x builds at base (TestOld passes, TestAdd fails until
 # Add adds); package y's new test file needs Mul, so y does not build until the fix adds it.

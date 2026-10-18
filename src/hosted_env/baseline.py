@@ -30,8 +30,8 @@ import re
 import shlex
 import time
 
-from .envs.swe import (_SCRIPT_DIR_RE, GRADER_VERSION, MIMO_BUNDLE, _junit_results, _repo_rel,
-                       _shell_commands, test_patch_scripts)
+from .envs.swe import (_ASSIGN_RE, _KEYWORDS, _SCRIPT_DIR_RE, _WRAPPERS, GRADER_VERSION, MIMO_BUNDLE,
+                       _junit_results, _repo_rel, _shell_commands, test_patch_scripts)
 
 BASELINE_VERSION = 'baseline-v1'
 _PYTEST_RE = re.compile(r'(^|[\s/;&|(])(py\.test|pytest)(\s|$)')
@@ -180,6 +180,26 @@ def gotest_cases(report: bytes) -> tuple[dict[str, str], set[str]]:
     return cases, pkg_fail - pkg_tests
 
 
+def _command_words(words: list[str]) -> list[str]:
+    """A shell command's words from the program on: the prefixes bash runs the program through are dropped the
+    way script_named_files drops them -- compound keywords (if / then / do / ! / {), `export`, VAR=value
+    assignments and wrappers with their options (exec, env, timeout 600, time, nohup ...). Without this an
+    `exec go test ./x/...` (EXP-018 pilot 001712) is not seen as a go test command, so a package that does not
+    build at base gets no static ids and the task derives no expected tests."""
+    while words and words[0] in _KEYWORDS:
+        words = words[1:]
+    if words[:1] == ['export']:
+        words = words[1:]
+    while words and _ASSIGN_RE.match(words[0]):
+        words = words[1:]
+    while words and words[0] in _WRAPPERS:
+        words = words[1:]
+        while words and (words[0].startswith('-') or _ASSIGN_RE.match(words[0])
+                         or re.fullmatch(r'\d+[smhd]?', words[0])):
+            words = words[1:]
+    return words
+
+
 def go_test_commands(scripts: list[tuple[str, str]], cwd: str) -> list[tuple[list[tuple[str, str]], str | None]]:
     """Every `go test` command in the task's scripts, given as (repo-relative script path or '' for the test
     command itself, text), as (package specs, top-level -run pattern or None). A spec is ('tree', dir) for
@@ -199,6 +219,7 @@ def go_test_commands(scripts: list[tuple[str, str]], cwd: str) -> list[tuple[lis
             except ValueError:
                 continue
             for _, words in commands:
+                words = _command_words(words)
                 if not words:
                     continue
                 if words[0] == 'cd':
