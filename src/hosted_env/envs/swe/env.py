@@ -21,6 +21,7 @@ import time
 from ...infra.providers.sandbox.base import SandboxCommandError, SandboxLimitError
 from ..base import DockerTaskEnv, EnvSession, GradeError, SetupError
 from .cleanup import anti_hack_cleanup, future_commits, git_strip
+from .forgery import patch_audit_hits
 from .protect import (_JS_CONFIG_RE, GRADER_PARSERS, STRUCTURED_MANIFESTS, jsts_config_refs, manifest_reverts,
                       protected_paths, shadow_added)
 from .receipt import MAX_MODEL_PATCH_BYTES
@@ -308,6 +309,22 @@ class SweEnv(DockerTaskEnv):
         res['go_report_shim'] = real
         return f'PATH={bindir}:"$PATH" MIMO_GO_REPORT={shlex.quote(rpath)} '
 
+    def _patch_audit(self, sb, repo: str, start: str, patch: str, reverted: set[str]) -> str:
+        """'' when the patch passes forgery.patch_audit_hits, else what it added and where. A framework-output
+        string is excused when the start tree already contains it (`git grep` over the tree object, which the
+        patch cannot have changed); a git grep error excuses nothing (fail closed)."""
+        excused: dict[str, bool] = {}
+        for path, s, always in patch_audit_hits(patch, reverted):
+            if not always:
+                if s not in excused:
+                    r = sb.execute(f'git grep -q -F -e {shlex.quote(s)} {shlex.quote(start)} --', cwd=repo,
+                                   timeout=120, login=False)
+                    excused[s] = r['returncode'] == 0
+                if excused[s]:
+                    continue
+            return f'{path} adds {s!r}' + ('' if always else ' (test-framework output the base repo does not have)')
+        return ''
+
     def _read_abs(self, sb, path: str) -> bytes:
         """Raw bytes of an absolute file (a structured test report in a random dir), base64 so binary is safe."""
         if not path:
@@ -510,6 +527,11 @@ fi
                 res['grader_parsers'] = GRADER_PARSERS
                 reverted = sorted(reverted)
                 self._reset_paths(sb, repo, start, [p.encode('utf-8', 'surrogateescape') for p in reverted])
+                # what the patch adds to the code it keeps may not be test-framework output or name our report
+                # plumbing (forgery.patch_audit_hits): a forge has to print / write exactly that
+                bad = self._patch_audit(sb, repo, start, patch.decode('utf-8', 'surrogateescape'), set(reverted))
+                if bad:
+                    return {**res, 'grade_detail': 'patch_audit: ' + bad, 'reverted_paths': reverted}
             sb.copy_text_to(gi['test_patch'], TEST_PATCH_REMOTE)
             test_paths = self._changed_paths(sb, repo, base, TEST_PATCH_REMOTE)[0] if base else None
             if test_paths is None:                          # does not apply to the base commit: take git's parse
