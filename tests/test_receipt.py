@@ -184,7 +184,7 @@ def _group(wk, outcomes, patch=b'diff --git a/calc.py b/calc.py\n'):
         ctx = {**CTX, 'model_patch_sha256': hashlib.sha256(patch).hexdigest()}
         rolls.append({'nonce': n, 'segments': [{'src': s, 'ids': i} for s, i in segs],
                       'receipt': _sign(wk, segs, o, rw, nonce=n, ctx=ctx),
-                      'model_patch': base64.b64encode(patch).decode()})
+                      'artifacts': {'model_patch': base64.b64encode(patch).decode()}})
     return {'version': GROUP_ATTACHMENT_VERSION, 'env_id': ID['env_id'], 'task': ID['task'], 'rollouts': rolls,
             'seal': _seal([r['receipt'] for r in rolls])}
 
@@ -246,20 +246,35 @@ def test_group_carries_the_graded_patch():
     outcomes = [('completed', 1.0), ('completed', 0.0)] + [('unresolved', 0.0)] * 6
     g = _group(wk, outcomes)
     v = verify_group(g, keys, **GID, expect={'image': CTX['image']})
-    assert v['model_patches'][0] == b'diff --git a/calc.py b/calc.py\n'
+    assert v['artifacts'][0] == {'model_patch': b'diff --git a/calc.py b/calc.py\n'}
     with pytest.raises(ReceiptError, match='context_mismatch'):
         verify_group(g, keys, **GID, expect={'test_command_sha256': '0' * 64})
     swapped = copy.deepcopy(g)                              # a better-looking patch than the one graded
-    swapped['rollouts'][1]['model_patch'] = base64.b64encode(b'diff --git a/x b/x\n').decode()
-    with pytest.raises(ReceiptError, match='model_patch_mismatch'):
+    swapped['rollouts'][1]['artifacts']['model_patch'] = base64.b64encode(b'diff --git a/x b/x\n').decode()
+    with pytest.raises(ReceiptError, match='artifact_mismatch'):
         verify_group(swapped, keys, **GID)
     for bad in ('not base64!', 7, 'A' * (3_000_000)):
         broken = copy.deepcopy(g)
-        broken['rollouts'][0]['model_patch'] = bad
+        broken['rollouts'][0]['artifacts']['model_patch'] = bad
         with pytest.raises(ReceiptError, match='malformed_group'):
             verify_group(broken, keys, **GID)
     with pytest.raises(ReceiptError, match='bad_attachment_version'):
         verify_group(dict(g, version='hosted-env-group-v1'), keys, **GID)
+    # the artifacts must be exactly the environment's (SWE: model_patch), and a v2 attachment is refused
+    for arts in ({}, {'model_patch': '', 'extra': ''}, None):
+        odd = copy.deepcopy(g)
+        odd['rollouts'][0]['artifacts'] = arts
+        with pytest.raises(ReceiptError, match='malformed_group'):
+            verify_group(odd, keys, **GID)
+    v2 = copy.deepcopy(g)
+    v2['version'] = 'hosted-env-group-v2'
+    for r in v2['rollouts']:
+        r['model_patch'] = r.pop('artifacts')['model_patch']
+    with pytest.raises(ReceiptError, match='bad_attachment_version'):
+        verify_group(v2, keys, **GID)
+    from hosted_env.envs import DockerTaskEnv          # another environment's spec rejects the group outright
+    with pytest.raises(ReceiptError, match='malformed_receipt'):
+        verify_group(g, keys, **{**GID, 'spec': DockerTaskEnv.RECEIPT})
 
 
 def test_group_seal_binds_the_receipts_and_the_gateway():

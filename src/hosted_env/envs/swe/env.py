@@ -23,6 +23,7 @@ from ..base import DockerTaskEnv, EnvSession, GradeError, SetupError
 from .cleanup import anti_hack_cleanup, future_commits, git_strip
 from .protect import (_JS_CONFIG_RE, GRADER_PARSERS, STRUCTURED_MANIFESTS, jsts_config_refs, manifest_reverts,
                       protected_paths, shadow_added)
+from .receipt import MAX_MODEL_PATCH_BYTES
 from .receipt import SPEC as RECEIPT_SPEC
 from .receipt import expected_tests_digest
 from .reports import _REPORT_EXT, _REPORT_PARSERS, GO_REPORT_SHIM, report_verdict
@@ -47,7 +48,6 @@ GRADER_UID = 65534                     # nobody: the hidden tests run without ro
 # no_new_privs: setuid-root binaries in the image (sudo, su, ...) cannot hand root back to the code under test
 DROP_PRIVS = f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups --no-new-privs --'
 GRADER_BASH = 'bash --noprofile --norc -c'   # the drop probes run under exactly what the test command runs under
-MAX_MODEL_PATCH_BYTES = 2_000_000
 GRADER_VERSION = 'isolated-v3'         # v1: tests as root; v2: tests as GRADER_UID; v3: structured manifests, wider revert
 
 
@@ -122,6 +122,10 @@ class SweEnv(DockerTaskEnv):
         if rp:
             out.update(reverted_count=len(rp), reverted_head=sorted(rp)[:REVERTED_LOG_HEAD])
         return out
+
+    def artifacts(self, grade: dict) -> dict[str, str]:
+        """SPEC.artifacts for the attachment, base64: the patch that was graded ('' when none was captured)."""
+        return {'model_patch': grade.get('model_patch_b64', '')}
 
     def _prepare_repo(self, sb, repo: str, lang: str) -> str:
         """Bring a fresh container's repo to the base state the model starts from (also used for the grading

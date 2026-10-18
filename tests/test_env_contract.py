@@ -57,6 +57,17 @@ def test_receipt_is_checked_against_the_environments_spec():
         sign_receipt(wk, 'w1', trajectory_sha256=d, n_tokens=n, outcome='completed', reward=1.0, context=ctx,
                      spec=SweEnv.RECEIPT, **ID)
     assert set(CORE_FIELDS) <= set(DockerTaskEnv.RECEIPT.context_fields())
+    # the other direction: an SWE receipt has docker_task's fields and more, and still fails with docker_task's
+    # spec -- otherwise the narrower spec would skip the type and digest checks of the SWE fields
+    swe = SweEnv('swe', {})
+    sctx = {**swe.receipt_context(None, {}, {}), **CORE}
+    rs = sign_receipt(wk, 'w1', trajectory_sha256=d, n_tokens=n, outcome='completed', reward=0.0, context=sctx,
+                      spec=SweEnv.RECEIPT, **ID)
+    verify_receipt(rs, SEGS, keys, spec=SweEnv.RECEIPT, **ID)
+    with pytest.raises(ReceiptError, match='malformed_receipt'):
+        verify_receipt(rs, SEGS, keys, spec=DockerTaskEnv.RECEIPT, **ID)
+    assert swe.artifacts({}) == {'model_patch': ''} and set(swe.artifacts({})) == set(SweEnv.RECEIPT.artifacts)
+    assert env.artifacts({}) == {} and not DockerTaskEnv.RECEIPT.artifacts
 
 
 def test_executor_version_names_the_checkout_commit():
