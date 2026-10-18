@@ -70,7 +70,10 @@ Two separate interfaces, because a machine and a sandbox are different products:
 The `k8s` sandbox: one Pod per rollout, CPU, memory and ephemeral-storage limits (`disk`, default 10g), no
 service-account token, and the same environment
 repair as `DockerSandbox` (`ENV_PROBE`). Without that repair Go tasks cannot find their module cache and try to
-download it. Offline sandboxes are denied the network twice: the `gvisor-nonet` RuntimeClass (runsc
+download it. Every command in every sandbox also runs with `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and
+`MKL_NUM_THREADS` set to 1 (`THREAD_CAPS`): a 1-CPU sandbox still sees all host cores, so numpy-heavy parallel
+tests otherwise start a thread per host core, hit the pid limit, and a correct fix grades 0 (Affine measured 22.7%
+of correct solutions overall, 96% on a 32-core box). Offline sandboxes are denied the network twice: the `gvisor-nonet` RuntimeClass (runsc
 `--network=none`, loopback only, checked after start; a sandbox with any other interface is refused) and a
 default-deny NetworkPolicy. The policy alone is not enough: it is enforced asynchronously, and on a freshly joined
 node the first Pod reached the internet (EXP-018).

@@ -55,10 +55,13 @@ def _reverted_summary(grade: dict) -> dict:
 
 def _sandbox_limits(rt) -> str:
     """The receipt's sandbox_limits: provider kind and the cpus / memory / disk the rollout and grading
-    containers were given, with each provider's own defaults filled in so the value names what was enforced.
+    containers were given, with each provider's own defaults filled in so the value names what was enforced,
+    plus threads= -- the OMP / OpenBLAS / MKL thread caps every command ran with (providers.sandbox.THREAD_CAPS).
     The docker provider does not enforce disk (development only); the local one enforces nothing (tests)."""
     if rt.sandbox == 'local':
         return 'local'
+    from ..providers.sandbox.base import THREAD_CAPS
+    threads = ','.join(sorted(set(THREAD_CAPS.values())))
     o = rt.sandbox_opts
     if rt.sandbox == 'k8s':
         from ..providers.sandbox.k8s import DEFAULT_DISK
@@ -66,7 +69,7 @@ def _sandbox_limits(rt) -> str:
         disk = 'none' if not disk or str(disk) == '0' else str(disk)
     else:
         disk = 'unenforced'
-    return f"{rt.sandbox}:cpus={o.get('cpus', '1')};memory={o.get('memory', '2g')};disk={disk}"
+    return f"{rt.sandbox}:cpus={o.get('cpus', '1')};memory={o.get('memory', '2g')};disk={disk};threads={threads}"
 
 
 def _build_version() -> str:

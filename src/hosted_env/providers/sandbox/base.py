@@ -9,6 +9,14 @@ from typing import Protocol
 
 OUTPUT_CAP_BYTES = 4_000_000   # collect at most 4MB of output per command and drop the rest (the env truncates by characters later)
 
+# Every command in every sandbox (the model's tool calls and the grading run alike) gets these. A sandbox has one
+# CPU but sees the host's cores, so numpy / scipy / torch start one OpenBLAS / OpenMP / MKL thread per HOST core;
+# parallel tests then hit the pid limit and a correct fix grades 0 -- and since a container's own limit kill now
+# scores 0 (PR #15) rather than voiding, that is a wrong 0, not a retry. Measured by Affine on Targon: 22.7% of
+# correct solutions overall, 96% on a 32-core box (Arbos, 2026-10-18). A task script that sets its own value
+# still wins (it runs after these are in the environment). Recorded in the receipt's sandbox_limits.
+THREAD_CAPS = {'OMP_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
+
 
 class SandboxError(RuntimeError):
     """The sandbox itself is broken (fails to start, docker errors): recorded as an infra error, not the

@@ -23,7 +23,7 @@ import time
 import uuid
 from collections.abc import Callable
 
-from .base import OUTPUT_CAP_BYTES, SandboxError, SandboxCommandError, SandboxLimitError
+from .base import OUTPUT_CAP_BYTES, THREAD_CAPS, SandboxError, SandboxCommandError, SandboxLimitError
 from .docker import ENV_PROBE
 
 MANAGED_BY = {'app.kubernetes.io/managed-by': 'hosted-env'}
@@ -312,7 +312,7 @@ class K8sSandbox:
         self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env
         self.delete_timeout, self.limit_wait, self.pid1_guard = delete_timeout, limit_wait, pid1_guard
         self.started, self.has_timeout, self.handed_out = False, False, False
-        self.env: dict[str, str] = {}
+        self.env: dict[str, str] = dict(THREAD_CAPS)
 
     def start(self):
         if self.network == 'none' and self.networking_api is not None:
@@ -345,8 +345,8 @@ class K8sSandbox:
             self._check_pid1_protected()
         if self.repair_env:
             out = self.execute(ENV_PROBE, timeout=60, raw=True)['output']
-            self.env = dict(ln.split('=', 1) for ln in out.splitlines()
-                            if '=' in ln and ln.split('=', 1)[0].isupper())
+            self.env = {**THREAD_CAPS, **dict(ln.split('=', 1) for ln in out.splitlines()
+                                              if '=' in ln and ln.split('=', 1)[0].isupper())}
         self.handed_out = True          # from here on its commands are the caller's: a limit kill is theirs
 
     def _check_pid1_protected(self) -> None:

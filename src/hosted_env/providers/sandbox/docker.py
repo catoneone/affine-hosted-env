@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-from .base import OUTPUT_CAP_BYTES, SandboxError
+from .base import OUTPUT_CAP_BYTES, THREAD_CAPS, SandboxError
 
 DOCKER = os.environ.get('HOSTED_ENV_DOCKER', 'docker')
 CONTAINER_LABEL = 'hosted-env=1'
@@ -70,7 +70,7 @@ class DockerSandbox:
         self.cid: str | None = None
         self.has_timeout = False
         self.repair_env = repair_env
-        self.env: dict[str, str] = {}
+        self.env: dict[str, str] = dict(THREAD_CAPS)
 
     def start(self):
         name = f'hosted-env-{uuid.uuid4().hex[:12]}'
@@ -83,8 +83,8 @@ class DockerSandbox:
         self.has_timeout = self.execute('command -v timeout', timeout=30, raw=True)['returncode'] == 0
         if self.repair_env:
             out = self.execute(ENV_PROBE, timeout=60, raw=True)['output']
-            self.env = dict(ln.split('=', 1) for ln in out.splitlines()
-                            if '=' in ln and ln.split('=', 1)[0].isupper())
+            self.env = {**THREAD_CAPS, **dict(ln.split('=', 1) for ln in out.splitlines()
+                                              if '=' in ln and ln.split('=', 1)[0].isupper())}
 
     def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
                 login: bool = True) -> dict:
