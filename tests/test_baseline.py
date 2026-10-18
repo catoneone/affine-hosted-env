@@ -244,13 +244,21 @@ if [ "$1" = -json ]; then json=1; shift; fi
 pkg=""
 for a in "$@"; do case "$a" in ./*) pkg="${a#./}";; esac; done
 ev() { if [ $json = 1 ]; then printf '{"Action":"%s","Package":"example.com/m/%s","Test":"%s"}\n' "$1" "$pkg" "$2"; fi; }
+canary() { grep -q 'Fatal("canary' "$1"; }    # a test the grader's canary edited fails, as real go would run it
+if [ "$pkg" = x ] && [ -f x/forge.go ]; then   # what a forging init() does: "pass" for every test it finds, exit 0
+  for t in $(grep -ho 'func Test[A-Za-z0-9_]*' x/*_test.go | cut -c6-); do ev pass "$t"; done; exit 0
+fi
 if [ "$pkg" = x ]; then
-  ev pass TestOld
-  if grep -q 'a + b' x/calc.go; then ev pass TestAdd; exit 0; fi
+  if canary x/old_test.go; then ev fail TestOld; old=1; else ev pass TestOld; old=0; fi
+  if grep -q 'a + b' x/calc.go && ! canary x/calc_test.go && [ $old = 0 ]; then ev pass TestAdd; exit 0; fi
+  if grep -q 'a + b' x/calc.go && ! canary x/calc_test.go; then ev pass TestAdd; exit 1; fi
   ev fail TestAdd; exit 1
 fi
 if [ "$pkg" = y ]; then
-  if grep -q 'func Mul' y/*.go; then ev pass TestMul; ev pass TestOther; exit 0; fi
+  if grep -q 'func Mul' y/*.go; then
+    if canary y/mul_test.go; then ev fail TestMul; else ev pass TestMul; fi; ev pass TestOther
+    canary y/mul_test.go && exit 1; exit 0
+  fi
   if [ $json = 1 ]; then printf '{"Action":"fail","Package":"example.com/m/y"}\n'; fi
   exit 2
 fi
