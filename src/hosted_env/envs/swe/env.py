@@ -60,6 +60,13 @@ def as_grader(command: str) -> str:
     return f'{DROP_PRIVS} env USER=nobody LOGNAME=nobody {GRADER_BASH} {shlex.quote(command)}'
 
 
+class _NoSandbox:
+    """The rollout container of a re-grade: there is none (regrade grades a captured patch in fresh containers)."""
+
+    def cleanup(self) -> None:
+        pass
+
+
 class SweEnv(DockerTaskEnv):
     """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error'),
     require_expected_tests (on by default; false only for local development and the baseline tool).
@@ -469,11 +476,34 @@ fi
         if s.factory is None:
             raise GradeError('no sandbox factory for an isolated grading container')
         s.sb.cleanup()                                      # the rollout container is never used again
+        return self._grade_patch(s, gi, patch, res)
+
+    def _grade_patch(self, s: EnvSession, gi: dict, patch: bytes, res: dict) -> dict:
+        """The captured patch, graded in a fresh container, and a pass checked again by the canary."""
+        if res['grader_user'] not in ('root', 'nobody'):    # a typo must not silently pick one (grade and regrade)
+            raise GradeError(f'grader_user must be "root" or "nobody", not {res["grader_user"]!r}')
         out = self._grade_fresh(s, gi, patch, res)
         if (self.cfg.get('canary', True) and out.get('reward') == 1.0 and out.get('second_check') is True
                 and gi.get('report_kind') in CANARY_KINDS and not gi.get('collect_report')):
             out = self._canary_verdict(out, self._grade_fresh(s, gi, patch, res, canary=True))
         return out
+
+    def regrade(self, task: str, patch: bytes, start_tree: str, factory) -> dict:
+        """Grade a captured patch again, as a verifier does from a receipt (`hosted-env regrade`): the same pipeline
+        as grade() -- fresh container from the task's image, reverts, audit, second check, canary -- with no
+        rollout container. start_tree is the receipt's: the grading container must reproduce it, or GradeError."""
+        if len(patch) > MAX_MODEL_PATCH_BYTES:
+            raise GradeError(f'patch of {len(patch)} bytes is over the grader cap {MAX_MODEL_PATCH_BYTES}')
+        grader = self.cfg.get('grader_user', 'nobody')
+        res = {'model_patch': patch.decode('utf-8', 'replace'), 'model_patch_b64': base64.b64encode(patch).decode(),
+               'model_patch_sha256': hashlib.sha256(patch).hexdigest(), 'reward': 0.0, 'grader': GRADER_VERSION,
+               'grader_user': grader}
+        s = EnvSession(self, self.public_spec(task), _NoSandbox(), factory)
+        s.state['start_tree'] = start_tree
+        try:
+            return self._grade_patch(s, self.grade_inputs(task), patch, res)
+        finally:
+            s.close()
 
     @staticmethod
     def _canary_verdict(out: dict, c: dict) -> dict:

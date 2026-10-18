@@ -150,3 +150,13 @@ names. A group has one `env_spec`.
 
 The receipt is evidence for the verifier to re-check, not a trusted reward: the hidden tests run in the same
 process as the code under test, which can always produce the test framework's output.
+
+To re-check it, `hosted-env regrade --attachment <file> --gateway <url> --tasks <your task index> --config <cfg>`
+runs `verify_group` with `expect` = the `task_hash` and `image` of your own task row and `require_gate=False`
+(every receipt and artifact is checked; only the group-level pass/fail and infra-error rules are skipped, so such a
+group is still re-graded), refuses a receipt whose `grader` is not this code's or whose `sandbox_limits` differ from
+what your config enforces (`--any-grader`, `--any-limits` to override), grades as the receipts' `grader_user`, then
+grades every graded rollout's verified `model_patch` again in fresh containers from the receipt's `start_tree` (the
+same pipeline, canary included) and prints the receipt's reward next to the re-grade's. Exit 0 when all match, 2 on
+a mismatch, 1 on a refusal (nothing is graded then). Pass `--hotkey` / `--epoch` to catch a group replayed under
+another miner or epoch; by default they are the receipts' own.
