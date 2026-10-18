@@ -126,7 +126,7 @@ vitest / mocha run, everything else unchanged).
 from hosted_env.receipt import task_hash
 from hosted_env.verify import verify_group
 
-v = verify_group(attachment, worker_keys, gateway_key=gw_key, epoch=..., hotkey=..., env_id=..., task=...,
+v = verify_group(attachment, trusted_keys, gateway_key=gw_key, epoch=..., hotkey=..., env_id=..., task=...,
                  group_size=8, expect={'task_hash': task_hash(my_copy_of_the_row)})
 ```
 

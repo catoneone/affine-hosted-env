@@ -99,7 +99,9 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
         claims.append(verify_receipt(r.get('receipt') or {}, s, trusted_keys, epoch=epoch, hotkey=hotkey,
                                      env_id=env_id, task=task, nonce=n, spec=spec, expect=expect))
         if claims[-1]['env_spec'] != claims[0]['env_spec']:
-            raise ReceiptError('env_spec_mismatch')     # one group, one field set
+            # one group, one field set: with spec=None each receipt resolves its own spec, so two different
+            # registered specs could otherwise share a group (test_a_group_has_one_env_spec)
+            raise ReceiptError('env_spec_mismatch')
         artifacts.append(_artifacts(r, claims[-1], resolve_spec(claims[-1], spec)))
         segs.append(s)
         masks.append(loss_mask(s))
