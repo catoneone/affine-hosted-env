@@ -120,6 +120,25 @@ exec "$REAL" "$@"
 '''
 
 
+def id_status(results: dict, t: str) -> str | None:
+    """The status of expected id t in parsed results. An id read statically from the test source has no
+    parameters; pytest reports `test_x[a]`, `test_x[b]`: every instance must pass (worst status), and at least one
+    must be there. None when the report does not have it."""
+    if t in results:
+        return results[t]
+    inst = [s for k, s in results.items() if k.startswith(t + '[')]
+    return None if not inst else ('fail' if 'fail' in inst else 'skip' if 'skip' in inst else 'pass')
+
+
+def parse_report(report_kind: str, report: bytes) -> dict | None:
+    """{id -> status}, or None when the kind is unknown or the report does not parse (never a pass)."""
+    parse = _REPORT_PARSERS.get(report_kind)
+    try:
+        return None if parse is None else parse(report)
+    except Exception:  # noqa: BLE001  a malformed / forged report is not a pass
+        return None
+
+
 def report_verdict(report_kind: str, report: bytes, fail_to_pass: list[str], pass_to_pass: list[str]) -> tuple[bool, str]:
     """The second check: every expected test id (the tests the fix must make pass, plus those that must stay
     passing) is present in the structured report AND passed; a skip never counts as a pass. Returns (ok, detail).
@@ -135,15 +154,7 @@ def report_verdict(report_kind: str, report: bytes, fail_to_pass: list[str], pas
     expected = list(dict.fromkeys([*(fail_to_pass or []), *(pass_to_pass or [])]))
     if not expected:
         return False, 'no expected test ids'
-
-    def status(t: str) -> str | None:
-        """An id read statically from the test source has no parameters; pytest reports `test_x[a]`, `test_x[b]`:
-        every instance must pass (worst status), and at least one must be there."""
-        if t in results:
-            return results[t]
-        inst = [s for k, s in results.items() if k.startswith(t + '[')]
-        return None if not inst else ('fail' if 'fail' in inst else 'skip' if 'skip' in inst else 'pass')
-    got = {t: status(t) for t in expected}
+    got = {t: id_status(results, t) for t in expected}
     missing = [t for t in expected if got[t] is None]
     if missing:
         return False, f'{len(missing)} expected test(s) not in the report, e.g. {missing[0]}'

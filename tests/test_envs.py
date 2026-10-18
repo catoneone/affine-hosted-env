@@ -142,7 +142,7 @@ def graded(tmp_path, *cmds, in_place_check=False, image_prep=None, script=None):
 def test_honest_fix_scores_and_is_kept(tmp_path):
     g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak',
                   'printf "notes\\n" > NOTES.md', 'mkdir -p pkg && printf "x = 1\\n" > pkg/helper.py')
-    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v3' and g['reverted_paths'] == []
+    assert g['reward'] == 1.0 and g['grader'] == 'isolated-v4' and g['reverted_paths'] == []
     assert g['grader_parsers'].startswith('py')
     assert g['grader_user'] == 'root' and 'lock_seconds' not in g
     assert 'a + b' in g['model_patch'] and 'pkg/helper.py' in g['model_patch']

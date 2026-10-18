@@ -81,6 +81,7 @@ as a checklist of questions a new environment has to answer for itself:
 | Can the patch change what the tests mean? | protected files (test files, runner configs, shadow modules, test-relevant manifest fields) are put back first (`protect.py`) |
 | Can the code tamper with the results? | the tests run as an unprivileged user (`grader_user`, default `nobody`), with the test files root-owned and read-only |
 | Is "exit 0" enough? | no: a second check reads the structured test report and requires every expected test to pass (`reports.py`, expected tests from `hosted-env baseline`) |
+| Can the code under test forge the report? | always, in principle: it runs in the framework's process. `forgery.py` makes the cheap forms fail: a patch audit (no added test-framework output or report plumbing in kept files) and, for pytest / go test, a canary re-run of every pass with each expected test edited to fail. A forge that spots the canary edit still wins, so the receipt is evidence to re-verify |
 | Are the tasks the same bytes later? | images pinned by digest (`hosted-env pin-images`), so a re-grade runs what was graded |
 
 `docker_task` (the base class) answers none of these: it grades with an exit code in the model's own container.
