@@ -121,6 +121,7 @@ class RolloutSession:
         self.last_activity = self.started
         self.envsess = None
         self.image = None
+        self.task_hash = ''                 # of the task row the gateway served, set at start
         self.ops: dict[int, _Op] = {}
         self.last_seq = -1
         self.final: dict | None = None
@@ -342,6 +343,10 @@ class Worker:
             raise WorkerError('session_closed', 410) from None
         if spec['env_id'] != c['env_id'] or spec['task'] != c['task']:
             raise WorkerError('spec_mismatch', 500)
+        th = spec.get('task_hash')
+        if type(th) is not str or len(th) != 64 or not set(th) <= set('0123456789abcdef'):
+            raise WorkerError('spec_mismatch', 500)     # every receipt binds the served task row (task_hash)
+        s.task_hash = th
         t0 = time.time()
         try:
             if rt.sandbox == 'docker':
@@ -422,7 +427,8 @@ class Worker:
         """receipt.CORE_FIELDS for this rollout plus the fields its environment declares (env.RECEIPT), which the
         environment fills (env.receipt_context; gi and grade are {} when the rollout was not graded)."""
         r = s.rt.renderer
-        core = {'sandbox_limits': _sandbox_limits(s.rt), 'model_id': r.model_id, 'model_revision': r.model_revision,
+        core = {'task_hash': s.task_hash, 'sandbox_limits': _sandbox_limits(s.rt), 'model_id': r.model_id,
+                'model_revision': r.model_revision,
                 **r.identity, 'executor_version': self.build_version, 'started_at_ms': int(s.started * 1000)}
         return {**s.rt.env.receipt_context(s.envsess, gi, grade), **core}
 

@@ -2,10 +2,12 @@
 whole group of 8 and finishes it; the validator checks the attachment with verify_group. The sandbox is
 LocalSandbox, the model is a scripted fake model, the tokenizer is CharRenderer."""
 import copy
+import hashlib
 import json
 import socket
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -109,11 +111,18 @@ def test_group_end_to_end(stack):
     v = verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe', spec=SweEnv.RECEIPT, task=res['task']['task'])
     assert [c['reward'] for c in v['claims']] == [1.0, 0.0] * 4
     assert all(sum(m) > 0 for m in v['loss_masks'])
-    c0 = v['claims'][0]                                                # receipt v2 context, set by the worker
+    c0 = v['claims'][0]                                                # receipt v3 context, set by the worker
     assert (c0['grader'], c0['grader_user'], c0['renderer']) == ('isolated-v3', 'root', 'char/v1/enable_thinking=false')
     assert len(c0['model_patch_sha256']) == len(c0['test_patch_sha256']) == len(c0['tokenizer_sha256']) == 64
     assert c0['image'] and c0['verifier_returncode'] == 0 and c0['started_at_ms'] <= c0['issued_at_ms']
     assert len(c0['start_tree']) == 40
+    # task_hash: what a verifier computes from its own copy of the task row, with verifiers' task_key encoding
+    row = next(json.loads(x) for x in Path(stack['store']._env('swe').cfg['tasks']).read_text().splitlines()
+               if x.strip() and str(json.loads(x)['id']) == res['task']['task'])
+    want = hashlib.sha256(json.dumps({k: x for k, x in row.items() if x is not None}, sort_keys=True).encode())
+    assert {c['task_hash'] for c in v['claims']} == {want.hexdigest()} and c0['env_spec'] == 'swe/1'
+    assert verify_group(att, keys, gateway_key=gw_key(info), epoch=EPOCH, hotkey='5H0', env_id='swe',   # no spec=
+                        task=res['task']['task'], expect={'task_hash': want.hexdigest()})['claims'] == v['claims']
     assert b'a + b' in v['artifacts'][0]['model_patch'] and v['artifacts'][1] == {'model_patch': b''}   # the fix, then the no-op rollout
 
     bad = copy.deepcopy(att)
@@ -235,7 +244,7 @@ def test_receipt_context_binds_expected_tests():
     rend = SimpleNamespace(model_id='m', model_revision='r', identity={'tokenizer_sha256': '', 'chat_template_sha256': '',
                                                                      'renderer': 'char'})
     s = SimpleNamespace(rt=SimpleNamespace(renderer=rend, sandbox='local', sandbox_opts={}, env=SweEnv('swe', {})),
-                        envsess=None, started=1.0)
+                        envsess=None, started=1.0, task_hash='7' * 64)
     me = SimpleNamespace(build_version='t')
     gi = {'test_patch': 'p', 'test_command': 'c', 'report_kind': 'junit',
           'fail_to_pass': ['tests/test_a.py::t1'], 'pass_to_pass': ['tests/test_a.py::t0']}

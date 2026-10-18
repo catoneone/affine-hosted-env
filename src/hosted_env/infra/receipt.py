@@ -11,14 +11,16 @@
   hash from the uploaded tokens, then use the outcome / reward from the receipt. Model tokens are still verified
   with the sampling proof as before.
 - The source tags double as the loss mask: only M segments are trained on (`loss_mask`).
-- v2 also binds what the reward is a function of, so a verifier can replay the grading offline and tie the tokens
-  to a tokenizer. The context is flat in the signed payload and has two parts: CORE_FIELDS, the same for every
-  environment (the model side -- model id and revision as the worker is configured, tokenizer and chat-template
-  hashes, renderer -- the sandbox limits, the worker build, the start time in milliseconds), and the fields the
-  environment declares in its EnvReceiptSpec (for SWE: the task's image digest, test patch and command, the grader
-  version and user, the model's patch, the verifier's exit code; envs.swe.receipt). Signing and verifying take that
-  spec, so this module knows no environment. The model id is the worker's configuration, not a proof: which model
-  produced the M tokens is still shown by the sampling proof, and trajectory_sha256 ties both to the same tokens.
+- The receipt also binds what the reward is a function of, so a verifier can replay the grading offline and tie
+  the tokens to a tokenizer. The context is flat in the signed payload and has two parts: CORE_FIELDS, the same
+  for every environment (the task_hash of the task row served, the model side -- model id and revision as the
+  worker is configured, tokenizer and chat-template hashes, renderer -- the sandbox limits, the worker build, the
+  start time in milliseconds), and the fields the environment declares in its EnvReceiptSpec (for SWE: the task's
+  image digest, test patch and command, the grader version and user, the model's patch, the verifier's exit code;
+  envs.swe.receipt), named in the payload by env_spec. Signing takes that spec and verifying takes it or looks it
+  up by env_spec (SPECS), so this module knows no environment. The model id is the worker's configuration, not a
+  proof: which model produced the M tokens is still shown by the sampling proof, and trajectory_sha256 ties both
+  to the same tokens. The wire format, versions and error codes are in docs/formats.md.
 
 This module depends only on PyNaCl and the standard library and can be copied upstream as-is.
 """
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 import time
 from collections.abc import Mapping, Sequence
@@ -37,17 +40,21 @@ from nacl.signing import SigningKey, VerifyKey
 from .common import b64u, canonical, sign, unb64u, verify
 
 TRAJ_DOMAIN = b'affine-hosted-env-trajectory-v1'
-RECEIPT_DOMAIN = b'affine-hosted-env-receipt-v2|'
+RECEIPT_DOMAIN = b'affine-hosted-env-receipt-v3|'
 SOURCES = ('P', 'M', 'T')   # P=task prompt from the environment, M=model generated, T=tool output (environment generated)
 OUTCOMES = ('completed', 'unresolved', 'infra_error')
-RECEIPT_VERSION = 2
+RECEIPT_VERSION = 3
 _HEX = frozenset('0123456789abcdef')
+# Versioning (docs/formats.md): the payload names its environment field set in env_spec ('swe/1'). A change to an
+# environment's fields is a new spec version (registered next to the old one, so old receipts still verify); only
+# a change to CORE_FIELDS or PAYLOAD_KEYS bumps RECEIPT_VERSION and RECEIPT_DOMAIN. Fields are never added inside a
+# version: v2 grew three fields while it ran, so older v2 receipts failed verification.
+#
 # Context field -> type. *_sha256 fields are lowercase hex SHA-256 or '' (not known: e.g. a rollout that never got
-# graded). Every field is required, and fields have been added within v2 while it runs only on the test deployment
-# (grader_parsers, then expected_tests_sha256 and sandbox_limits): a v2 receipt signed by an older worker fails
-# verification with malformed_receipt ('missing <field>'). Before receipts are relied on outside the test
-# deployment, the next field change bumps RECEIPT_VERSION (and RECEIPT_DOMAIN) instead.
+# graded); task_hash is always known (REQUIRED_HEX). Every field is required.
 CORE_FIELDS = {
+    'task_hash': str,               # task_hash() of the task-index row the gateway served for this task: verifiers'
+                                    # task_key encoding, so it is the hash a verifier computes from its own copy
     'sandbox_limits': str,          # the sandbox the rollout and its grading ran in and its limits, e.g.
                                     # 'k8s:cpus=1;memory=2g;disk=10g;threads=1' (threads: the OMP / OpenBLAS /
                                     # MKL caps): hitting its own limit scores 0, so an offline re-grade on a
@@ -60,22 +67,39 @@ CORE_FIELDS = {
     'executor_version': str,
     'started_at_ms': int,
 }
+REQUIRED_HEX = {'task_hash': 64}  # core fields that hold a lowercase hex digest of this length, never ''
 # signed payload keys that are not context: an environment cannot declare a field with one of these names
-PAYLOAD_KEYS = frozenset({'v', 'epoch', 'hotkey', 'env_id', 'task', 'nonce', 'trajectory_sha256', 'n_tokens',
-                          'outcome', 'reward', 'key_id', 'issued_at_ms'})
+PAYLOAD_KEYS = frozenset({'v', 'env_spec', 'epoch', 'hotkey', 'env_id', 'task', 'nonce', 'trajectory_sha256',
+                          'n_tokens', 'outcome', 'reward', 'key_id', 'issued_at_ms'})
+_SPEC_ID = re.compile(r'[a-z][a-z0-9_]*/[1-9][0-9]*')
+
+
+def task_hash(data: Mapping) -> str:
+    """Content hash of a task: verifiers' task_key -- sha256 of json.dumps(data, sort_keys=True) with the DEFAULT
+    separators and ensure_ascii -- over the task-index row as served, with None-valued keys dropped (as
+    model_dump(exclude_none=True) drops them). This is the encoding of verifiers' Task.hash; it equals that hash
+    when the task's data model dumps to exactly this row."""
+    if not isinstance(data, Mapping):
+        raise TypeError('task data must be a mapping')
+    return hashlib.sha256(json.dumps({k: v for k, v in data.items() if v is not None},
+                                     sort_keys=True).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
 class EnvReceiptSpec:
     """What an environment adds to its receipts, declared by the environment (e.g. envs.swe.receipt.SPEC).
+    id: '<name>/<version>', signed in every receipt as env_spec; any change to the rest is a new version.
     fields: context field -> type (or tuple of types), all required, signed flat next to CORE_FIELDS.
     hex_lengths: fields besides *_sha256 that hold a lowercase hex digest of that length ('' allowed).
     artifacts: attachment artifact name -> (the context field holding its sha256, max bytes)."""
+    id: str
     fields: Mapping[str, Any]
     hex_lengths: Mapping[str, int] = field(default_factory=dict)
     artifacts: Mapping[str, tuple[str, int]] = field(default_factory=dict)
 
     def __post_init__(self):
+        if not isinstance(self.id, str) or not _SPEC_ID.fullmatch(self.id):
+            raise ValueError(f"spec id must look like 'name/1', not {self.id!r}")
         clash = sorted(set(self.fields) & (set(CORE_FIELDS) | PAYLOAD_KEYS))
         if clash:
             raise ValueError(f'environment receipt fields clash with core / payload keys: {clash}')
@@ -85,6 +109,21 @@ class EnvReceiptSpec:
 
     def context_fields(self) -> dict:
         return {**CORE_FIELDS, **self.fields}
+
+
+# Every receipt spec an environment has ever signed with, by id: verify_receipt looks a receipt's env_spec up here
+# when the caller passes no spec. Environments register their specs where they define them (hosted_env imports
+# them), and keep old versions registered so receipts signed before a field change still verify.
+SPECS: dict[str, EnvReceiptSpec] = {}
+
+
+def register_spec(spec: EnvReceiptSpec) -> EnvReceiptSpec:
+    """Add spec to SPECS (idempotent); a different spec under a registered id is a ValueError -- an id names one
+    field set forever."""
+    have = SPECS.setdefault(spec.id, spec)
+    if have != spec:
+        raise ValueError(f'receipt spec {spec.id!r} is already registered with other fields; bump its version')
+    return spec
 
 
 class ReceiptError(Exception):
@@ -161,8 +200,8 @@ def _context_problem(ctx: Mapping, spec: EnvReceiptSpec) -> str | None:
         v = ctx[k]
         if not isinstance(v, t) or isinstance(v, bool):
             return f'bad type for {k}'
-        n = 64 if k.endswith('_sha256') else spec.hex_lengths.get(k, 0)
-        if n and v and (len(v) != n or not set(v) <= _HEX):
+        n = 64 if k.endswith('_sha256') else REQUIRED_HEX.get(k) or spec.hex_lengths.get(k, 0)
+        if (n and v or k in REQUIRED_HEX) and (len(v) != n or not set(v) <= _HEX):
             return f'bad digest for {k}'
     return None
 
@@ -179,9 +218,10 @@ def sign_receipt(worker_key: SigningKey, key_id: str, *, epoch: str, hotkey: str
         raise ValueError(f'bad receipt context: {problem or "unknown fields"}')
     if issued_at_ms is None:                    # never before the start, even if the wall clock stepped back
         issued_at_ms = max(int(time.time() * 1000), context['started_at_ms'])
-    payload = {**context, 'v': RECEIPT_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
-               'nonce': nonce, 'trajectory_sha256': trajectory_sha256, 'n_tokens': n_tokens, 'outcome': outcome,
-               'reward': float(reward), 'key_id': key_id, 'issued_at_ms': issued_at_ms}
+    payload = {**context, 'v': RECEIPT_VERSION, 'env_spec': spec.id, 'epoch': epoch, 'hotkey': hotkey,
+               'env_id': env_id, 'task': task, 'nonce': nonce, 'trajectory_sha256': trajectory_sha256,
+               'n_tokens': n_tokens, 'outcome': outcome, 'reward': float(reward), 'key_id': key_id,
+               'issued_at_ms': issued_at_ms}
     body = canonical(payload)
     return {'payload': b64u(body), 'sig': b64u(sign(worker_key, RECEIPT_DOMAIN, body))}
 
@@ -253,27 +293,47 @@ def check_expect(expect: Mapping | None, spec: EnvReceiptSpec) -> None:
         raise ValueError(f'expect: not receipt context fields: {bad}')
 
 
+def resolve_spec(claims: Mapping, spec: EnvReceiptSpec | None) -> EnvReceiptSpec:
+    """The spec a receipt is checked against: the caller's (which must be the one the receipt names) or, with
+    none, the registered spec of the receipt's env_spec."""
+    named = claims.get('env_spec')
+    if spec is not None:
+        if named != spec.id:
+            raise ReceiptError('env_spec_mismatch')     # signed with another field set than the caller pinned
+        return spec
+    found = SPECS.get(named) if type(named) is str else None
+    if found is None:
+        raise ReceiptError('unknown_env_spec')          # import the environment's spec module (hosted_env does)
+    return found
+
+
 def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, VerifyKey], *, epoch: str, hotkey: str,
-                   env_id: str, task: str, nonce: int, spec: EnvReceiptSpec, expect: Mapping | None = None) -> dict:
+                   env_id: str, task: str, nonce: int, spec: EnvReceiptSpec | None = None,
+                   expect: Mapping | None = None) -> dict:
     """Validator / trainer side. segments is the [(source, token ids)] of this rollout as uploaded by the miner;
-    trusted_keys are the worker public keys {key_id: VerifyKey} from this epoch's opening; spec is the receipt spec
-    of the environment kind serving env_id (hosted_env.envs.receipt_spec). expect optionally pins context fields to
-    the values the verifier knows (the task's image and test hashes from its own copy of the task pool, the
+    trusted_keys are the worker public keys {key_id: VerifyKey} from this epoch's opening. spec pins the receipt
+    spec of the environment kind serving env_id (hosted_env.envs.receipt_spec); omitted, the receipt's own
+    env_spec is looked up in SPECS (the worker's signature covers it). expect optionally pins context fields to the
+    values the verifier knows (the task_hash of its own copy of the task row, the task's image and test hashes, the
     tokenizer it trains with). Returns the receipt contents (including outcome and reward) on success, otherwise
     raises ReceiptError."""
-    check_expect(expect, spec)
+    if spec is not None:
+        check_expect(expect, spec)
     try:
         body, sig = unb64u(receipt['payload']), unb64u(receipt['sig'])
         claims = json.loads(body)
         key = trusted_keys.get(claims['key_id'])
     except (KeyError, ValueError, TypeError, AttributeError):
         raise ReceiptError('malformed_receipt') from None
+    if claims.get('v') != RECEIPT_VERSION or type(claims.get('v')) is not int:
+        raise ReceiptError('unsupported_receipt_version')   # v2 receipts are not accepted (docs/formats.md)
     if key is None:
         raise ReceiptError('untrusted_worker_key')
     if not verify(key, RECEIPT_DOMAIN, body, sig):
         raise ReceiptError('bad_signature')
-    expected = {'v': RECEIPT_VERSION, 'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task,
-                'nonce': nonce}
+    spec = resolve_spec(claims, spec)
+    check_expect(expect, spec)
+    expected = {'epoch': epoch, 'hotkey': hotkey, 'env_id': env_id, 'task': task, 'nonce': nonce}
     if any(claims.get(k) != v or type(claims.get(k)) is not type(v) for k, v in expected.items()):
         raise ReceiptError('identity_mismatch')         # another task, another nonce, someone else's receipt
     issued, started = claims.get('issued_at_ms'), claims.get('started_at_ms')
