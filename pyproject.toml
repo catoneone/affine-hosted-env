@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "affine-hosted-env"
-version = "0.1.0"
+version = "0.2.0"
 description = "SN120 hosted tool-environment service: gateway (identity/quota/task assignment) + worker (container execution/token rendering/trajectory receipts) + pure receipt-verification functions + miner client"
 readme = "README.md"
 requires-python = ">=3.12"

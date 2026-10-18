@@ -82,3 +82,25 @@ def test_executor_version_names_the_checkout_commit():
         pytest.skip('not running from a git checkout of this repository')
     v = _build_version()
     assert v.startswith(f'{__version__}+g') and len(v.split('+g')[1].split('.')[0]) == 12
+
+
+def test_the_format_doc_matches_the_code():
+    """docs/formats.md is what verifiers port against: its versions, domains and field tables must be the code's."""
+    import re
+
+    from hosted_env.infra import receipt as R
+    from hosted_env.infra.verify import GROUP_ATTACHMENT_VERSION
+    doc = (Path(__file__).resolve().parents[1] / 'docs' / 'formats.md').read_text()
+    assert f'`v: {R.RECEIPT_VERSION}`' in doc and R.RECEIPT_DOMAIN.decode().rstrip('|') in doc
+    assert R.SEAL_DOMAIN.decode().rstrip('|') in doc and R.TRAJ_DOMAIN.decode() in doc
+    assert GROUP_ATTACHMENT_VERSION in doc and f'version {__version__}' in doc and f'`v{__version__}`' in doc
+
+    def table(heading):                       # field names in the first column of the first table under heading
+        part = doc.split(heading, 1)[1]
+        rows = part[part.index('\n|'):].split('\n\n', 1)[0]
+        return {n for row in re.findall(r'(?m)^\| (.+?) \|', rows) for n in re.findall(r'`(\w+)`', row)}
+    assert table('Core context fields') == set(R.CORE_FIELDS)
+    assert table('### `swe/1`') == set(SweEnv.RECEIPT.fields)
+    assert table('Flat signed payload') == set(R.PAYLOAD_KEYS)
+    assert set(re.findall(r'`(\w+)` \(', doc.split('### `docker_task/1`', 1)[1].split('\n#', 1)[0])) == \
+        set(DockerTaskEnv.RECEIPT.fields)
