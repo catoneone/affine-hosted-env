@@ -18,7 +18,7 @@ import secrets
 import shlex
 import time
 
-from ...providers.sandbox.base import SandboxCommandError, SandboxLimitError
+from ...infra.providers.sandbox.base import SandboxCommandError, SandboxLimitError
 from ..base import DockerTaskEnv, EnvSession, GradeError, SetupError
 from .cleanup import anti_hack_cleanup, future_commits, git_strip
 from .protect import (_JS_CONFIG_RE, GRADER_PARSERS, STRUCTURED_MANIFESTS, jsts_config_refs, manifest_reverts,

@@ -3,7 +3,7 @@ test_gateway_auth.py."""
 import pytest
 from nacl.signing import SigningKey
 
-from hosted_env.auth import (MINER_DOMAIN, WORKER_DOMAIN, AuthError, RequestVerifier, issue_token, sign_request,
+from hosted_env.infra.auth import (MINER_DOMAIN, WORKER_DOMAIN, AuthError, RequestVerifier, issue_token, sign_request,
                              verify_token)
 
 NOW = 1_800_000_000.0

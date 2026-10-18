@@ -2,9 +2,9 @@
 import pytest
 from test_nodes import node_store
 
-from hosted_env.coordinator.nodes import NodeInfo
-from hosted_env.coordinator.planner import Planner, PlannerLimits
-from hosted_env.providers.machine import CreateFailed, Machine, MachineError, MachineSpec, Offer
+from hosted_env.infra.coordinator.nodes import NodeInfo
+from hosted_env.infra.coordinator.planner import Planner, PlannerLimits
+from hosted_env.infra.providers.machine import CreateFailed, Machine, MachineError, MachineSpec, Offer
 
 
 class FakeProvider:
@@ -230,7 +230,7 @@ def test_old_planner_ledger_is_migrated(tmp_path):
     con.close()
     from nacl.signing import SigningKey
 
-    from hosted_env.coordinator.store import Store
+    from hosted_env.infra.coordinator.store import Store
     st = Store(str(db), {}, SigningKey.generate())
     [r] = st.machines()
     assert (r['name'], r['machine_id'], r['origin'], r['state'], r['slots']) == ('hosted-env-boat-a1', 'bx_1',
@@ -246,7 +246,7 @@ def test_cli_machines_prints_the_inventory(tmp_path, capsys):
     from nacl.signing import SigningKey
 
     from hosted_env.cli import main
-    from hosted_env.coordinator.store import Store
+    from hosted_env.infra.coordinator.store import Store
     st = Store(str(tmp_path / 'g.db'), {}, SigningKey.generate())
     st.machine_created('boat', 'bx_1', 'hosted-env-boat-a1', 'large', 0.072, 7, now=1000.0)
     st.machine_set_state('boat', 'bx_1', 'deleted', now=1000.0 + 7200, note='idle for 600s')
@@ -290,7 +290,7 @@ def test_store_capacity_snapshot(tmp_path):
     st = node_store(tmp_path)
     from test_coordinator_store import EPOCH, NOW
 
-    from hosted_env.coordinator.store import CapacityError
+    from hosted_env.infra.coordinator.store import CapacityError
     st.sync_nodes([NodeInfo('n1', 8, ())], now=NOW)
     st.open_task(EPOCH, '5H0', 'env', now=NOW)
     with pytest.raises(CapacityError):
@@ -302,7 +302,7 @@ def test_store_capacity_snapshot(tmp_path):
 def test_config_machines_defaults_are_safe(tmp_path):
     from nacl.signing import SigningKey
 
-    from hosted_env.config import _planner, _store
+    from hosted_env.infra.config import _planner, _store
     (tmp_path / 'boat.token').write_text('tok\n')
     (tmp_path / 'k3s.token').write_text('K10join::server:s3cr3t\n')
     cfg = {'db': str(tmp_path / 'g.db'), 'placement': {'kind': 'k8s', 'cpus': '2', 'memory': '4g'},
@@ -331,7 +331,7 @@ def test_gateway_runs_the_planner(tmp_path):
     from nacl.signing import SigningKey
     from test_coordinator_store import EPOCH
 
-    from hosted_env.gateway.app import Roster, create_gateway_app
+    from hosted_env.infra.gateway.app import Roster, create_gateway_app
     roster = tmp_path / 'roster.json'
     roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {}}))
     st = node_store(tmp_path)

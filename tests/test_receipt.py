@@ -6,10 +6,10 @@ import json
 import pytest
 from nacl.signing import SigningKey
 
-from hosted_env.common import b64u, unb64u
-from hosted_env.receipt import (ReceiptError, TrajectoryHasher, expected_tests_digest, loss_mask, sign_receipt,
+from hosted_env.infra.common import b64u, unb64u
+from hosted_env.infra.receipt import (ReceiptError, TrajectoryHasher, expected_tests_digest, loss_mask, sign_receipt,
                                 trajectory_sha256, verify_receipt)
-from hosted_env.verify import GROUP_ATTACHMENT_VERSION, verify_group
+from hosted_env.infra.verify import GROUP_ATTACHMENT_VERSION, verify_group
 
 ID = dict(epoch='e000001', hotkey='5Hotkey0', env_id='mimo_swe', task='002119', nonce=3)
 SEGS = [('P', [151644, 8948, 198]), ('M', [40, 1184, 311, 1349]), ('T', [27, 14172, 9, 29]),
@@ -75,8 +75,8 @@ def test_expect_pins_context(setup):
 
 def test_v1_and_hand_made_payloads_are_rejected(setup):
     """A v1 payload, or a v2 payload with a context field dropped, fails even when signed by a trusted key."""
-    from hosted_env.common import canonical, sign
-    from hosted_env.receipt import RECEIPT_DOMAIN
+    from hosted_env.infra.common import canonical, sign
+    from hosted_env.infra.receipt import RECEIPT_DOMAIN
     wk, keys, r = setup
     body = json.loads(unb64u(r['payload']))
     for forged, code in (({**body, 'v': 1}, 'identity_mismatch'),
@@ -192,7 +192,7 @@ GW = SigningKey.generate()                                  # the gateway's key:
 
 
 def _seal(receipts, **kw):
-    from hosted_env.receipt import receipt_digest, sign_group_seal
+    from hosted_env.infra.receipt import receipt_digest, sign_group_seal
     args = dict(epoch=ID['epoch'], hotkey=ID['hotkey'], env_id=ID['env_id'], task=ID['task'], task_id='tk-1',
                 group_size=len(receipts), opened_at_ms=1_800_000_000_000, finished_at_ms=1_800_000_200_000,
                 receipts=[receipt_digest(r) for r in receipts])

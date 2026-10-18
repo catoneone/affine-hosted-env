@@ -9,7 +9,7 @@ from conftest import _run
 from hosted_env.envs.swe.baseline import junit_cases, pytest_selection, select, static_test_ids
 from hosted_env.envs import SweEnv
 from hosted_env.envs.swe import report_verdict
-from hosted_env.providers.sandbox import LocalSandbox
+from hosted_env.infra.providers.sandbox import LocalSandbox
 
 XUNIT1 = b'''<testsuites><testsuite>
 <testcase classname="" name="tests.test_new" file="tests/test_new.py"><error message="collection failure"/></testcase>

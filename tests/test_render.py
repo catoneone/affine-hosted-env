@@ -9,7 +9,7 @@ import os
 import pytest
 
 from hosted_env.envs.base import BASH_TOOL, INSTANCE_TEMPLATE, SYSTEM_TEMPLATE
-from hosted_env.render import CharRenderer, RenderError, TemplateRenderer
+from hosted_env.infra.render import CharRenderer, RenderError, TemplateRenderer
 
 TOK_ROOT = os.environ.get('HOSTED_ENV_TOKENIZERS', '')
 TOK = {n: os.path.join(TOK_ROOT, f'hf-tokenizer-{n}-9b') for n in ('mimo', 'qwen35')}
@@ -71,7 +71,7 @@ def test_hf_renderer(name, thinking):
     if not os.path.exists(os.path.join(TOK[name], 'tokenizer.json')):
         pytest.skip('no local tokenizer')
     pytest.importorskip('transformers')
-    from hosted_env.render import HFRenderer
+    from hosted_env.infra.render import HFRenderer
     r = HFRenderer(TOK[name], enable_thinking=thinking)
     check_renderer(r)
     assert r.prompt_opens_think == (thinking and name == 'qwen35')      # Qwen3.5 with thinking on: the prompt already opens think
@@ -84,7 +84,7 @@ def test_hf_renderer(name, thinking):
 def test_tokenizer_digest_and_pin(tmp_path):
     """The digest covers the named tokenizer files only (not weights or configs), in a fixed order, and the
     worker refuses to start when the files differ from the pinned tokenizer_sha256."""
-    from hosted_env.render import make_renderer, tokenizer_digest
+    from hosted_env.infra.render import make_renderer, tokenizer_digest
     for bad in (str(tmp_path), str(tmp_path / 'nope'), 'Qwen/Qwen3-8B'):     # nothing to commit to: refused
         with pytest.raises(ValueError, match='not a local tokenizer directory'):
             tokenizer_digest(bad)

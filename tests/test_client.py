@@ -1,6 +1,6 @@
 """client.run_task / run_rollout with fake gateway and worker clients: a task voided mid-group."""
-from hosted_env.client import ApiError, ScriptedSampler, run_task
-from hosted_env.render import CharRenderer
+from hosted_env.infra.client import ApiError, ScriptedSampler, run_task
+from hosted_env.infra.render import CharRenderer
 
 
 class FakeGateway:

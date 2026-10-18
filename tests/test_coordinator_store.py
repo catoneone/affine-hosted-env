@@ -6,9 +6,9 @@ import threading
 import pytest
 from nacl.signing import SigningKey
 
-from hosted_env.auth import AuthError, verify_token
+from hosted_env.infra.auth import AuthError, verify_token
 from hosted_env.envs import DockerTaskEnv
-from hosted_env.coordinator.store import CapacityError, Limits, QuotaError, Store
+from hosted_env.infra.coordinator.store import CapacityError, Limits, QuotaError, Store
 
 NOW = 1_800_000_000.0
 EPOCH = 'e000001'
@@ -308,7 +308,7 @@ def test_worker_spec_and_grade_inputs_scoped(tmp_path):
 def test_finish_returns_a_gateway_signed_seal(tmp_path):
     """The seal lists the receipt hash each worker reported, by nonce, with the gateway's own open / finish
     times; finishing again returns the same seal; a voided task has none."""
-    from hosted_env.receipt import ReceiptError, verify_group_seal
+    from hosted_env.infra.receipt import ReceiptError, verify_group_seal
     st, key = make_store(tmp_path)
     t = st.open_task(EPOCH, '5H0', 'env', now=NOW)
     ss = st.open_sessions(EPOCH, '5H0', t['task_id'], list(range(8)), now=NOW + 1)
@@ -346,7 +346,7 @@ def test_reqids_are_scoped_and_legacy_ones_still_count(tmp_path):
     ages out, so a request signed just before the upgrade cannot be replayed after it."""
     import sqlite3
 
-    from hosted_env.auth import REQID_TTL
+    from hosted_env.infra.auth import REQID_TTL
     old = sqlite3.connect(tmp_path / 'g.db')                  # a database from before per-signer scopes
     old.execute('CREATE TABLE reqids (reqid TEXT PRIMARY KEY, seen_at REAL NOT NULL)')
     old.execute('INSERT INTO reqids VALUES (?, ?)', ('legacy' * 4, NOW))

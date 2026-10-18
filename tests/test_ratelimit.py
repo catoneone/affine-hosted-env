@@ -6,12 +6,12 @@ import pytest
 from fastapi.testclient import TestClient
 from nacl.signing import SigningKey
 
-from hosted_env.auth import sign_request
-from hosted_env.client import ApiError, GatewayClient
-from hosted_env.coordinator.store import Store
+from hosted_env.infra.auth import sign_request
+from hosted_env.infra.client import ApiError, GatewayClient
+from hosted_env.infra.coordinator.store import Store
 from hosted_env.envs import DockerTaskEnv
-from hosted_env.gateway.app import Roster, create_gateway_app
-from hosted_env.gateway.ratelimit import MemoryBuckets, Rate, RateLimiter, RateLimitError, RateLimits
+from hosted_env.infra.gateway.app import Roster, create_gateway_app
+from hosted_env.infra.gateway.ratelimit import MemoryBuckets, Rate, RateLimiter, RateLimitError, RateLimits
 
 EPOCH = 'e000001'
 
