@@ -277,8 +277,10 @@ def verify_receipt(receipt: Mapping, segments, trusted_keys: Mapping[str, Verify
     if any(claims.get(k) != v or type(claims.get(k)) is not type(v) for k, v in expected.items()):
         raise ReceiptError('identity_mismatch')         # another task, another nonce, someone else's receipt
     issued, started = claims.get('issued_at_ms'), claims.get('started_at_ms')
-    if (claims.get('outcome') not in OUTCOMES or _context_problem(claims, spec) or type(issued) is not int
-            or started > issued):
+    # exactly the spec's fields, as sign_receipt writes them: verifying with another environment's spec fails in
+    # both directions (a narrower spec would otherwise skip the type and digest checks of the fields it lacks)
+    if (claims.get('outcome') not in OUTCOMES or set(claims) != PAYLOAD_KEYS | set(spec.context_fields())
+            or _context_problem(claims, spec) or type(issued) is not int or started > issued):
         raise ReceiptError('malformed_receipt')
     for k, v in (expect or {}).items():
         if claims[k] != v or type(claims[k]) is not type(v):

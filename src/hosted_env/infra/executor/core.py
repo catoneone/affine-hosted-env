@@ -451,7 +451,7 @@ class Worker:
             log.error('could not report close for %s', s.sid)
         res = {'status': 'ok', 'seq': seq, 'done': True, 'outcome': outcome, 'reward': reward, 'detail': detail,
                'steps': s.steps, 'receipt': receipt,
-               'model_patch': grade.get('model_patch_b64', '')}     # base64; its sha256 is in the receipt
+               'artifacts': s.rt.env.artifacts(grade)}     # base64; each one's sha256 is in the receipt
         s.final = res
         s.last_activity = time.time()
         return res

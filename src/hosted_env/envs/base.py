@@ -236,3 +236,7 @@ class DockerTaskEnv:
     def log_fields(self, grade: dict) -> dict:
         """Grade details for the executor's per-rollout log line (small values only, never test output)."""
         return {k: grade[k] for k in ('verifier_returncode', 'verifier_reason', 'grade_detail') if k in grade}
+
+    def artifacts(self, grade: dict) -> dict[str, str]:
+        """RECEIPT.artifacts for the group attachment, base64 (each bound by its *_sha256 receipt field)."""
+        return {}

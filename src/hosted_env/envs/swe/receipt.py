@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from ...infra.common import canonical
 from ...infra.receipt import EnvReceiptSpec
 
+MAX_MODEL_PATCH_BYTES = 2_000_000       # the grader never grades a larger patch; also the attachment's cap
+
 SPEC = EnvReceiptSpec(
     fields={
         'image': str,                   # name@sha256:... the rollout and its grading ran in
@@ -25,6 +27,8 @@ SPEC = EnvReceiptSpec(
         'verifier_returncode': (int, type(None)),   # None when no verifier ran
     },
     hex_lengths={'start_tree': 40},     # a git tree id, or '' before setup finished
+    # the attachment carries the patch that was graded, so a verifier can re-grade it offline
+    artifacts={'model_patch': ('model_patch_sha256', MAX_MODEL_PATCH_BYTES)},
 )
 
 

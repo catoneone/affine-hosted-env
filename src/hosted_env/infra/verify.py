@@ -2,19 +2,22 @@
 (design §9, §10).
 
 Hosted-env attachment format inside the group object (`GROUP_ATTACHMENT_VERSION`):
-    {"version": "hosted-env-group-v2", "env_id": ..., "task": ..., "seal": {...},
+    {"version": "hosted-env-group-v3", "env_id": ..., "task": ..., "seal": {...},
      "rollouts": [{"nonce": 0, "segments": [{"src": "P", "ids": [...]}, ...], "receipt": {...},
-                   "model_patch": "<base64 of the patch bytes that were graded>"}, ...]}
+                   "artifacts": {"<name>": "<base64>", ...}}, ...]}
+artifacts carries what the environment declares in its EnvReceiptSpec.artifacts, each bound by a sha256 field of the
+receipt (SWE: {"model_patch": <the patch bytes that were graded>} bound by model_patch_sha256). v2 had a top-level
+"model_patch" instead.
 
 Rules: the seal is signed by the gateway key and names this group (epoch, hotkey, env, task, group size) and, by
 nonce, exactly the receipts in it (receipt_digest), so rollouts from different runs cannot be assembled into one
 group and the open / finish times are the gateway's; exactly one rollout for each nonce 0..group_size-1; every
-receipt must pass `verify_receipt` (with the
-caller's `expect`); each model_patch must hash to its receipt's model_patch_sha256 (empty when the rollout was not
-graded), so a verifier can re-grade it offline with the receipt's image and test hashes; any infra_error voids
-the whole group; at least one completed rollout with reward >= success_reward and at least one completed rollout
-with reward < success_reward. If any check fails the whole group scores 0 (raises ReceiptError). The sampling
-proof for model tokens is not checked here; the existing flow still verifies it.
+receipt must pass `verify_receipt` (with the environment's spec and the caller's `expect`); every rollout carries
+exactly the spec's artifacts, each within its size cap and hashing to its receipt field (an empty artifact when
+that field is '', e.g. the rollout was not graded), so a verifier can re-grade offline with the receipt's task
+hashes; any infra_error voids the whole group; at least one completed rollout with reward >= success_reward and at
+least one completed rollout with reward < success_reward. If any check fails the whole group scores 0 (raises
+ReceiptError). The sampling proof for model tokens is not checked here; the existing flow still verifies it.
 """
 from __future__ import annotations
 
@@ -26,35 +29,42 @@ from collections.abc import Mapping
 from nacl.signing import VerifyKey
 
 from .receipt import (EnvReceiptSpec, ReceiptError, as_segments, check_expect, loss_mask, receipt_digest,
-                      verify_group_seal,
-                      verify_receipt)
+                      verify_group_seal, verify_receipt)
 
-GROUP_ATTACHMENT_VERSION = 'hosted-env-group-v2'
-MAX_MODEL_PATCH_BYTES = 2_000_000          # the worker never grades a larger patch (envs.swe.MAX_MODEL_PATCH_BYTES)
+GROUP_ATTACHMENT_VERSION = 'hosted-env-group-v3'
 
 
-def _model_patch(r: Mapping, claims: Mapping) -> bytes:
-    b64 = r.get('model_patch', '')
-    if not isinstance(b64, str) or len(b64) > (MAX_MODEL_PATCH_BYTES + 2) // 3 * 4:
+def _artifacts(r: Mapping, claims: Mapping, spec: EnvReceiptSpec) -> dict[str, bytes]:
+    """The rollout's artifacts, decoded, each checked against the receipt field that binds it."""
+    arts = r.get('artifacts')
+    if not isinstance(arts, Mapping) or set(arts) != set(spec.artifacts):
         raise ReceiptError('malformed_group')
-    try:
-        raw = base64.b64decode(b64, validate=True)
-    except (binascii.Error, ValueError):
-        raise ReceiptError('malformed_group') from None
-    want = claims.get('model_patch_sha256', '')
-    if (hashlib.sha256(raw).hexdigest() != want) if want else raw:   # '' = never graded: no patch either
-        raise ReceiptError('model_patch_mismatch')      # not the patch that was graded
-    return raw
+    out = {}
+    for name, (hash_field, max_bytes) in spec.artifacts.items():
+        b64 = arts[name]
+        if not isinstance(b64, str) or len(b64) > (max_bytes + 2) // 3 * 4:
+            raise ReceiptError('malformed_group')
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ReceiptError('malformed_group') from None
+        want = claims.get(hash_field, '')
+        if (hashlib.sha256(raw).hexdigest() != want) if want else raw:   # '' = never produced: no artifact either
+            raise ReceiptError('artifact_mismatch')         # not what the receipt says was graded
+        out[name] = raw
+    return out
 
 
 def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, gateway_key: VerifyKey, epoch: str,
                  hotkey: str, env_id: str, task: str, spec: EnvReceiptSpec, group_size: int = 8,
                  success_reward: float = 1.0, expect: Mapping | None = None) -> dict:
     """On success returns {'claims': [receipt contents ordered by nonce], 'loss_masks': [...], 'segments': [...],
-    'model_patches': [patch bytes ...], 'seal': seal contents}. trusted_keys are the worker keys, gateway_key the
-    key that signs group seals (both from the epoch's opening). spec is the receipt spec of the environment kind
-    serving env_id (hosted_env.envs.receipt_spec; /v1/info names the kind). expect is passed to every
-    verify_receipt (e.g. the task's image and test hashes from the verifier's own task pool, its tokenizer_sha256)."""
+    'artifacts': [{name: bytes} per nonce], 'seal': seal contents}. trusted_keys are the worker keys, gateway_key
+    the key that signs group seals (both from the epoch's opening). spec is the receipt spec of the environment kind
+    serving env_id (hosted_env.envs.receipt_spec); take the kind from the same source as the keys (the epoch's
+    opening / the gateway's /v1/info) -- a receipt must carry exactly the spec's fields, so another environment's
+    spec rejects it rather than checking less. expect is passed to every verify_receipt (e.g. the task's
+    image and test hashes from the verifier's own task pool, its tokenizer_sha256)."""
     check_expect(expect, spec)
     if not isinstance(attachment, Mapping) or attachment.get('version') != GROUP_ATTACHMENT_VERSION:
         raise ReceiptError('bad_attachment_version')
@@ -77,7 +87,7 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
         r = by_nonce[n].get('receipt') or {}
         if seal['receipts'][n] != receipt_digest(r):
             raise ReceiptError('seal_mismatch')         # not the receipt the worker reported for this nonce
-    claims, masks, segs, patches = [], [], [], []
+    claims, masks, segs, artifacts = [], [], [], []
     for n in range(group_size):
         r = by_nonce[n]
         try:
@@ -86,7 +96,7 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
             raise ReceiptError('malformed_trajectory') from None
         claims.append(verify_receipt(r.get('receipt') or {}, s, trusted_keys, epoch=epoch, hotkey=hotkey,
                                      env_id=env_id, task=task, nonce=n, spec=spec, expect=expect))
-        patches.append(_model_patch(r, claims[-1]))
+        artifacts.append(_artifacts(r, claims[-1], spec))
         segs.append(s)
         masks.append(loss_mask(s))
     if any(c['outcome'] == 'infra_error' for c in claims):
@@ -94,4 +104,4 @@ def verify_group(attachment: Mapping, trusted_keys: Mapping[str, VerifyKey], *, 
     done = [c for c in claims if c['outcome'] == 'completed']
     if not (any(c['reward'] >= success_reward for c in done) and any(c['reward'] < success_reward for c in done)):
         raise ReceiptError('group_gate_failed')     # at least one completed and correct, one completed and wrong
-    return {'claims': claims, 'loss_masks': masks, 'segments': segs, 'model_patches': patches, 'seal': seal}
+    return {'claims': claims, 'loss_masks': masks, 'segments': segs, 'artifacts': artifacts, 'seal': seal}
