@@ -94,6 +94,8 @@ def edit_python(src: str, classes: list[str], func: str, stmt: str) -> str | Non
         tree = ast.parse(src)
     except (SyntaxError, ValueError):
         return None
+    if 'xfail' in src or 'expectedFailure' in src:
+        return None                      # an expected-failure test that now raises reports xfail (a skip), not fail
     body = tree.body
     for cls in classes:
         found = [n for n in body if isinstance(n, ast.ClassDef) and n.name == cls]

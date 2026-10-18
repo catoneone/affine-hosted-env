@@ -111,6 +111,8 @@ def test_edit_python_puts_a_failure_first():
     for bad in (('def test_x():\n    yield 1\n', [], 'test_x'),             # a generator
                 ('def test_x():\n  a\ndef test_x():\n  b\n', [], 'test_x'),  # defined twice
                 ('def test_x(:\n', [], 'test_x'),                           # does not parse
+                ('import pytest\n@pytest.mark.xfail\ndef test_x():\n    a\n', [], 'test_x'),   # would report xfail
+                ('class K(T):\n    @unittest.expectedFailure\n    def test_x(self):\n        a\n', ['K'], 'test_x'),
                 (src, [], 'test_m'), (src, ['Nope'], 'test_m')):            # not at that level
         assert edit_python(bad[0], bad[1], bad[2], 'raise X') is None
 
