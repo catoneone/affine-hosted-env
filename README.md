@@ -69,6 +69,9 @@ hosted-env gateway --config examples/gateway.toml          # default 127.0.0.1:8
 hosted-env worker  --config examples/worker.toml           # default 127.0.0.1:8790; exposed publicly via `boat host`
 hosted-env mine --gateway http://127.0.0.1:8780 --hotkey <ss58> --key <mining key> --env mimo_swe \
     --tokenizer <tokenizer dir>              # fake model for smoke tests; --vllm <url> for a real model
+# --tasks 0 runs until the epoch has no task left for the hotkey; that stop (pool_exhausted / task_quota_epoch, or
+# wrong_epoch when --epoch was not given) exits 0, any other error exits 1, and either way one JSON line on stderr
+# says why (phase "open" = the gateway refused to open a task, "task" = the task opened and then failed)
 hosted-env verify attachments/<env>-<task>.json --gateway http://127.0.0.1:8780 --hotkey <ss58>
 # a verifier's own re-grade: receipts + YOUR task index (task_hash must match) -> grade each patch again, compare
 hosted-env regrade --attachment attachments/<env>-<task>.json --gateway http://127.0.0.1:8780 \

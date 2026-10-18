@@ -30,6 +30,7 @@ class ApiError(RuntimeError):
     def __init__(self, status: int, code: str, detail: str = '', retry_after: float | None = None):
         super().__init__(f'{status} {code} {detail}'.strip())
         self.status, self.code, self.detail, self.retry_after = status, code, detail, retry_after
+        self.task: str | None = None       # set by run_task when the error came after the task opened (worker, finish)
 
 
 def _raise(r: httpx.Response):
@@ -193,11 +194,15 @@ def run_task(gateway: GatewayClient, epoch: str, env_id: str, sampler: Sampler, 
         worker = worker_factory(t['worker_url'])
         with ThreadPoolExecutor(concurrency) as ex:
             results = list(ex.map(lambda s: run_rollout(worker, s['token'], sampler, nonce=s['nonce']), sessions))
+    except ApiError as e:
+        e.task = t['task']                             # not a refusal to open: the task opened, then this failed
+        raise
     finally:
         try:
             seal = gateway.finish_task(epoch, t['task_id'])
         except ApiError as e:
             if e.status not in (404, 409, 410):        # an already ended (voided) task cannot be finished again
+                e.task = t['task']
                 raise
     # no seal (the gateway voided the task, or finish was refused): the group could never verify, nothing to upload
     voided = seal is None or any(x['outcome'] in ('voided', 'infra_error') for x in results)
