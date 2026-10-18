@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from .base import DockerTaskEnv, EnvSession, GradeError, SetupError
+from .images import register_cli as _images_cli
 from .swe import SweEnv
+from .swe.cli import register as _swe_cli
 
 KINDS = {DockerTaskEnv.kind: DockerTaskEnv, SweEnv.kind: SweEnv}
+# environment-side `hosted-env` subcommands: each registers its parsers on the CLI's subparsers
+CLI_EXTENSIONS = [_images_cli, _swe_cli]
 
 
 def make_env(env_id: str, cfg: dict) -> DockerTaskEnv:
@@ -22,4 +26,5 @@ def receipt_spec(kind: str):
     return KINDS[kind].RECEIPT
 
 
-__all__ = ['DockerTaskEnv', 'EnvSession', 'GradeError', 'KINDS', 'SetupError', 'SweEnv', 'make_env', 'receipt_spec']
+__all__ = ['CLI_EXTENSIONS', 'DockerTaskEnv', 'EnvSession', 'GradeError', 'KINDS', 'SetupError', 'SweEnv', 'make_env',
+           'receipt_spec']

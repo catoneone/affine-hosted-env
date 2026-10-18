@@ -73,6 +73,26 @@ def open_local(env, task, tmp_path):
     return env.open(env.public_spec(task), lambda image, cwd: LocalSandbox(image, cwd, base_dir=str(tmp_path)))
 
 
+def test_the_environment_repairs_both_containers(tmp_path, monkeypatch):
+    """The image-environment repair moved out of the sandbox providers into the environment: SweEnv applies
+    IMAGE_ENV_PROBE to the rollout container and to the fresh grading container (same environment for both), and
+    repair_image_env = false turns it off."""
+    from hosted_env.envs.base import IMAGE_ENV_PROBE
+    seen = []
+    monkeypatch.setattr(LocalSandbox, 'extend_env', lambda self, probe: seen.append((id(self), probe)))
+    g, _ = graded(tmp_path, 'sed -i.bak "s/a - b/a + b/" calc.py && rm calc.py.bak')
+    assert g['reward'] == 1.0
+    assert len(seen) == 2 and len({sid for sid, _ in seen}) == 2 and all(p == IMAGE_ENV_PROBE for _, p in seen)
+    seen.clear()
+    (tmp_path / 'off').mkdir()
+    env, task = make_task(tmp_path / 'off')
+    env.cfg['repair_image_env'] = False
+    s = open_local(env, task, tmp_path)
+    s.setup()
+    s.close()
+    assert seen == []
+
+
 def test_setup_strips_and_grades(tmp_path):
     env, task = make_task(tmp_path)
     s = open_local(env, task, tmp_path)

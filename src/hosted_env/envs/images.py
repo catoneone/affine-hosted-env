@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:          # httpx is imported where it is used: `import hosted_env.envs` (validators) needs none
+    import httpx
 
 MANIFEST_TYPES = ', '.join((
     'application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json',
@@ -46,7 +48,9 @@ def split_ref(image: str) -> tuple[str, str, str]:
 def resolve_digest(image: str, http: httpx.Client | None = None) -> str:
     """The registry's content digest for `image` (`name:tag`)."""
     registry, repo, tag = split_ref(image)
-    http = http or httpx.Client(timeout=30, follow_redirects=True)
+    if http is None:
+        import httpx
+        http = httpx.Client(timeout=30, follow_redirects=True)
     headers = {'Accept': MANIFEST_TYPES}
     if registry == 'registry-1.docker.io':
         t = http.get('https://auth.docker.io/token',
@@ -84,3 +88,21 @@ def pin_tasks(lines: list[str], resolve=resolve_digest) -> tuple[list[str], dict
             stats['pinned'] += 1
         out.append(json.dumps(row, ensure_ascii=False))
     return out, stats
+
+
+def cmd_pin_images(a):
+    from pathlib import Path
+    src = Path(a.tasks)
+    lines, stats = pin_tasks(src.read_text().splitlines())
+    dst = Path(a.out) if a.out else src
+    dst.write_text('\n'.join(lines) + '\n')
+    print(json.dumps({**stats, 'out': str(dst)}))
+
+
+def register_cli(sub) -> None:
+    """`hosted-env pin-images`, registered by hosted_env.cli through hosted_env.envs.CLI_EXTENSIONS."""
+    pi = sub.add_parser('pin-images', help='Rewrite a task file so every image is name@sha256:<digest> '
+                                          '(the tag is kept as image_tag); needs registry access')
+    pi.add_argument('tasks')
+    pi.add_argument('--out', help='write here instead of in place')
+    pi.set_defaults(fn=cmd_pin_images)
