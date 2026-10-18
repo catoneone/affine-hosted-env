@@ -150,3 +150,10 @@ names. A group has one `env_spec`.
 
 The receipt is evidence for the verifier to re-check, not a trusted reward: the hidden tests run in the same
 process as the code under test, which can always produce the test framework's output.
+
+To re-check it, `hosted-env regrade --attachment <file> --gateway <url> --tasks <your task index> --config <cfg>`
+verifies the group as above (a group that fails only the pass/fail gate is still re-graded), refuses when a
+receipt's `task_hash`, `image` or `grader` differs from your task row / this code, then grades every graded
+rollout's `model_patch` again in fresh containers from the receipt's `start_tree` (the same pipeline, canary
+included) and prints the receipt's reward next to the re-grade's. Exit 0 when all match, 2 on a mismatch, 1 on a
+refusal. Use the receipt's `sandbox_limits` in your config: a re-grade under other limits can differ.

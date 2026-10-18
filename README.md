@@ -70,6 +70,9 @@ hosted-env worker  --config examples/worker.toml           # default 127.0.0.1:8
 hosted-env mine --gateway http://127.0.0.1:8780 --hotkey <ss58> --key <mining key> --env mimo_swe \
     --tokenizer <tokenizer dir>              # fake model for smoke tests; --vllm <url> for a real model
 hosted-env verify attachments/<env>-<task>.json --gateway http://127.0.0.1:8780 --hotkey <ss58>
+# a verifier's own re-grade: receipts + YOUR task index (task_hash must match) -> grade each patch again, compare
+hosted-env regrade --attachment attachments/<env>-<task>.json --gateway http://127.0.0.1:8780 \
+    --tasks <your tasks.jsonl> --config <config with the env and its sandbox> [--passing-only]
 ```
 
 See [examples/](examples/) for config examples. Services listen on 127.0.0.1 only; the gateway's miner endpoints require a hotkey signature, the worker endpoints require a worker key signature, and `/v1/info` is public and read-only.
