@@ -217,7 +217,9 @@ Implemented in `src/hosted_env/infra/receipt.py` and `src/hosted_env/infra/verif
 - `src/hosted_env/infra/executor/` (formerly `worker/`): token rendering, tool execution, grading, receipt signing.
 - `src/hosted_env/infra/providers/sandbox/`: one container per rollout (Docker, local for tests).
 - `src/hosted_env/envs/swe/`: Xiaomi MiMo SWE task type, ported from the internal EXP-014 harness (`env.py` SweEnv,
-  `cleanup.py`, `protect.py`, `scripts.py`, `reports.py` the second check, `baseline.py` expected tests).
+  `cleanup.py`, `protect.py`, `scripts.py`, `reports.py` the second check, `baseline.py` expected tests,
+  `receipt.py` the fields its receipts bind, `cli.py` the `baseline` command). How to add another task type:
+  [adding-an-environment.md](adding-an-environment.md).
 - `src/hosted_env/envs/images.py`: pinning task images by digest.
 - `src/hosted_env/infra/client.py`: reference miner.
 - Tests: `uv run pytest`.

@@ -4,6 +4,7 @@ Hosted tool-environment service for SN120. Miners keep running inference on thei
 
 Design doc: [docs/design.md](docs/design.md) (overall design v1, 2026-10-15).
 Architecture v2 (layered services on Kubernetes, in progress): [docs/architecture.md](docs/architecture.md).
+Adding a task type: [docs/adding-an-environment.md](docs/adding-an-environment.md).
 
 ## Why
 
@@ -19,7 +20,7 @@ In tool environments like SWE, about half of a trajectory is tool output rather 
 | `hosted_env.infra.coordinator` | Quota, task assignment, global budget / fair share, sessions, session tokens, worker registration | SQLite |
 | `hosted_env.infra.executor` | Formerly the worker: renders task prompt / tool output tokens, executes, grades, signs receipts; long poll, idempotent retries | FastAPI |
 | `hosted_env.infra.providers.sandbox` | One container per rollout: `K8sSandbox` (Pod, gVisor, egress denied), `DockerSandbox` + image cache, `LocalSandbox` (tests) | `kubernetes` (extra `k8s`), Docker |
-| `hosted_env.envs` | Environment interface: `docker_task` (image + task prompt + grading command), `mimo_swe` (Xiaomi MiMo SWE tasks) | |
+| `hosted_env.envs` | Task types, everything task-specific: prompt, tools, setup, grading, anti-cheat, extra receipt fields. `docker_task` (image + task prompt + grading command), `mimo_swe` (Xiaomi MiMo SWE tasks, `envs/swe/`) | |
 | `hosted_env.infra.client` | Reference miner: opens a task, runs the group concurrently, writes the attachment into the group object; pluggable sampler | httpx |
 
 ```text
