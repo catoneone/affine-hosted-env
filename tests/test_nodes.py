@@ -6,8 +6,8 @@ import pytest
 from nacl.signing import SigningKey
 from test_coordinator_store import BIG, EPOCH, NOW, make_env
 
-from hosted_env.coordinator.nodes import NodeInfo, cpu_cores, image_names, k8s_nodes, mem_bytes, node_info
-from hosted_env.coordinator.store import CapacityError, Limits, Store
+from hosted_env.infra.coordinator.nodes import NodeInfo, cpu_cores, image_names, k8s_nodes, mem_bytes, node_info
+from hosted_env.infra.coordinator.store import CapacityError, Limits, Store
 
 
 def knode(name, cpu='8', mem='16Gi', ready='True', unschedulable=False, taints=(), images=(), disk=None):
@@ -108,7 +108,7 @@ def test_gateway_node_sync_loop(tmp_path):
 
     from fastapi.testclient import TestClient
 
-    from hosted_env.gateway.app import Roster, create_gateway_app
+    from hosted_env.infra.gateway.app import Roster, create_gateway_app
     roster = tmp_path / 'roster.json'
     roster.write_text(json.dumps({'epoch': EPOCH, 'hotkeys': {}}))
     st = node_store(tmp_path)
@@ -131,7 +131,7 @@ def test_gateway_node_sync_loop(tmp_path):
 
 
 def test_config_placement_k8s(tmp_path):
-    from hosted_env.config import _node_source, _store
+    from hosted_env.infra.config import _node_source, _store
     cfg = {'db': str(tmp_path / 'g.db'), 'placement': {'kind': 'k8s', 'cpus': '2'}}
     assert _store(cfg, tmp_path, SigningKey.generate()).placement == 'nodes'
     assert callable(_node_source(cfg)) and _node_source({}) is None

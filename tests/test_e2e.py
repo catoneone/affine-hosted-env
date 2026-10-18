@@ -13,17 +13,17 @@ from conftest import FIX, make_swe_tasks
 from nacl.signing import SigningKey
 
 from hosted_env.cli import SMOKE_REPLIES
-from hosted_env.client import ApiError, GatewayClient, ScriptedSampler, run_task
-from hosted_env.common import key_id
-from hosted_env.coordinator.store import Limits, Store
+from hosted_env.infra.client import ApiError, GatewayClient, ScriptedSampler, run_task
+from hosted_env.infra.common import key_id
+from hosted_env.infra.coordinator.store import Limits, Store
 from hosted_env.envs import SweEnv
-from hosted_env.executor.app import create_worker_app
-from hosted_env.executor.core import EnvRuntime, Worker
-from hosted_env.executor.gateway_client import WorkerGatewayClient
-from hosted_env.gateway.app import Roster, create_gateway_app
-from hosted_env.receipt import ReceiptError
-from hosted_env.render import CharRenderer
-from hosted_env.verify import verify_group
+from hosted_env.infra.executor.app import create_worker_app
+from hosted_env.infra.executor.core import EnvRuntime, Worker
+from hosted_env.infra.executor.gateway_client import WorkerGatewayClient
+from hosted_env.infra.gateway.app import Roster, create_gateway_app
+from hosted_env.infra.receipt import ReceiptError
+from hosted_env.infra.render import CharRenderer
+from hosted_env.infra.verify import verify_group
 
 uvicorn = pytest.importorskip('uvicorn')
 EPOCH = 'e000001'
@@ -81,13 +81,13 @@ def stack(tmp_path):
 
 def trusted(stack):
     info = httpx.get(stack['gw'].url + '/v1/info').json()
-    from hosted_env.common import verify_key_from_hex
+    from hosted_env.infra.common import verify_key_from_hex
     return info, {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
 
 
 def gw_key(info):
     """The key the gateway signs group seals with, as /v1/info publishes it."""
-    from hosted_env.common import verify_key_from_hex
+    from hosted_env.infra.common import verify_key_from_hex
     return verify_key_from_hex(info['gateway_public_key'])
 
 
@@ -100,7 +100,7 @@ def test_group_end_to_end(stack):
     outs = [(x['nonce'], x['outcome'], x['reward']) for x in res['rollouts']]
     assert outs == [(n, 'completed', 1.0 if n % 2 == 0 else 0.0) for n in range(8)]
     # this task has no expected tests: the receipt says so, and the reward rests on the exit code
-    from hosted_env.common import unb64u
+    from hosted_env.infra.common import unb64u
     assert all(json.loads(unb64u(x['receipt']['payload']))['expected_tests_sha256'] == '' for x in res['rollouts'])
 
     info, keys = trusted(stack)
@@ -177,8 +177,8 @@ def test_auth_and_quota_errors_over_http(stack):
 def test_single_process_group_and_data_plane_limit(tmp_path):
     """gateway + coordinator + executor in one process: the miner only ever talks to the gateway, which also
     serves /v1/start and /v1/turn and rate limits them by the session token's hotkey."""
-    from hosted_env.executor.gateway_client import InProcessGatewayClient
-    from hosted_env.gateway.ratelimit import MemoryBuckets, Rate, RateLimiter, RateLimits
+    from hosted_env.infra.executor.gateway_client import InProcessGatewayClient
+    from hosted_env.infra.gateway.ratelimit import MemoryBuckets, Rate, RateLimiter, RateLimits
 
     class Counting(MemoryBuckets):
         limited = 0
@@ -215,7 +215,7 @@ def test_single_process_group_and_data_plane_limit(tmp_path):
         assert [x['outcome'] for x in res['rollouts']] == ['completed'] * 8
         assert Counting.limited > 0                                 # 429s happened and the client retried them
         info = httpx.get(gw.url + '/v1/info').json()
-        from hosted_env.common import verify_key_from_hex
+        from hosted_env.infra.common import verify_key_from_hex
         keys = {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
         v = verify_group(json.loads(json.dumps(res['attachment'])), keys, gateway_key=gw_key(info), epoch=EPOCH,
                          hotkey='5H0', env_id='swe', task=res['task']['task'])
@@ -230,8 +230,8 @@ def test_receipt_context_binds_expected_tests():
     check it used the same list; an ungraded rollout (gi == {}) carries ''."""
     from types import SimpleNamespace
 
-    from hosted_env.executor.core import Worker
-    from hosted_env.receipt import expected_tests_digest
+    from hosted_env.infra.executor.core import Worker
+    from hosted_env.infra.receipt import expected_tests_digest
     rend = SimpleNamespace(model_id='m', model_revision='r', identity={'tokenizer_sha256': '', 'chat_template_sha256': '',
                                                                      'renderer': 'char'})
     s = SimpleNamespace(rt=SimpleNamespace(renderer=rend, sandbox='local', sandbox_opts={}), envsess=None,
@@ -249,8 +249,8 @@ def test_sandbox_limits_names_what_was_enforced():
     """The receipt's sandbox_limits fills each provider's defaults, so it names the limits actually enforced."""
     from types import SimpleNamespace
 
-    from hosted_env.executor.core import _sandbox_limits
-    from hosted_env.providers.sandbox.k8s import DEFAULT_DISK
+    from hosted_env.infra.executor.core import _sandbox_limits
+    from hosted_env.infra.providers.sandbox.k8s import DEFAULT_DISK
 
     def rt(kind, **o):
         return SimpleNamespace(sandbox=kind, sandbox_opts=o)
@@ -265,10 +265,10 @@ def test_sandbox_limits_names_what_was_enforced():
 def test_every_sandbox_command_runs_with_the_thread_caps(tmp_path):
     """OMP / OpenBLAS / MKL are capped at 1 thread in every command, so numpy-heavy tests in a 1-CPU sandbox do
     not start one thread per HOST core and run into the pid limit (a correct fix would then grade 0)."""
-    from hosted_env.providers.sandbox import LocalSandbox
-    from hosted_env.providers.sandbox.base import THREAD_CAPS
-    from hosted_env.providers.sandbox.docker import DockerSandbox
-    from hosted_env.providers.sandbox.k8s import K8sSandbox
+    from hosted_env.infra.providers.sandbox import LocalSandbox
+    from hosted_env.infra.providers.sandbox.base import THREAD_CAPS
+    from hosted_env.infra.providers.sandbox.docker import DockerSandbox
+    from hosted_env.infra.providers.sandbox.k8s import K8sSandbox
     assert THREAD_CAPS == {'OMP_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
     img = tmp_path / 'img'
     img.mkdir()

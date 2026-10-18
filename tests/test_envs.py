@@ -11,8 +11,8 @@ from conftest import make_swe_tasks
 from hosted_env.envs import SweEnv
 from hosted_env.envs.base import BASH_TOOL, GradeError, truncate_middle
 from hosted_env.envs.swe import TEST_PATCH_REMOTE, future_commits, protected_paths
-from hosted_env.providers.sandbox import LocalSandbox, SandboxCommandError, SandboxLimitError
-from hosted_env.toolcall import parse_tool_calls, split_reasoning
+from hosted_env.infra.providers.sandbox import LocalSandbox, SandboxCommandError, SandboxLimitError
+from hosted_env.infra.toolcall import parse_tool_calls, split_reasoning
 
 
 

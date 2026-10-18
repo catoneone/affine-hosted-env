@@ -5,8 +5,8 @@ from pathlib import Path
 from conftest import make_swe_tasks
 
 from hosted_env.cli import main
-from hosted_env.common import load_key_file, public_hex
-from hosted_env.config import build_gateway_app, build_worker
+from hosted_env.infra.common import load_key_file, public_hex
+from hosted_env.infra.config import build_gateway_app, build_worker
 
 EX = Path(__file__).resolve().parents[1] / 'examples'
 
@@ -39,7 +39,7 @@ def test_examples_build(tmp_path, capsys):
 
 
 def test_server_example_builds(tmp_path, capsys):
-    from hosted_env.config import build_server_app
+    from hosted_env.infra.config import build_server_app
     (tmp_path / 'cfg').mkdir()
     (tmp_path / 'runs').mkdir()
     main(['keygen', str(tmp_path / 'keys' / 'gateway.key')])
@@ -59,7 +59,7 @@ def test_slot_sizes_must_match_the_sandbox_pods():
 
     import pytest
 
-    from hosted_env.config import _check_slot_sizes
+    from hosted_env.infra.config import _check_slot_sizes
     k8s = {'placement': {'kind': 'k8s', 'cpus': '1', 'memory': '2g'}}
     _check_slot_sizes(k8s, {'e': NS(sandbox='k8s', sandbox_opts={})})                       # defaults agree
     _check_slot_sizes(k8s, {'e': NS(sandbox='k8s', sandbox_opts={'memory': '2Gi', 'disk': '10g'})})   # same sizes

@@ -7,9 +7,9 @@ import os
 import pytest
 from nacl.signing import SigningKey
 
-from hosted_env.chain import (OWNER, activation_message, decode_commitment, registrations, ss58_public_key,
+from hosted_env.infra.chain import (OWNER, activation_message, decode_commitment, registrations, ss58_public_key,
                               sync_once, write_roster)
-from hosted_env.gateway.app import Roster
+from hosted_env.infra.gateway.app import Roster
 
 B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 
@@ -151,7 +151,7 @@ def test_info_reports_the_roster(tmp_path):
     from fastapi.testclient import TestClient
     from test_nodes import node_store
 
-    from hosted_env.gateway.app import create_gateway_app
+    from hosted_env.infra.gateway.app import create_gateway_app
     allow = tmp_path / 'roster.json'
     allow.write_text(json.dumps({'epoch': 'e1', 'hotkeys': {}}))
     write_roster(str(tmp_path / 'c.json'), 7, {}, now=5.0)

@@ -1,7 +1,7 @@
 """providers/machine: data types and the static provider."""
 import pytest
 
-from hosted_env.providers.machine import Machine, MachineSpec, NotSupported, StaticProvider
+from hosted_env.infra.providers.machine import Machine, MachineSpec, NotSupported, StaticProvider
 
 
 def test_spec_requires_prefix():
@@ -73,8 +73,8 @@ def test_boat_create_runs_boot_script_and_lists_own(tmp_path):
     import base64
     import json as _json
 
-    from hosted_env.providers.machine import MachineError
-    from hosted_env.providers.machine.boat import BOOT_PATH, BoatProvider
+    from hosted_env.infra.providers.machine import MachineError
+    from hosted_env.infra.providers.machine.boat import BOOT_PATH, BoatProvider
     fb = FakeBoat()
     fb.sandboxes['bx_other'] = {'id': 'bx_other', 'name': 'someone else', 'type': 'large', 'state': 'idle',
                                 'ip': '2001:db8::9', 'polls': 0}
@@ -103,8 +103,8 @@ def test_boat_create_runs_boot_script_and_lists_own(tmp_path):
 
 
 def test_boat_create_times_out_when_never_ready():
-    from hosted_env.providers.machine import CreateFailed
-    from hosted_env.providers.machine.boat import BoatProvider
+    from hosted_env.infra.providers.machine import CreateFailed
+    from hosted_env.infra.providers.machine.boat import BoatProvider
     fb, ids = FakeBoat(ready_after=10 ** 9), []
     p = BoatProvider('tok', http=fb.http, ready_timeout=0, poll=0)
     with pytest.raises(CreateFailed, match='did not become ready') as e:
@@ -116,8 +116,8 @@ def test_boat_create_times_out_when_never_ready():
 def test_boat_failed_cleanup_is_reported_not_swallowed():
     import httpx
 
-    from hosted_env.providers.machine import CreateFailed
-    from hosted_env.providers.machine.boat import BoatProvider
+    from hosted_env.infra.providers.machine import CreateFailed
+    from hosted_env.infra.providers.machine.boat import BoatProvider
     fb = FakeBoat(ready_after=10 ** 9)
     fb.sandboxes['bx_other'] = {'id': 'bx_other', 'name': 'hosted-env-cp1', 'type': 'large', 'state': 'idle',
                                 'ip': '2001:db8::9', 'polls': 0}
@@ -194,8 +194,8 @@ class FakeTargon:
 
 
 def test_targon_create_maps_ports_and_runs_boot(tmp_path):
-    from hosted_env.providers.machine import MachineError
-    from hosted_env.providers.machine.targon import TargonProvider
+    from hosted_env.infra.providers.machine import MachineError
+    from hosted_env.infra.providers.machine.targon import TargonProvider
     ft, booted = FakeTargon(), []
     p = TargonProvider('tok', ssh_key_uid='shk-1', boot_runner=lambda m, s: booted.append((m.id, s)), http=ft.http,
                        poll=0)
@@ -223,8 +223,8 @@ def test_targon_create_maps_ports_and_runs_boot(tmp_path):
 
 
 def test_targon_never_running_fails_without_boot():
-    from hosted_env.providers.machine import CreateFailed, MachineError
-    from hosted_env.providers.machine.targon import TargonProvider
+    from hosted_env.infra.providers.machine import CreateFailed, MachineError
+    from hosted_env.infra.providers.machine.targon import TargonProvider
     booted, ids = [], []
     p = TargonProvider('tok', ssh_key_uid='k', boot_runner=lambda m, s: booted.append(m), org='al-1',
                        http=FakeTargon(ready_after=10 ** 9).http, ready_timeout=0, poll=0)
@@ -249,7 +249,7 @@ def _bash_syntax_ok(script: str) -> None:
 
 
 def test_boot_script_defaults():
-    from hosted_env.providers.machine.bootstrap import K3S_VERSION, render_boot_script
+    from hosted_env.infra.providers.machine.bootstrap import K3S_VERSION, render_boot_script
     tok = 'K10abc::server:s3cr3t'
     s = render_boot_script(server_url='https://cp.example:6443', join_token=tok,
                            labels={'hosted-env/provider': 'boat'})
@@ -271,7 +271,7 @@ def test_boot_script_defaults():
 def test_boot_script_remapped_wireguard_and_no_gvisor():
     import json as _json
 
-    from hosted_env.providers.machine.bootstrap import render_boot_script
+    from hosted_env.infra.providers.machine.bootstrap import render_boot_script
     s = render_boot_script(server_url='https://160.0.0.1:20004', join_token='t', node_name='hosted-env-tg1',
                            wireguard_port=20000, wireguard_forwarded_port=51820, gvisor=False)
     _bash_syntax_ok(s)
@@ -283,7 +283,7 @@ def test_boot_script_remapped_wireguard_and_no_gvisor():
 
 
 def test_server_boot_script_targon_shape():
-    from hosted_env.providers.machine.bootstrap import render_server_boot_script
+    from hosted_env.infra.providers.machine.bootstrap import render_server_boot_script
     tok = 'K10srv::server:s3cr3t'
     s = render_server_boot_script(join_token=tok, public_ip='160.0.0.1', api_port=20004, hairpin=True,
                                   wireguard_port=20000, wireguard_forwarded_port=51820, node_name='hosted-env-cp1')
@@ -302,7 +302,7 @@ def test_server_boot_script_targon_shape():
 
 
 def test_server_boot_script_plain_and_validation():
-    from hosted_env.providers.machine.bootstrap import render_server_boot_script
+    from hosted_env.infra.providers.machine.bootstrap import render_server_boot_script
     s = render_server_boot_script(join_token='t', public_ip='2001:db8::1', schedulable=True, gvisor=False)
     _bash_syntax_ok(s)
     assert 'socat' not in s and 'NoSchedule' not in s and 'RuntimeClass' not in s and 'flannel.json' not in s
@@ -314,7 +314,7 @@ def test_server_boot_script_plain_and_validation():
 
 
 def test_boot_script_rejects_injection():
-    from hosted_env.providers.machine.bootstrap import render_boot_script
+    from hosted_env.infra.providers.machine.bootstrap import render_boot_script
     with pytest.raises(ValueError):
         render_boot_script(server_url='https://x; rm -rf ~', join_token='t')
     with pytest.raises(ValueError):

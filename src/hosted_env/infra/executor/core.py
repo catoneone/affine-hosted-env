@@ -26,10 +26,10 @@ from dataclasses import dataclass, field
 
 from nacl.signing import SigningKey, VerifyKey
 
-from .. import __version__
+from ... import __version__
 from ..auth import AuthError, verify_token
 from ..common import canonical, key_id, sha256_hex
-from ..envs import SetupError
+from ...envs import SetupError
 from ..receipt import TrajectoryHasher, expected_tests_digest, receipt_digest, sign_receipt
 from ..render import TemplateRenderer
 from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox, SandboxCommandError, SandboxLimitError

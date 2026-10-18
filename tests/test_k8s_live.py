@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(not KUBECONFIG, reason='HOSTED_ENV_KUBECONFIG no
 
 def test_live_pod_sandbox():
     kubernetes = pytest.importorskip('kubernetes')
-    from hosted_env.providers.sandbox.k8s import K8sSandbox
+    from hosted_env.infra.providers.sandbox.k8s import K8sSandbox
     api_client = kubernetes.config.new_client_from_config(config_file=os.path.expanduser(KUBECONFIG))
     core, net = kubernetes.client.CoreV1Api(api_client), kubernetes.client.NetworkingV1Api(api_client)
     sb = K8sSandbox(os.environ.get('HOSTED_ENV_K8S_IMAGE', 'python:3.12-slim'), '/tmp', api=core, networking_api=net,

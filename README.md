@@ -13,14 +13,14 @@ In tool environments like SWE, about half of a trajectory is tool output rather 
 
 | Module | Purpose | Dependencies |
 |---|---|---|
-| `hosted_env.receipt` | Trajectory hash, receipt issuance, `verify_receipt`, `loss_mask` | PyNaCl only; can be copied upstream as is |
-| `hosted_env.verify` | `verify_group`: a group's 8 receipts + the "at least one pass and one fail" gate | Same as above |
-| `hosted_env.gateway` | Public HTTP edge: hotkey signature verification, replay protection, roster checks, routing | FastAPI |
-| `hosted_env.coordinator` | Quota, task assignment, global budget / fair share, sessions, session tokens, worker registration | SQLite |
-| `hosted_env.executor` | Formerly the worker: renders task prompt / tool output tokens, executes, grades, signs receipts; long poll, idempotent retries | FastAPI |
-| `hosted_env.providers.sandbox` | One container per rollout: `K8sSandbox` (Pod, gVisor, egress denied), `DockerSandbox` + image cache, `LocalSandbox` (tests) | `kubernetes` (extra `k8s`), Docker |
+| `hosted_env.infra.receipt` | Trajectory hash, receipt issuance, `verify_receipt`, `loss_mask` | PyNaCl only; can be copied upstream as is |
+| `hosted_env.infra.verify` | `verify_group`: a group's 8 receipts + the "at least one pass and one fail" gate | Same as above |
+| `hosted_env.infra.gateway` | Public HTTP edge: hotkey signature verification, replay protection, roster checks, routing | FastAPI |
+| `hosted_env.infra.coordinator` | Quota, task assignment, global budget / fair share, sessions, session tokens, worker registration | SQLite |
+| `hosted_env.infra.executor` | Formerly the worker: renders task prompt / tool output tokens, executes, grades, signs receipts; long poll, idempotent retries | FastAPI |
+| `hosted_env.infra.providers.sandbox` | One container per rollout: `K8sSandbox` (Pod, gVisor, egress denied), `DockerSandbox` + image cache, `LocalSandbox` (tests) | `kubernetes` (extra `k8s`), Docker |
 | `hosted_env.envs` | Environment interface: `docker_task` (image + task prompt + grading command), `mimo_swe` (Xiaomi MiMo SWE tasks) | |
-| `hosted_env.client` | Reference miner: opens a task, runs the group concurrently, writes the attachment into the group object; pluggable sampler | httpx |
+| `hosted_env.infra.client` | Reference miner: opens a task, runs the group concurrently, writes the attachment into the group object; pluggable sampler | httpx |
 
 ```text
 miner GPU ──① tasks/open, sessions/open, tasks/finish (hotkey-signed)──▶ gateway

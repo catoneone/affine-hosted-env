@@ -66,7 +66,7 @@ Miner GPU (anywhere)                         Operator
 | validator / trainer | Existing sampling proof + one `verify_receipt` call per rollout | Existing |
 
 ## 4. Identity and quotas (gateway)
-Implemented in `src/hosted_env/auth.py` and `src/hosted_env/coordinator/` (tests: `tests/test_auth.py`, `tests/test_coordinator_store.py`).
+Implemented in `src/hosted_env/infra/auth.py` and `src/hosted_env/infra/coordinator/` (tests: `tests/test_auth.py`, `tests/test_coordinator_store.py`).
 
 **Identity**
 - The miner signs every control-plane request with the supervisor's Ed25519 mining key; the signed content is `domain | method | path | hotkey | timestamp | request id | sha256(request body)`.
@@ -127,7 +127,7 @@ Data plane (worker, session token):
 The miner uploads the group's 8 rollouts through the existing complete-group flow; the group object additionally carries the 8 receipts and each rollout's source segments.
 
 ## 9. Receipts and verification
-Implemented in `src/hosted_env/receipt.py` and `src/hosted_env/verify.py` (tests: `tests/test_receipt.py`).
+Implemented in `src/hosted_env/infra/receipt.py` and `src/hosted_env/infra/verify.py` (tests: `tests/test_receipt.py`).
 
 - **Trajectory hash**: the worker incrementally hashes `[(source, token ids)...]`. Each segment is encoded as 1 byte of source + segment length u32 + each token id as u32 (little-endian); it must start with P, and adjacent segments must have different sources.
 - **Receipt content**: epoch, hotkey, env_id, task, nonce, trajectory hash, token count, outcome (completed / unresolved / infra_error), reward, worker key id, issue time, signed with the worker's Ed25519 key.
@@ -209,16 +209,16 @@ Implemented in `src/hosted_env/receipt.py` and `src/hosted_env/verify.py` (tests
 | P3 | Proposal to const; small pilot with external miners | Decided by const | |
 
 ## Appendix: code
-- `src/hosted_env/auth.py`: hotkey signature verification, session tokens.
-- `src/hosted_env/gateway/`: public HTTP edge (signatures, replay protection, routing; FastAPI).
-- `src/hosted_env/coordinator/`: quotas, task assignment, global budget / fair share, worker registry (SQLite).
-- `src/hosted_env/receipt.py`: trajectory hash, receipt signing, `verify_receipt`, `loss_mask`.
-- `src/hosted_env/verify.py`: `verify_group`.
-- `src/hosted_env/executor/` (formerly `worker/`): token rendering, tool execution, grading, receipt signing.
-- `src/hosted_env/providers/sandbox/`: one container per rollout (Docker, local for tests).
+- `src/hosted_env/infra/auth.py`: hotkey signature verification, session tokens.
+- `src/hosted_env/infra/gateway/`: public HTTP edge (signatures, replay protection, routing; FastAPI).
+- `src/hosted_env/infra/coordinator/`: quotas, task assignment, global budget / fair share, worker registry (SQLite).
+- `src/hosted_env/infra/receipt.py`: trajectory hash, receipt signing, `verify_receipt`, `loss_mask`.
+- `src/hosted_env/infra/verify.py`: `verify_group`.
+- `src/hosted_env/infra/executor/` (formerly `worker/`): token rendering, tool execution, grading, receipt signing.
+- `src/hosted_env/infra/providers/sandbox/`: one container per rollout (Docker, local for tests).
 - `src/hosted_env/envs/swe/`: Xiaomi MiMo SWE task type, ported from the internal EXP-014 harness (`env.py` SweEnv,
   `cleanup.py`, `protect.py`, `scripts.py`, `reports.py` the second check, `baseline.py` expected tests).
 - `src/hosted_env/envs/images.py`: pinning task images by digest.
-- `src/hosted_env/client.py`: reference miner.
+- `src/hosted_env/infra/client.py`: reference miner.
 - Tests: `uv run pytest`.
 - The original prototypes lived in internal experiment EXP-015.

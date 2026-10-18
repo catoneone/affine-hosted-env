@@ -6,8 +6,8 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from hosted_env.providers.sandbox import SandboxError, SandboxCommandError, SandboxLimitError
-from hosted_env.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, _parse_exit_status, ensure_network_policies,
+from hosted_env.infra.providers.sandbox import SandboxError, SandboxCommandError, SandboxLimitError
+from hosted_env.infra.providers.sandbox.k8s import (WRITE_CHUNK, K8sSandbox, _parse_exit_status, ensure_network_policies,
                                               limit_reason, network_policy_manifest, pod_manifest)
 
 
@@ -367,8 +367,8 @@ def test_executor_builds_k8s_sandboxes(tmp_path):
     from nacl.signing import SigningKey
 
     from hosted_env.envs import DockerTaskEnv
-    from hosted_env.executor.core import EnvRuntime, Worker
-    from hosted_env.render import CharRenderer
+    from hosted_env.infra.executor.core import EnvRuntime, Worker
+    from hosted_env.infra.render import CharRenderer
     core, net = FakeCore(), FakeNet()
     rt = EnvRuntime(env=DockerTaskEnv('e', {'group_size': 8}), renderer=CharRenderer(), sandbox='k8s',
                     sandbox_opts={'exec_fn': offline_exec(), 'node_name': 'node-a', 'repair_env': False,
@@ -414,7 +414,7 @@ def test_exec_never_uses_the_shared_client(monkeypatch):
     kubernetes = pytest.importorskip('kubernetes')
     stream_mod = pytest.importorskip('kubernetes.stream')
 
-    from hosted_env.providers.sandbox.k8s import ws_exec
+    from hosted_env.infra.providers.sandbox.k8s import ws_exec
     cfg = kubernetes.client.Configuration()
     cfg.host = 'https://cp.test:6443'
     shared = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(cfg))
@@ -466,7 +466,7 @@ def test_exec_retries_a_failed_handshake_only(monkeypatch):
     stream_mod = pytest.importorskip('kubernetes.stream')
     from kubernetes.client.rest import ApiException
 
-    from hosted_env.providers.sandbox import k8s
+    from hosted_env.infra.providers.sandbox import k8s
     monkeypatch.setattr(k8s, 'HANDSHAKE_BACKOFF', 0)
     cfg = kubernetes.client.Configuration()
     cfg.host = 'https://cp.test:6443'

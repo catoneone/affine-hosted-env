@@ -3,13 +3,13 @@ import pytest
 from conftest import FIX, make_swe_tasks
 from nacl.signing import SigningKey
 
-from hosted_env.common import key_id
-from hosted_env.coordinator.store import Limits, Store
+from hosted_env.infra.common import key_id
+from hosted_env.infra.coordinator.store import Limits, Store
 from hosted_env.envs import GradeError, SweEnv
-from hosted_env.executor.core import EnvRuntime, Worker, WorkerError
-from hosted_env.providers.sandbox import SandboxError
-from hosted_env.receipt import ReceiptError, verify_receipt
-from hosted_env.render import CharRenderer
+from hosted_env.infra.executor.core import EnvRuntime, Worker, WorkerError
+from hosted_env.infra.providers.sandbox import SandboxError
+from hosted_env.infra.receipt import ReceiptError, verify_receipt
+from hosted_env.infra.render import CharRenderer
 
 EPOCH = 'e000001'
 
@@ -187,7 +187,7 @@ def test_grade_infra_error_is_signed(rig, monkeypatch):
 def test_sandbox_limit_in_a_tool_call_scores_0_not_void(rig, monkeypatch):
     """A rollout whose commands blow the sandbox's own memory / disk limit must not be able to void itself."""
     from hosted_env.envs.base import EnvSession
-    from hosted_env.providers.sandbox import SandboxLimitError
+    from hosted_env.infra.providers.sandbox import SandboxLimitError
     w, store, r, rt, session, wkey = rig
     t, (s,) = session()
 
@@ -208,7 +208,7 @@ def test_sandbox_command_failure_in_a_tool_call_scores_0_not_void(rig, monkeypat
     """The model deletes a binary exec needs (/bin/sh): the next command cannot launch. That is the model's own
     doing, so the rollout is unresolved / 0, never voided."""
     from hosted_env.envs.base import EnvSession
-    from hosted_env.providers.sandbox import SandboxCommandError
+    from hosted_env.infra.providers.sandbox import SandboxCommandError
     w, store, r, rt, session, wkey = rig
     t, (s,) = session()
 

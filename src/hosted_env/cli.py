@@ -29,36 +29,36 @@ def _serve(app, host: str, port: int):
 
 
 def cmd_keygen(a):
-    from .common import generate_key_file, key_id, public_hex
+    from .infra.common import generate_key_file, key_id, public_hex
     sk = generate_key_file(a.path)
     print(json.dumps({'path': str(Path(a.path).resolve()), 'public_key': public_hex(sk),
                       'key_id': key_id(sk.verify_key)}))
 
 
 def cmd_server(a):
-    from .config import build_server_app
+    from .infra.config import build_server_app
     _serve(build_server_app(a.config), a.host, a.port)
 
 
 def cmd_gateway(a):
-    from .config import build_gateway_app
+    from .infra.config import build_gateway_app
     _serve(build_gateway_app(a.config), a.host, a.port)
 
 
 def cmd_worker(a):
-    from .config import build_worker_app
+    from .infra.config import build_worker_app
     _serve(build_worker_app(a.config), a.host, a.port)
 
 
 def cmd_mine(a):
-    from .client import GatewayClient, ScriptedSampler, VLLMSampler, run_task
-    from .common import load_key_file
+    from .infra.client import GatewayClient, ScriptedSampler, VLLMSampler, run_task
+    from .infra.common import load_key_file
     gw = GatewayClient(a.gateway, a.hotkey, load_key_file(a.key))
     epoch = a.epoch or gw.info()['epoch']
     if a.vllm:
         sampler = VLLMSampler(a.vllm, a.model, temperature=a.temperature, top_p=a.top_p)
     else:
-        from .render import make_renderer
+        from .infra.render import make_renderer
         r = make_renderer({'kind': 'char'} if a.tokenizer == 'char' else {'kind': 'hf', 'path': a.tokenizer})
         sampler = ScriptedSampler(r.encode, r.turn_end_id, SMOKE_REPLIES)
     out = Path(a.out)
@@ -76,9 +76,9 @@ def cmd_mine(a):
 def cmd_verify(a):
     import httpx
 
-    from .common import verify_key_from_hex
-    from .receipt import ReceiptError
-    from .verify import verify_group
+    from .infra.common import verify_key_from_hex
+    from .infra.receipt import ReceiptError
+    from .infra.verify import verify_group
     att = json.loads(Path(a.attachment).read_text())
     info = httpx.get(a.gateway.rstrip('/') + '/v1/info', timeout=30).json()
     keys = {w['key_id']: verify_key_from_hex(w['public_key']) for w in info['workers'].values()}
@@ -109,8 +109,8 @@ def cmd_machines(a):
     import time
     from datetime import UTC, datetime
 
-    from .config import machine_inventory
-    from .coordinator.store import LIVE_MACHINE_STATES
+    from .infra.config import machine_inventory
+    from .infra.coordinator.store import LIVE_MACHINE_STATES
     rows, report = machine_inventory(a.config, refresh=a.refresh)
     now = time.time()
     rows = _machine_rows(rows, now)
@@ -153,7 +153,7 @@ def cmd_machines(a):
 def cmd_roster_sync(a):
     import logging
 
-    from .chain import sync_forever, sync_once
+    from .infra.chain import sync_forever, sync_once
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     if a.every:
         sync_forever(a.out, a.every, network=a.network, netuid=a.netuid)
@@ -175,7 +175,7 @@ def cmd_baseline(a):
     with --tasks-out a copy of the task file with fail_to_pass / pass_to_pass / report_kind filled in."""
     import tomllib
     from .envs.swe.baseline import derive
-    from .config import _envs
+    from .infra.config import _envs
     from .envs import make_env
     cfgp = Path(a.config).resolve()
     ecfg = _envs(tomllib.loads(cfgp.read_text()), cfgp.parent)[a.env]
@@ -185,12 +185,12 @@ def cmd_baseline(a):
     opts = dict(ecfg.get('sandbox_opts') or {})
     kind = ecfg.get('sandbox', 'docker')
     if kind == 'k8s':
-        from .providers.sandbox.k8s import K8sSandbox
+        from .infra.providers.sandbox.k8s import K8sSandbox
         if a.node:
             opts['node_name'] = a.node
         factory = lambda image, cwd: K8sSandbox(image, cwd, **opts)  # noqa: E731
     elif kind == 'docker':
-        from .providers.sandbox import DockerSandbox
+        from .infra.providers.sandbox import DockerSandbox
         factory = lambda image, cwd: DockerSandbox(image, cwd, **opts)  # noqa: E731
     else:
         raise SystemExit(f'baseline needs a k8s or docker sandbox, not {kind!r}')

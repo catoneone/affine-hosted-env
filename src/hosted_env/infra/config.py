@@ -7,7 +7,7 @@ import tomllib
 from pathlib import Path
 
 from .common import load_key_file, verify_key_from_hex
-from .envs import make_env
+from ..envs import make_env
 
 
 def _load(path: str) -> tuple[dict, Path]:
