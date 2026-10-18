@@ -22,6 +22,22 @@ k3s cluster: one sandbox Pod per rollout                MachineProvider: boat, t
 (gVisor runtime, egress denied, resource limits)        each machine boots and joins the cluster
 ```
 
+## Infrastructure and environments
+The code is split in two (since 2026-10-18):
+
+- `hosted_env/infra/`: everything above plus the providers, receipts and verification. It runs any task type and
+  knows none: no task fields, no grading rules, no anti-cheat.
+- `hosted_env/envs/`: the task types (`docker_task`, `mimo_swe` in `envs/swe/`). Each owns its task pool filters,
+  prompt, tools, container setup, grading and anti-cheat, the extra receipt fields it binds (`RECEIPT`, an
+  `EnvReceiptSpec`), the attachment artifacts, and its own CLI commands.
+
+The seams are small: the coordinator calls `task_ids` / `image_of` / `public_spec` / `grade_inputs`; the executor
+calls `open`, the session's `setup` / `call_tool` / `grade`, then `receipt_context`, `log_fields` and
+`artifacts`; `sign_receipt`, `verify_receipt` and `verify_group` take the environment's spec, which verifiers get
+from `hosted_env.envs.receipt_spec(kind)`. An exception out of `setup` or `grade` voids the rollout, so deciding
+what is the model's fault (score 0) is the environment's job. `tests/test_boundary.py` fails if infra imports a
+concrete environment or names SWE concepts. How to add one: [adding-an-environment.md](adding-an-environment.md).
+
 ### Gateway
 - Verifies hotkey request signatures and replay ids (`auth.py`) and checks the epoch roster.
 - Roster = SN120 registrations + a hand-edited allowlist, both hot-reloaded. `hosted-env roster-sync --every 300`
@@ -64,13 +80,14 @@ Two separate interfaces, because a machine and a sandbox are different products:
 
 | Interface | Gives | Implementations |
 |---|---|---|
-| `SandboxProvider` | one isolated container per rollout: `start`, `execute`, `copy_text_to`, `cleanup` | `k8s` (default), `docker` (single-host dev), `local` (tests); later vendor sandboxes such as Targon Sandbox (template-based, cannot run arbitrary task images) |
+| `SandboxProvider` | one isolated container per rollout: `start`, `execute`, `copy_text_to`, `extend_env`, `cleanup` | `k8s` (default), `docker` (single-host dev), `local` (tests); later vendor sandboxes such as Targon Sandbox (template-based, cannot run arbitrary task images) |
 | `MachineProvider` | whole machines: create, list, delete, spec, price, limits; a boot script that joins the cluster | `boat`, `targon` (VM), `static` (machines registered by hand) |
 
 The `k8s` sandbox: one Pod per rollout, CPU, memory and ephemeral-storage limits (`disk`, default 10g), no
-service-account token, and the same environment
-repair as `DockerSandbox` (`ENV_PROBE`). Without that repair Go tasks cannot find their module cache and try to
-download it. Every command in every sandbox also runs with `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and
+service-account token. The MiMo task images lost their ENV (single-layer tarballs), so the environment restores
+it after every sandbox start through the generic `extend_env` (`envs.base.IMAGE_ENV_PROBE`, applied by
+`DockerTaskEnv.prepare_sandbox` to the rollout and the grading container). Without that repair Go tasks cannot
+find their module cache and try to download it. Every command in every sandbox also runs with `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and
 `MKL_NUM_THREADS` set to 1 (`THREAD_CAPS`): a 1-CPU sandbox still sees all host cores, so numpy-heavy parallel
 tests otherwise start a thread per host core, hit the pid limit, and a correct fix grades 0 (Affine measured 22.7%
 of correct solutions overall, 96% on a 32-core box). Offline sandboxes are denied the network twice: the `gvisor-nonet` RuntimeClass (runsc
@@ -111,14 +128,15 @@ container; under runc an OOM may kill only the offending process.
 | Exec latency | persistent client through the API server: p50 27-42 ms (runc), +10-30 ms with gVisor, 184 ms cross-region |
 | gVisor grading | Go task 002119: same test verdicts as runc, 27.5 s vs 23.9 s (+15%) |
 | Isolation | default-deny NetworkPolicy blocks egress for runc and gVisor Pods, but asynchronously: on a node that had just joined, the first Pod reached the internet (EXP-018). With `gvisor-nonet` the sandbox has loopback only (`Network is unreachable` for the internet, Service and Pod CIDRs), including the first Pod on a fresh node; a Pod with any other interface is refused at start (EXP-018) |
-| Offline grading | Go task 002119 under `gvisor-nonet` with ENV_PROBE: 32.4 s on 2 cores, same 9 FAILs as with network, no module downloads (EXP-018) |
+| Offline grading | Go task 002119 under `gvisor-nonet` with the image env repair (then `ENV_PROBE`, now `IMAGE_ENV_PROBE`): 32.4 s on 2 cores, same 9 FAILs as with network, no module downloads (EXP-018) |
 | Targon VM | AMD SEV-SNP guest; joins as a node; as control plane it needs two workarounds (advertised address plus local hairpin forwarder, WireGuard port equal to the public mapping) |
 
 ## Migration plan
 Each step is one PR with tests green:
 
 1. **Package split** (done). `gateway/` (HTTP edge), `coordinator/` (today's store), `executor/` (today's worker
-   core), `providers/sandbox/` (today's docker and local sandboxes). Behavior unchanged.
+   core), `providers/sandbox/` (today's docker and local sandboxes). Behavior unchanged. All of them now live
+   under `hosted_env/infra/` (see "Infrastructure and environments").
 2. **Gateway** (done). Rate limits (`gateway/ratelimit.py`) and data-plane routing to an in-process executor
    (`hosted-env server`); the split mode with a separate executor process still works.
 3. **`k8s` SandboxProvider** (done). `providers/sandbox/k8s.py`; Kubernetes Python client as the `k8s` extra;
@@ -148,5 +166,5 @@ Each step is one PR with tests green:
 ## Open
 - Which host runs the control plane (provider, region, dual-stack).
 - Multi-region: one executor and node pool per region, plus routing miners to the nearest region.
-- Whether grading can always run with egress denied (expected yes once `ENV_PROBE` is applied; to be confirmed on
-  the pilot tasks).
+- Whether grading can always run with egress denied (expected yes with the image environment repair applied;
+  to be confirmed on the pilot tasks).
