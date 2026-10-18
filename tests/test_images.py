@@ -1,10 +1,10 @@
-"""images.py: pinning task images by digest (fake registry), and envs refusing unpinned images."""
+"""envs/images.py: pinning task images by digest (fake registry), and envs refusing unpinned images."""
 import json
 
 import httpx
 import pytest
 
-from hosted_env.images import ImageError, is_pinned, pin_tasks, pinned_ref, resolve_digest, split_ref
+from hosted_env.envs.images import ImageError, is_pinned, pin_tasks, pinned_ref, resolve_digest, split_ref
 
 D1 = 'sha256:' + 'a' * 64
 

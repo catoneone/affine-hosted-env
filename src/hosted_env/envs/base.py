@@ -171,7 +171,7 @@ class DockerTaskEnv:
                     r = json.loads(line)
                     rows[str(r['id'])] = r
             if self.cfg.get('require_image_digest', True):   # on by default; false only for local dev with tags
-                from ..images import is_pinned
+                from .images import is_pinned
                 loose = sorted(k for k, r in rows.items() if not is_pinned(r.get('image', '')))
                 if loose:
                     raise RuntimeError(f'env {self.env_id}: {len(loose)} task images are not pinned by digest '
