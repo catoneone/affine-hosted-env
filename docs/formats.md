@@ -1,7 +1,9 @@
 # Wire formats
 
-The formats a validator or trainer reads, frozen as of package version 0.2.0 (git tag `v0.2.0`). Pin a tag, not a
-commit. Code: `hosted_env.receipt` and `hosted_env.verify` (stable names for `hosted_env.infra.receipt` and
+The formats a validator or trainer reads, frozen as of package version 0.2.0 (git tag `v0.2.0`) and unchanged in
+version 0.2.1 (`v0.2.1`: grader `isolated-v4`, `hosted-env regrade` with the additive
+`verify_group(require_gate=False)`, the reference miner's clean stop), so receipts and attachments from either
+verify with either. Pin a tag, not a commit. Code: `hosted_env.receipt` and `hosted_env.verify` (stable names for `hosted_env.infra.receipt` and
 `hosted_env.infra.verify`), PyNaCl and the standard library only.
 
 | Object | Version | Signed by | Domain prefix |
