@@ -98,6 +98,9 @@ def test_group_end_to_end(stack):
     res = run_task(gw, EPOCH, 'swe', sampler)
     outs = [(x['nonce'], x['outcome'], x['reward']) for x in res['rollouts']]
     assert outs == [(n, 'completed', 1.0 if n % 2 == 0 else 0.0) for n in range(8)]
+    # this task has no expected tests: the receipt says so, and the reward rests on the exit code
+    from hosted_env.common import unb64u
+    assert all(json.loads(unb64u(x['receipt']['payload']))['expected_tests_sha256'] == '' for x in res['rollouts'])
 
     info, keys = trusted(stack)
     assert key_id(stack['wkey'].verify_key) in keys and info['envs']['swe']['group_size'] == 8
@@ -129,7 +132,8 @@ def test_group_end_to_end(stack):
     assert sum(json.loads(x)['event'] == 'finish' for x in log) == 8
     fin = [json.loads(x) for x in log if json.loads(x)['event'] == 'finish']   # how each rollout was graded
     assert all(f['grader'] == 'isolated-v3' and f['grader_user'] == 'root' for f in fin)
-
+    # no expected tests on this task: no second-check verdict is logged; the log never carries the full revert list
+    assert all('second_check' not in f and 'reverted_paths' not in f for f in fin)
 def test_smoke_replies_end_to_end(stack):
     """The EXP-014 smoke script: timeout, malformed call, unknown tool, truncation, submit, over the full HTTP path."""
     r = CharRenderer()
@@ -217,3 +221,39 @@ def test_single_process_group_and_data_plane_limit(tmp_path):
         assert httpx.get(gw.url + '/v1/health').json()['worker_id'] == 'local'
         bad = httpx.post(gw.url + '/v1/start', json={}, headers={'Authorization': 'Bearer nope'})
         assert (bad.status_code, bad.json()['error']) == (401, 'bad_token')
+
+
+def test_receipt_context_binds_expected_tests():
+    """The receipt carries the digest of the expected tests the grader was handed, so an offline re-grade can
+    check it used the same list; an ungraded rollout (gi == {}) carries ''."""
+    from types import SimpleNamespace
+
+    from hosted_env.executor.core import Worker
+    from hosted_env.receipt import expected_tests_digest
+    rend = SimpleNamespace(model_id='m', model_revision='r', identity={'tokenizer_sha256': '', 'chat_template_sha256': '',
+                                                                     'renderer': 'char'})
+    s = SimpleNamespace(rt=SimpleNamespace(renderer=rend, sandbox='local', sandbox_opts={}), envsess=None,
+                        started=1.0)
+    me = SimpleNamespace(build_version='t')
+    gi = {'test_patch': 'p', 'test_command': 'c', 'report_kind': 'junit',
+          'fail_to_pass': ['tests/test_a.py::t1'], 'pass_to_pass': ['tests/test_a.py::t0']}
+    ctx = Worker._receipt_context(me, s, gi, {'grader': 'isolated-v3'})
+    assert ctx['expected_tests_sha256'] == expected_tests_digest(['tests/test_a.py::t1'], ['tests/test_a.py::t0'],
+                                                                'junit') != ''
+    assert Worker._receipt_context(me, s, {}, {})['expected_tests_sha256'] == ''
+
+
+def test_sandbox_limits_names_what_was_enforced():
+    """The receipt's sandbox_limits fills each provider's defaults, so it names the limits actually enforced."""
+    from types import SimpleNamespace
+
+    from hosted_env.executor.core import _sandbox_limits
+    from hosted_env.providers.sandbox.k8s import DEFAULT_DISK
+
+    def rt(kind, **o):
+        return SimpleNamespace(sandbox=kind, sandbox_opts=o)
+    assert _sandbox_limits(rt('k8s')) == f'k8s:cpus=1;memory=2g;disk={DEFAULT_DISK}'
+    assert _sandbox_limits(rt('k8s', cpus='2', memory='4g', disk='20g')) == 'k8s:cpus=2;memory=4g;disk=20g'
+    assert _sandbox_limits(rt('k8s', disk='0')) == _sandbox_limits(rt('k8s', disk=None)) == 'k8s:cpus=1;memory=2g;disk=none'
+    assert _sandbox_limits(rt('docker', memory='8g', disk='10g')) == 'docker:cpus=1;memory=8g;disk=unenforced'
+    assert _sandbox_limits(rt('local', memory='8g')) == 'local'

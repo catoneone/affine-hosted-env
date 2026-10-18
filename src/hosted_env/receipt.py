@@ -40,6 +40,10 @@ RECEIPT_VERSION = 2
 _HEX = frozenset('0123456789abcdef')
 # Field -> type. *_sha256 fields are lowercase hex SHA-256 or '' (not known: e.g. a rollout that never got graded);
 # start_tree is a 40-hex git tree id or ''; verifier_returncode is None when no verifier ran.
+# Every field is required, and fields have been added within v2 while it runs only on the test deployment
+# (grader_parsers, then expected_tests_sha256 and sandbox_limits): a v2 receipt signed by an older worker fails
+# verification with malformed_receipt ('missing <field>'). Before receipts are relied on outside the test
+# deployment, the next field change bumps RECEIPT_VERSION (and RECEIPT_DOMAIN) instead.
 CONTEXT_FIELDS = {
     'image': str,                   # name@sha256:... the rollout and its grading ran in
     'start_tree': str,              # git tree the model started from (after setup); the patch applies to it
@@ -47,6 +51,12 @@ CONTEXT_FIELDS = {
     'test_command_sha256': str,     # of the test command text (UTF-8)
     'grader': str,                  # grading semantics version, e.g. isolated-v3
     'grader_parsers': str,          # pinned parsers that decided keep/revert of structured manifests (isolated-v3+)
+    'expected_tests_sha256': str,   # expected_tests_digest() of the task's expected tests (fail_to_pass /
+                                    # pass_to_pass / report_kind) the second check used; '' when the task has none,
+                                    # so the reward rests on the verifier's exit code alone
+    'sandbox_limits': str,          # the sandbox the rollout and its grading ran in and its limits, e.g.
+                                    # 'k8s:cpus=1;memory=2g;disk=10g': hitting its own limit scores 0, so an
+                                    # offline re-grade on a bigger box can differ unless it uses the same limits
     'grader_user': str,             # who the hidden tests ran as: nobody or root
     'model_patch_sha256': str,      # of the model's patch bytes as captured, before the grader put protected test
                                     # infrastructure back (a re-grader applies the same rule); the attachment has it
@@ -124,6 +134,18 @@ def trajectory_sha256(segments) -> tuple[str, int]:
 def loss_mask(segments) -> list[int]:
     """Per-token training mask: 1 for M segments, 0 for P and T segments."""
     return [1 if src == 'M' else 0 for src, ids in as_segments(segments) for _ in ids]
+
+
+def expected_tests_digest(fail_to_pass: Sequence[str], pass_to_pass: Sequence[str], report_kind: str) -> str:
+    """The receipt's expected_tests_sha256: SHA-256 of canonical JSON {fail_to_pass, pass_to_pass, report_kind},
+    each id list de-duplicated and sorted (the second check's verdict does not depend on order). '' when both lists
+    are empty -- the task has no expected tests and the second check did not run. A re-grader computes this from
+    the signed task index entry and compares it before trusting its own verdict."""
+    f2p, p2p = sorted(set(fail_to_pass or ())), sorted(set(pass_to_pass or ()))
+    if not f2p and not p2p:
+        return ''
+    body = {'fail_to_pass': f2p, 'pass_to_pass': p2p, 'report_kind': str(report_kind or '')}
+    return hashlib.sha256(canonical(body)).hexdigest()
 
 
 def _context_problem(ctx: Mapping) -> str | None:

@@ -30,7 +30,7 @@ from .. import __version__
 from ..auth import AuthError, verify_token
 from ..common import canonical, key_id, sha256_hex
 from ..envs import SetupError
-from ..receipt import TrajectoryHasher, receipt_digest, sign_receipt
+from ..receipt import TrajectoryHasher, expected_tests_digest, receipt_digest, sign_receipt
 from ..render import TemplateRenderer
 from ..providers.sandbox import DockerSandbox, ImageCache, LocalSandbox, SandboxCommandError, SandboxLimitError
 from ..providers.sandbox.k8s import K8sSandbox
@@ -39,9 +39,34 @@ from .gateway_client import GatewayRejected, GatewayUnavailable, WorkerGatewayCl
 
 log = logging.getLogger('hosted_env.executor')
 # grade() fields the executor log keeps for each finished rollout: how it was graded and what the verifier said
-# (model_patch and test_output are too large for the log)
+# (model_patch and test_output are too large for the log). second_check is the per-test-id verdict on a task with
+# expected tests (absent otherwise), so a live rollout that the exit code passed but the second check failed is
+# visible. The protected files the grader put back are logged as a count plus the first few (_reverted_summary):
+# a patch that touches node_modules/ can revert thousands.
 GRADE_LOG_FIELDS = ('grader', 'grader_parsers', 'grader_user', 'lock_seconds', 'grade_detail', 'verifier_returncode',
-                    'verifier_reason', 'test_seconds')
+                    'verifier_reason', 'test_seconds', 'second_check')
+REVERTED_LOG_HEAD = 5
+
+
+def _reverted_summary(grade: dict) -> dict:
+    rp = grade.get('reverted_paths') or []
+    return {'reverted_count': len(rp), 'reverted_head': sorted(rp)[:REVERTED_LOG_HEAD]} if rp else {}
+
+
+def _sandbox_limits(rt) -> str:
+    """The receipt's sandbox_limits: provider kind and the cpus / memory / disk the rollout and grading
+    containers were given, with each provider's own defaults filled in so the value names what was enforced.
+    The docker provider does not enforce disk (development only); the local one enforces nothing (tests)."""
+    if rt.sandbox == 'local':
+        return 'local'
+    o = rt.sandbox_opts
+    if rt.sandbox == 'k8s':
+        from ..providers.sandbox.k8s import DEFAULT_DISK
+        disk = o.get('disk', DEFAULT_DISK)
+        disk = 'none' if not disk or str(disk) == '0' else str(disk)
+    else:
+        disk = 'unenforced'
+    return f"{rt.sandbox}:cpus={o.get('cpus', '1')};memory={o.get('memory', '2g')};disk={disk}"
 
 
 def _build_version() -> str:
@@ -414,6 +439,11 @@ class Worker:
                 'test_patch_sha256': _sha256_text(gi.get('test_patch', '')),
                 'test_command_sha256': _sha256_text(gi.get('test_command', '')),
                 'grader': str(grade.get('grader', '')), 'grader_parsers': str(grade.get('grader_parsers', '')),
+                # the expected tests the grader was handed (gi is {} when the rollout was not graded -> '')
+                'expected_tests_sha256': expected_tests_digest(gi.get('fail_to_pass') or [],
+                                                               gi.get('pass_to_pass') or [],
+                                                               gi.get('report_kind') or ''),
+                'sandbox_limits': _sandbox_limits(s.rt),
                 'grader_user': str(grade.get('grader_user', '')),
                 'model_patch_sha256': str(grade.get('model_patch_sha256', '')),
                 'verifier_returncode': rc if type(rc) is int else None,
@@ -438,7 +468,7 @@ class Worker:
         self._log({'sid': s.sid, 'event': 'finish', 'task': c['task'], 'nonce': c['nonce'], 'outcome': outcome,
                    'detail': detail, 'reward': reward, 'steps': s.steps, 'n_tokens': s.hasher.n_tokens,
                    'wall_seconds': round(time.time() - s.started, 1), **s.stats,
-                   **{k: v for k, v in grade.items() if k in GRADE_LOG_FIELDS}})
+                   **{k: v for k, v in grade.items() if k in GRADE_LOG_FIELDS}, **_reverted_summary(grade)})
         self._teardown(s)
         try:
             self.gw.close(s.sid, outcome, reward, receipt_digest(receipt))   # the group seal lists it
