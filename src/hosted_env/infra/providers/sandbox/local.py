@@ -51,6 +51,10 @@ class LocalSandbox:
         with open(self._map(remote_path), 'w', encoding='utf-8', newline='') as f:
             f.write(text)
 
+    def extend_env(self, probe: str) -> None:
+        """No-op: commands run on the host with its own toolchains, and a probe would read the host's
+        directories, not an image's."""
+
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
         shutil.rmtree(self.env['HOME'], ignore_errors=True)

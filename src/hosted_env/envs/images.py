@@ -84,3 +84,21 @@ def pin_tasks(lines: list[str], resolve=resolve_digest) -> tuple[list[str], dict
             stats['pinned'] += 1
         out.append(json.dumps(row, ensure_ascii=False))
     return out, stats
+
+
+def cmd_pin_images(a):
+    from pathlib import Path
+    src = Path(a.tasks)
+    lines, stats = pin_tasks(src.read_text().splitlines())
+    dst = Path(a.out) if a.out else src
+    dst.write_text('\n'.join(lines) + '\n')
+    print(json.dumps({**stats, 'out': str(dst)}))
+
+
+def register_cli(sub) -> None:
+    """`hosted-env pin-images`, registered by hosted_env.cli through hosted_env.envs.CLI_EXTENSIONS."""
+    pi = sub.add_parser('pin-images', help='Rewrite a task file so every image is name@sha256:<digest> '
+                                          '(the tag is kept as image_tag); needs registry access')
+    pi.add_argument('tasks')
+    pi.add_argument('--out', help='write here instead of in place')
+    pi.set_defaults(fn=cmd_pin_images)

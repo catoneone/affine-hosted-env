@@ -455,6 +455,7 @@ fi
         reverted, untrusted, t0 = [], False, None
         try:
             sb.start()
+            self.prepare_sandbox(sb)                       # the same repaired environment as the rollout container
             base = self._prepare_repo(sb, repo, s.spec.get('lang', ''))
             start = self._tree(sb, repo, base)
             if start != s.state['start_tree']:

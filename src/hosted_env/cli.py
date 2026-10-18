@@ -163,68 +163,6 @@ def cmd_roster_sync(a):
         print(json.dumps(sync_once(a.out, network=a.network, netuid=a.netuid)))
 
 
-def cmd_pin_images(a):
-    from .envs.images import pin_tasks
-    src = Path(a.tasks)
-    lines, stats = pin_tasks(src.read_text().splitlines())
-    dst = Path(a.out) if a.out else src
-    dst.write_text('\n'.join(lines) + '\n')
-    print(json.dumps({**stats, 'out': str(dst)}))
-
-
-def cmd_baseline(a):
-    """Expected tests per task from baseline runs (hosted_env.envs.swe.baseline): one JSON record per task to --out, and
-    with --tasks-out a copy of the task file with fail_to_pass / pass_to_pass / report_kind filled in."""
-    import tomllib
-    from .envs.swe.baseline import derive
-    from .infra.config import _envs
-    from .envs import make_env
-    cfgp = Path(a.config).resolve()
-    ecfg = _envs(tomllib.loads(cfgp.read_text()), cfgp.parent)[a.env]
-    # the baseline derives the expected tests, so it must see the tasks that do not have them yet
-    ecfg = {**ecfg, 'require_expected_tests': False}
-    env = make_env(a.env, ecfg)
-    opts = dict(ecfg.get('sandbox_opts') or {})
-    kind = ecfg.get('sandbox', 'docker')
-    if kind == 'k8s':
-        from .infra.providers.sandbox.k8s import K8sSandbox
-        if a.node:
-            opts['node_name'] = a.node
-        factory = lambda image, cwd: K8sSandbox(image, cwd, **opts)  # noqa: E731
-    elif kind == 'docker':
-        from .infra.providers.sandbox import DockerSandbox
-        factory = lambda image, cwd: DockerSandbox(image, cwd, **opts)  # noqa: E731
-    else:
-        raise SystemExit(f'baseline needs a k8s or docker sandbox, not {kind!r}')
-    ids = a.only.split(',') if a.only else env.task_ids()
-    known = set(env.task_ids())
-    ids = [next((t for t in known if t == i or t.endswith(i)), i) for i in ids]
-    done = {}
-    with open(a.out, 'a') as out:
-        for task in ids:
-            try:
-                rec = derive(env, factory, task, runs=a.runs)
-            except Exception as e:  # noqa: BLE001  one task's infra failure must not stop the batch
-                rec = {'id': task, 'error': f'{type(e).__name__}: {e}'[:500]}
-            done[task] = rec
-            out.write(json.dumps(rec) + '\n')
-            out.flush()
-            print(json.dumps({k: rec.get(k) for k in ('id', 'report_kind', 'error')} |
-                             {'f2p': len(rec.get('fail_to_pass') or []), 'p2p': len(rec.get('pass_to_pass') or [])}),
-                  flush=True)
-    if a.tasks_out:
-        rows = [json.loads(x) for x in Path(ecfg['tasks']).read_text().splitlines() if x.strip()]
-        for r in rows:
-            rec = done.get(str(r['id']))
-            if rec and rec.get('report_kind') and rec.get('fail_to_pass'):
-                r.update(report_kind=rec['report_kind'], fail_to_pass=rec['fail_to_pass'],
-                         pass_to_pass=rec['pass_to_pass'])
-                # a JS task's grading script amended to write the report (baseline.amend_test_patch): the
-                # expected tests only hold for the amended harness, so it replaces the original in the index
-                r.update({k: rec[k] for k in ('test_patch', 'test_command') if rec.get(k)})
-        Path(a.tasks_out).write_text(''.join(json.dumps(r) + '\n' for r in rows))
-
-
 def main(argv=None):
     p = argparse.ArgumentParser(prog='hosted-env')
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -274,22 +212,9 @@ def main(argv=None):
     rs.add_argument('--netuid', type=int, default=120)
     rs.add_argument('--every', type=float, default=0, help='seconds between syncs; 0 = sync once and exit')
     rs.set_defaults(fn=cmd_roster_sync)
-    pi = sub.add_parser('pin-images', help='Rewrite a task file so every image is name@sha256:<digest> '
-                                          '(the tag is kept as image_tag); needs registry access')
-    pi.add_argument('tasks')
-    pi.add_argument('--out', help='write here instead of in place')
-    pi.set_defaults(fn=cmd_pin_images)
-    bl = sub.add_parser('baseline', help='Derive each task\'s expected tests (fail_to_pass / pass_to_pass) by grading '
-                                         'an empty rollout with the real grader (pytest tasks for now)')
-    bl.add_argument('--config', required=True, help='the server / worker config whose [envs] has the env')
-    bl.add_argument('--env', required=True)
-    bl.add_argument('--out', required=True, help='append one JSON record per task here')
-    bl.add_argument('--only', help='comma-separated task ids (or id suffixes); default every task')
-    bl.add_argument('--runs', type=int, default=2, help='baseline runs per task; a test whose status differs is '
-                                                       'flaky and left out')
-    bl.add_argument('--node', help='k8s node to run the sandboxes on')
-    bl.add_argument('--tasks-out', help='write a copy of the task file with the derived fields filled in')
-    bl.set_defaults(fn=cmd_baseline)
+    from .envs import CLI_EXTENSIONS
+    for register in CLI_EXTENSIONS:              # environment-side subcommands (pin-images, baseline)
+        register(sub)
     a = p.parse_args(argv)
     a.fn(a)
 

@@ -78,7 +78,6 @@ def offline_exec(dev=LO_ONLY, rc=0):
 
 
 def make(tmp_path, **kw):
-    kw.setdefault('repair_env', False)
     kw.setdefault('pid1_guard', False)   # the real probe would run `kill -STOP 1` on the host under the fake exec
     return K8sSandbox('img:1', str(tmp_path), api=kw.pop('api', FakeCore()), networking_api=kw.pop('net', FakeNet()),
                       exec_fn=kw.pop('exec_fn', offline_exec()), poll=0, **kw)
@@ -93,13 +92,13 @@ def test_pid1_guard_refuses_a_killable_init(tmp_path):
         return run
     # protection off: SIGSTOP stopped PID 1 (state T) -> the model could kill its container -> refuse (pre-hand-out)
     sb = K8sSandbox('img:1', str(tmp_path), api=FakeCore(), networking_api=FakeNet(), exec_fn=probe('T'),
-                    repair_env=False, poll=0, pid1_guard=True)
+                    poll=0, pid1_guard=True)
     with pytest.raises(SandboxError, match='not signal-protected'):
         sb.start()
     assert not sb.handed_out
     # protection on: the handler-less init ignored SIGSTOP (stays S) -> the sandbox is handed out
     sb = K8sSandbox('img:1', str(tmp_path), api=FakeCore(), networking_api=FakeNet(), exec_fn=probe('S'),
-                    repair_env=False, poll=0, pid1_guard=True)
+                    poll=0, pid1_guard=True)
     sb.start()
     assert sb.handed_out
 
@@ -149,10 +148,18 @@ def test_start_execute_cleanup(tmp_path):
     assert api.deleted == [(sb.name, 'hosted-env')]
 
 
-def test_env_probe_runs_on_start(tmp_path):
-    sb = make(tmp_path, repair_env=True)
+def test_extend_env_adds_the_probes_variables(tmp_path):
+    """The sandbox no longer probes on its own; the environment calls extend_env (envs.base.IMAGE_ENV_PROBE).
+    Variables already set -- the thread caps -- are kept, later commands see the new ones."""
+    from hosted_env.envs.base import IMAGE_ENV_PROBE
+    sb = make(tmp_path)
     sb.start()
-    assert isinstance(sb.env, dict)                             # whatever this host needs; parsing must not fail
+    before = dict(sb.env)
+    sb.extend_env(IMAGE_ENV_PROBE)                              # whatever this host needs; parsing must not fail
+    assert isinstance(sb.env, dict) and {k: sb.env[k] for k in before} == before
+    sb.extend_env("printf 'HOSTED_ENV_PROBE_X=1\\nOMP_NUM_THREADS=64\\nlower=1\\n'")
+    assert sb.env['HOSTED_ENV_PROBE_X'] == '1' and sb.env['OMP_NUM_THREADS'] == '1' and 'lower' not in sb.env
+    assert sb.execute('echo "$HOSTED_ENV_PROBE_X"')['output'].strip() == '1'
 
 
 def test_copy_text_multi_chunk(tmp_path):
@@ -186,7 +193,7 @@ def test_start_timeout(tmp_path):
 def test_pod_gone_during_exec(tmp_path):
     def gone(pod, argv, timeout):
         raise SandboxError('pod is gone')
-    sb = K8sSandbox('i', str(tmp_path), api=FakeCore(), exec_fn=gone, repair_env=False, poll=0)
+    sb = K8sSandbox('i', str(tmp_path), api=FakeCore(), exec_fn=gone, poll=0)
     with pytest.raises(SandboxError, match='gone'):
         sb.start()                                              # the `command -v timeout` probe already fails
 
@@ -371,7 +378,7 @@ def test_executor_builds_k8s_sandboxes(tmp_path):
     from hosted_env.infra.render import CharRenderer
     core, net = FakeCore(), FakeNet()
     rt = EnvRuntime(env=DockerTaskEnv('e', {'group_size': 8}), renderer=CharRenderer(), sandbox='k8s',
-                    sandbox_opts={'exec_fn': offline_exec(), 'node_name': 'node-a', 'repair_env': False,
+                    sandbox_opts={'exec_fn': offline_exec(), 'node_name': 'node-a',
                                   'poll': 0, 'pid1_guard': False})
     w = Worker(worker_id='local', key=SigningKey.generate(), gateway=None, gateway_pub=SigningKey.generate().verify_key,
                runtimes={'e': rt}, public_url='http://x', k8s_api=(core, net))

@@ -7,7 +7,8 @@
   enforced asynchronously, and on a freshly joined node the first Pod reached the internet (EXP-018).
 - Commands run through the Kubernetes exec API (measured in EXP-017: p50 27-42 ms in region with a persistent
   client). Each command is wrapped the same way as in DockerSandbox: coreutils `timeout` as a backstop and the
-  environment repaired by ENV_PROBE (Docker Hub task images lost their ENV, e.g. GOPATH).
+  sandbox's environment (THREAD_CAPS, plus whatever the environment added with extend_env -- e.g. the image
+  repair in envs.base.IMAGE_ENV_PROBE).
 - Files are written by exec with base64 chunks, so no extra tooling (tar, kubectl cp) is needed in the image.
 
 The `kubernetes` client is an optional dependency (`pip install "affine-hosted-env[k8s]"`). Tests inject a fake
@@ -23,8 +24,7 @@ import time
 import uuid
 from collections.abc import Callable
 
-from .base import OUTPUT_CAP_BYTES, THREAD_CAPS, SandboxError, SandboxCommandError, SandboxLimitError
-from .docker import ENV_PROBE
+from .base import OUTPUT_CAP_BYTES, THREAD_CAPS, SandboxError, SandboxCommandError, SandboxLimitError, parse_env_lines
 
 MANAGED_BY = {'app.kubernetes.io/managed-by': 'hosted-env'}
 NETWORK_LABEL = 'hosted-env/network'
@@ -284,7 +284,6 @@ class K8sSandbox:
     def __init__(self, image: str, cwd: str, *, api=None, networking_api=None, exec_fn: ExecFn | None = None,
                  namespace: str = 'hosted-env', node_name: str | None = None, runtime_class: str | None = 'auto',
                  cpus: str = '1', memory: str = '2g', disk: str | None = DEFAULT_DISK, network: str = 'none',
-                 repair_env: bool = True,
                  offline_check: str = 'interfaces', start_timeout: float = 600, poll: float = 0.5,
                  delete_timeout: float = 120, limit_wait: float = LIMIT_WAIT, pid1_guard: bool = True,
                  labels: dict | None = None, **_ignored):
@@ -309,7 +308,7 @@ class K8sSandbox:
                                      network=network, labels=labels)
         self.networking_api, self.network, self.offline_check = networking_api, network, offline_check
         self.exec_fn = exec_fn or ws_exec(api, namespace)
-        self.start_timeout, self.poll, self.repair_env = start_timeout, poll, repair_env
+        self.start_timeout, self.poll = start_timeout, poll
         self.delete_timeout, self.limit_wait, self.pid1_guard = delete_timeout, limit_wait, pid1_guard
         self.started, self.has_timeout, self.handed_out = False, False, False
         self.env: dict[str, str] = dict(THREAD_CAPS)
@@ -343,11 +342,11 @@ class K8sSandbox:
         self.has_timeout = self.execute('command -v timeout', timeout=30, raw=True)['returncode'] == 0
         if self.pid1_guard:
             self._check_pid1_protected()
-        if self.repair_env:
-            out = self.execute(ENV_PROBE, timeout=60, raw=True)['output']
-            self.env = {**THREAD_CAPS, **dict(ln.split('=', 1) for ln in out.splitlines()
-                                              if '=' in ln and ln.split('=', 1)[0].isupper())}
         self.handed_out = True          # from here on its commands are the caller's: a limit kill is theirs
+
+    def extend_env(self, probe: str) -> None:
+        out = self.execute(probe, timeout=60, raw=True)['output']
+        self.env = {**parse_env_lines(out), **self.env}
 
     def _check_pid1_protected(self) -> None:
         """Refuse the sandbox (pre-hand-out, so infra not model) unless PID 1 is protected from signals the model

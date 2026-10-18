@@ -15,38 +15,10 @@ import threading
 import time
 import uuid
 
-from .base import OUTPUT_CAP_BYTES, THREAD_CAPS, SandboxError
+from .base import OUTPUT_CAP_BYTES, THREAD_CAPS, SandboxError, parse_env_lines
 
 DOCKER = os.environ.get('HOSTED_ENV_DOCKER', 'docker')
 CONTAINER_LABEL = 'hosted-env=1'
-
-# The Xiaomi images on Docker Hub are single-layer tarballs and lost every ENV in the image config (EXP-014,
-# measured 2026-10-13). Probe directories following the conventions of the official golang/rust/ruby/openjdk
-# images and restore the environment variables, only when a variable is not already set.
-ENV_PROBE = r'''
-out() { printf '%s=%s\n' "$1" "$2"; }
-P="$PATH"
-if [ -z "${GOPATH:-}" ] && [ -d /go ]; then out GOPATH /go; P="/go/bin:$P"; fi
-[ -d /usr/local/go/bin ] && case ":$P:" in *:/usr/local/go/bin:*) ;; *) P="/usr/local/go/bin:$P";; esac
-if [ -d /usr/local/cargo/bin ]; then
-  [ -z "${CARGO_HOME:-}" ] && out CARGO_HOME /usr/local/cargo
-  [ -z "${RUSTUP_HOME:-}" ] && [ -d /usr/local/rustup ] && out RUSTUP_HOME /usr/local/rustup
-  P="/usr/local/cargo/bin:$P"
-fi
-if [ -z "${GEM_HOME:-}" ] && [ -d /usr/local/bundle ]; then
-  out GEM_HOME /usr/local/bundle; out BUNDLE_APP_CONFIG /usr/local/bundle; out BUNDLE_SILENCE_ROOT_WARNING 1
-  P="/usr/local/bundle/bin:$P"
-fi
-if [ -z "${JAVA_HOME:-}" ]; then
-  for j in /opt/java/openjdk /usr/local/openjdk-* /usr/lib/jvm/*; do
-    if [ -x "$j/bin/java" ]; then out JAVA_HOME "$j"; P="$j/bin:$P"; break; fi
-  done
-fi
-[ -d /root/.local/bin ] && P="$P:/root/.local/bin"
-[ -z "${LANG:-}" ] && out LANG C.UTF-8
-[ "$P" != "$PATH" ] && out PATH "$P"
-true
-'''
 
 
 def _pump(stream, buf: bytearray):
@@ -60,7 +32,7 @@ def _pump(stream, buf: bytearray):
 
 class DockerSandbox:
     def __init__(self, image: str, cwd: str, *, network: str = 'none', cpus: str = '1', memory: str = '2g',
-                 pids: int = 4096, repair_env: bool = True, disk: str | None = None):
+                 pids: int = 4096, disk: str | None = None):
         """disk is accepted so a k8s sandbox_opts table can be reused, but not enforced: `--storage-opt size=`
         works only on overlay2 over xfs with pquota. Development only, like the rest of this provider."""
         del disk
@@ -69,7 +41,6 @@ class DockerSandbox:
                          '--pids-limit', str(pids), '--security-opt', 'no-new-privileges']
         self.cid: str | None = None
         self.has_timeout = False
-        self.repair_env = repair_env
         self.env: dict[str, str] = dict(THREAD_CAPS)
 
     def start(self):
@@ -81,10 +52,10 @@ class DockerSandbox:
             raise SandboxError(f'docker run failed: {r.stderr.strip()[-500:]}')
         self.cid = r.stdout.strip()
         self.has_timeout = self.execute('command -v timeout', timeout=30, raw=True)['returncode'] == 0
-        if self.repair_env:
-            out = self.execute(ENV_PROBE, timeout=60, raw=True)['output']
-            self.env = {**THREAD_CAPS, **dict(ln.split('=', 1) for ln in out.splitlines()
-                                              if '=' in ln and ln.split('=', 1)[0].isupper())}
+
+    def extend_env(self, probe: str) -> None:
+        out = self.execute(probe, timeout=60, raw=True)['output']
+        self.env = {**parse_env_lines(out), **self.env}
 
     def execute(self, command: str, cwd: str | None = None, timeout: int = 60, raw: bool = False,
                 login: bool = True) -> dict:

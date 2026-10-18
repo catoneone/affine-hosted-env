@@ -62,6 +62,36 @@ BASH_TOOL = {
     },
 }
 
+# The Xiaomi images on Docker Hub are single-layer tarballs and lost every ENV in the image config (EXP-014,
+# measured 2026-10-13). Probe directories following the conventions of the official golang/rust/ruby/openjdk
+# images and restore the environment variables, only when a variable is not already set. Applied by
+# DockerTaskEnv.prepare_sandbox to every sandbox it starts (cfg repair_image_env = false turns it off).
+IMAGE_ENV_PROBE = r'''
+out() { printf '%s=%s\n' "$1" "$2"; }
+P="$PATH"
+if [ -z "${GOPATH:-}" ] && [ -d /go ]; then out GOPATH /go; P="/go/bin:$P"; fi
+[ -d /usr/local/go/bin ] && case ":$P:" in *:/usr/local/go/bin:*) ;; *) P="/usr/local/go/bin:$P";; esac
+if [ -d /usr/local/cargo/bin ]; then
+  [ -z "${CARGO_HOME:-}" ] && out CARGO_HOME /usr/local/cargo
+  [ -z "${RUSTUP_HOME:-}" ] && [ -d /usr/local/rustup ] && out RUSTUP_HOME /usr/local/rustup
+  P="/usr/local/cargo/bin:$P"
+fi
+if [ -z "${GEM_HOME:-}" ] && [ -d /usr/local/bundle ]; then
+  out GEM_HOME /usr/local/bundle; out BUNDLE_APP_CONFIG /usr/local/bundle; out BUNDLE_SILENCE_ROOT_WARNING 1
+  P="/usr/local/bundle/bin:$P"
+fi
+if [ -z "${JAVA_HOME:-}" ]; then
+  for j in /opt/java/openjdk /usr/local/openjdk-* /usr/lib/jvm/*; do
+    if [ -x "$j/bin/java" ]; then out JAVA_HOME "$j"; P="$j/bin:$P"; break; fi
+  done
+fi
+[ -d /root/.local/bin ] && P="$P:/root/.local/bin"
+[ -z "${LANG:-}" ] && out LANG C.UTF-8
+[ "$P" != "$PATH" ] && out PATH "$P"
+true
+'''
+
+
 MAX_OBSERVATION_CHARS = 40000
 
 _NOTICE = ('[TRUNCATION WARNING] The tool output below is INCOMPLETE: it was {total} characters, exceeding the '
@@ -130,6 +160,7 @@ class EnvSession:
 
     def setup(self) -> None:
         self.sb.start()
+        self.env.prepare_sandbox(self.sb)
         self.env.setup(self)
 
     def initial_messages(self) -> list[dict]:
@@ -213,6 +244,12 @@ class DockerTaskEnv:
 
     def setup(self, s: EnvSession) -> None:
         pass
+
+    def prepare_sandbox(self, sb) -> None:
+        """Right after a sandbox of this environment starts (the rollout's, and SWE's grading one): restore what
+        the task images lost (IMAGE_ENV_PROBE), so every command sees GOPATH, JAVA_HOME, ... as intended."""
+        if self.cfg.get('repair_image_env', True):
+            sb.extend_env(IMAGE_ENV_PROBE)
 
     def grade(self, s: EnvSession, gi: dict) -> dict:
         r = s.sb.execute(gi['test_command'], cwd=s.spec['cwd'], timeout=gi['verifier_timeout'])
