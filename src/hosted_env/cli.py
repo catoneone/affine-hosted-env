@@ -50,9 +50,17 @@ def cmd_worker(a):
     _serve(build_worker_app(a.config), a.host, a.port)
 
 
-# Refusals that mean this hotkey has nothing more to do in this epoch: every task it may take is taken, or it
-# started as many as an epoch allows. The miner stops there and exits 0; any other refusal exits 1.
+# Refusals to open a task that mean this hotkey has nothing more to do in this epoch: every task it may take is
+# taken, or it started as many as an epoch allows. The miner stops there and exits 0 (so does an epoch it read from
+# /v1/info that has since ended, wrong_epoch); any other error exits 1.
 EPOCH_DONE = ('pool_exhausted', 'task_quota_epoch')
+
+
+def _task_count(s: str) -> int:
+    n = int(s)
+    if n < 0:
+        raise argparse.ArgumentTypeError('must be 0 (until the epoch has none left) or a positive count')
+    return n
 
 
 def cmd_mine(a):
@@ -70,13 +78,20 @@ def cmd_mine(a):
     out.mkdir(parents=True, exist_ok=True)
     done = written = 0
     # stdout carries one line per finished task (scripts parse it); why the miner stopped early goes to stderr
-    while a.tasks <= 0 or done < a.tasks:
+    while a.tasks == 0 or done < a.tasks:
         try:
             res = run_task(gw, epoch, a.env, sampler, concurrency=a.concurrency, max_wait=a.max_wait)
         except ApiError as e:
-            print(json.dumps({'stopped': e.code or f'http_{e.status}', 'status': e.status, 'detail': e.detail,
-                              'tasks_done': done, 'attachments_written': written}), file=sys.stderr, flush=True)
-            sys.exit(0 if e.code in EPOCH_DONE else 1)
+            # e.task set: the task had opened and then the worker or the finish call failed (the task is still
+            # finished on the gateway, so it counts as taken); unset: the gateway refused to open one
+            stop = {'stopped': e.code or f'http_{e.status}', 'status': e.status, 'detail': e.detail,
+                    'phase': 'open' if e.task is None else 'task', 'tasks_done': done, 'attachments_written': written}
+            if e.task is not None:
+                stop['task'] = e.task
+            print(json.dumps(stop), file=sys.stderr, flush=True)
+            # the epoch read from /v1/info at start has ended: that epoch has nothing left either
+            clean = e.code in EPOCH_DONE or (e.code == 'wrong_epoch' and not a.epoch)
+            sys.exit(0 if e.task is None and clean else 1)
         done += 1
         t = res['task']
         if res['attachment'] is not None:                # a voided task (infra error) has nothing to upload
@@ -195,12 +210,14 @@ def main(argv=None):
     m.add_argument('--key', required=True, help='mining key file (hex seed)')
     m.add_argument('--env', required=True)
     m.add_argument('--epoch')
-    m.add_argument('--tasks', type=int, default=1,
+    m.add_argument('--tasks', type=_task_count, default=1,
                    help='tasks to run; 0 = until this epoch has none left for the hotkey. When the gateway has no '
-                        'task left (pool_exhausted) or the epoch quota is spent (task_quota_epoch) the miner stops '
-                        'and exits 0; any other refusal exits 1. Either way one JSON line on stderr says why')
+                        'task left (pool_exhausted), the epoch quota is spent (task_quota_epoch) or, without '
+                        '--epoch, the epoch has ended (wrong_epoch), the miner stops and exits 0; any other error '
+                        '(including a worker error mid-task) exits 1. Either way one JSON line on stderr says why')
     m.add_argument('--concurrency', type=int, default=8)
-    m.add_argument('--max-wait', type=float, default=600.0, help='max time to wait when capacity is insufficient')
+    m.add_argument('--max-wait', type=float, default=600.0,
+                   help='max time to wait when capacity is insufficient (429); after that the miner exits 1')
     m.add_argument('--out', default='attachments')
     m.add_argument('--tokenizer', default='char', help='tokenizer path for the smoke-test fake model (char = character tokenizer for tests)')
     m.add_argument('--vllm', help='vLLM URL; if given, use a real model')

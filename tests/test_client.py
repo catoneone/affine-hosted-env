@@ -55,11 +55,21 @@ def test_other_errors_still_raise():
     class Broken(FakeWorker):
         def turn(self, token, seq, tokens):
             raise ApiError(400, 'bad_tokens')
-    with pytest.raises(ApiError, match='bad_tokens'):
-        run_task(FakeGateway(), 'e1', 'swe', sampler(), worker_factory=Broken)
-    with pytest.raises(ApiError, match='unknown_hotkey'):
+    gw = FakeGateway()
+    with pytest.raises(ApiError, match='bad_tokens') as e:
+        run_task(gw, 'e1', 'swe', sampler(), worker_factory=Broken)
+    assert e.value.task == 'task-1' and gw.finished == ['t1']      # after the open: tagged, and the task still ends
+    with pytest.raises(ApiError, match='unknown_hotkey') as e:
         run_task(FakeGateway(finish_error=ApiError(403, 'unknown_hotkey')), 'e1', 'swe', sampler(),
                  worker_factory=FakeWorker)
+    assert e.value.task == 'task-1'
+
+    class Refused(FakeGateway):
+        def open_task(self, epoch, env_id, max_wait=0.0):
+            raise ApiError(409, 'pool_exhausted')
+    with pytest.raises(ApiError, match='pool_exhausted') as e:
+        run_task(Refused(), 'e1', 'swe', sampler(), worker_factory=FakeWorker)
+    assert e.value.task is None                                     # a refusal to open names no task
 
 
 def test_group_without_a_seal_is_not_uploaded():

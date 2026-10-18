@@ -15,10 +15,10 @@ def _key(tmp_path, sk):
     return str(p)
 
 
-def _mine(gateway, key, out, *args):
+def _mine(gateway, key, out, *args, epoch=EPOCH):
     with pytest.raises(SystemExit) as e:
-        cli.main(['mine', '--gateway', gateway, '--hotkey', '5H0', '--key', key, '--env', 'swe', '--epoch', EPOCH,
-                  '--out', str(out), *args])
+        cli.main(['mine', '--gateway', gateway, '--hotkey', '5H0', '--key', key, '--env', 'swe',
+                  *(['--epoch', epoch] if epoch else []), '--out', str(out), *args])
     return e.value.code
 
 
@@ -43,21 +43,53 @@ def test_mine_stops_at_pool_exhausted(stack, tmp_path, capsys, monkeypatch, task
     assert len(list(out.iterdir())) == 2
     stop = _stop_line(cap.err)
     assert stop == {'stopped': 'pool_exhausted', 'status': 409, 'detail': 'no task left for this hotkey in this epoch',
-                    'tasks_done': 2, 'attachments_written': 2}
+                    'phase': 'open', 'tasks_done': 2, 'attachments_written': 2}
 
 
-@pytest.mark.parametrize('status,code,exit_code', [(409, 'task_quota_epoch', 0), (409, 'wrong_epoch', 1),
-                                                   (429, 'capacity_exhausted', 1), (401, '', 1)])
-def test_mine_refusals(tmp_path, capsys, monkeypatch, status, code, exit_code):
-    """The epoch quota is the other "nothing left" refusal (exit 0); any other refusal exits 1. Neither prints a
-    traceback."""
+@pytest.mark.parametrize('status,code,exit_code,epoch', [
+    (409, 'task_quota_epoch', 0, EPOCH),
+    (409, 'wrong_epoch', 1, EPOCH),            # the epoch the operator named is not the current one: their mistake
+    (409, 'wrong_epoch', 0, None),             # the epoch read from /v1/info at start has ended: nothing left in it
+    (409, 'task_quota_inflight', 1, EPOCH),
+    (429, 'capacity_exhausted', 1, EPOCH),
+    (401, '', 1, EPOCH)])
+def test_mine_refusals(tmp_path, capsys, monkeypatch, status, code, exit_code, epoch):
+    """Refusals to open: the epoch quota is the other "nothing left" stop (exit 0); any other exits 1. Neither
+    prints a traceback."""
     from nacl.signing import SigningKey
 
     def refuse(*a, **kw):
         raise ApiError(status, code, 'why')
     monkeypatch.setattr(client, 'run_task', refuse)
-    rc = _mine('http://127.0.0.1:9', _key(tmp_path, SigningKey.generate()), tmp_path / 'att', '--tasks', '0')
+    monkeypatch.setattr(client.GatewayClient, 'info', lambda self: {'epoch': EPOCH})
+    rc = _mine('http://127.0.0.1:9', _key(tmp_path, SigningKey.generate()), tmp_path / 'att', '--tasks', '0',
+               epoch=epoch)
     cap = capsys.readouterr()
     assert rc == exit_code and cap.out == '' and 'Traceback' not in cap.err
     assert _stop_line(cap.err) == {'stopped': code or f'http_{status}', 'status': status, 'detail': 'why',
-                                   'tasks_done': 0, 'attachments_written': 0}
+                                   'phase': 'open', 'tasks_done': 0, 'attachments_written': 0}
+
+
+@pytest.mark.parametrize('code', ['worker_unavailable', 'pool_exhausted', 'wrong_epoch'])
+def test_mine_error_after_the_open_exits_1(tmp_path, capsys, monkeypatch, code):
+    """An error once the task had opened (the worker, or finishing the task) is a failure whatever its code, and the
+    stop line names the task so it does not read as a refusal to open."""
+    from nacl.signing import SigningKey
+
+    def fail(*a, **kw):
+        e = ApiError(503, code, 'why')
+        e.task = 'task-7'
+        raise e
+    monkeypatch.setattr(client, 'run_task', fail)
+    monkeypatch.setattr(client.GatewayClient, 'info', lambda self: {'epoch': EPOCH})
+    rc = _mine('http://127.0.0.1:9', _key(tmp_path, SigningKey.generate()), tmp_path / 'att', epoch=None)
+    cap = capsys.readouterr()
+    assert rc == 1 and 'Traceback' not in cap.err
+    assert _stop_line(cap.err) == {'stopped': code, 'status': 503, 'detail': 'why', 'phase': 'task',
+                                   'task': 'task-7', 'tasks_done': 0, 'attachments_written': 0}
+
+
+def test_mine_rejects_a_negative_task_count(tmp_path, capsys):
+    from nacl.signing import SigningKey
+    assert _mine('http://127.0.0.1:9', _key(tmp_path, SigningKey.generate()), tmp_path / 'att', '--tasks', '-1') == 2
+    assert 'must be 0' in capsys.readouterr().err
