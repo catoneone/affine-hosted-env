@@ -50,8 +50,13 @@ def cmd_worker(a):
     _serve(build_worker_app(a.config), a.host, a.port)
 
 
+# Refusals that mean this hotkey has nothing more to do in this epoch: every task it may take is taken, or it
+# started as many as an epoch allows. The miner stops there and exits 0; any other refusal exits 1.
+EPOCH_DONE = ('pool_exhausted', 'task_quota_epoch')
+
+
 def cmd_mine(a):
-    from .infra.client import GatewayClient, ScriptedSampler, VLLMSampler, run_task
+    from .infra.client import ApiError, GatewayClient, ScriptedSampler, VLLMSampler, run_task
     from .infra.common import load_key_file
     gw = GatewayClient(a.gateway, a.hotkey, load_key_file(a.key))
     epoch = a.epoch or gw.info()['epoch']
@@ -63,11 +68,20 @@ def cmd_mine(a):
         sampler = ScriptedSampler(r.encode, r.turn_end_id, SMOKE_REPLIES)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    for _ in range(a.tasks):
-        res = run_task(gw, epoch, a.env, sampler, concurrency=a.concurrency, max_wait=a.max_wait)
+    done = written = 0
+    # stdout carries one line per finished task (scripts parse it); why the miner stopped early goes to stderr
+    while a.tasks <= 0 or done < a.tasks:
+        try:
+            res = run_task(gw, epoch, a.env, sampler, concurrency=a.concurrency, max_wait=a.max_wait)
+        except ApiError as e:
+            print(json.dumps({'stopped': e.code or f'http_{e.status}', 'status': e.status, 'detail': e.detail,
+                              'tasks_done': done, 'attachments_written': written}), file=sys.stderr, flush=True)
+            sys.exit(0 if e.code in EPOCH_DONE else 1)
+        done += 1
         t = res['task']
         if res['attachment'] is not None:                # a voided task (infra error) has nothing to upload
             (out / f'{t["env_id"]}-{t["task"]}.json').write_text(json.dumps(res['attachment']))
+            written += 1
         print(json.dumps({'task': t['task'], 'voided': res['voided'],
                           'results': [{k: x[k] for k in ('nonce', 'outcome', 'reward', 'detail', 'steps')}
                                       for x in res['rollouts']]}), flush=True)
@@ -181,7 +195,10 @@ def main(argv=None):
     m.add_argument('--key', required=True, help='mining key file (hex seed)')
     m.add_argument('--env', required=True)
     m.add_argument('--epoch')
-    m.add_argument('--tasks', type=int, default=1)
+    m.add_argument('--tasks', type=int, default=1,
+                   help='tasks to run; 0 = until this epoch has none left for the hotkey. When the gateway has no '
+                        'task left (pool_exhausted) or the epoch quota is spent (task_quota_epoch) the miner stops '
+                        'and exits 0; any other refusal exits 1. Either way one JSON line on stderr says why')
     m.add_argument('--concurrency', type=int, default=8)
     m.add_argument('--max-wait', type=float, default=600.0, help='max time to wait when capacity is insufficient')
     m.add_argument('--out', default='attachments')
