@@ -216,7 +216,9 @@ Implemented in `src/hosted_env/receipt.py` and `src/hosted_env/verify.py` (tests
 - `src/hosted_env/verify.py`: `verify_group`.
 - `src/hosted_env/executor/` (formerly `worker/`): token rendering, tool execution, grading, receipt signing.
 - `src/hosted_env/providers/sandbox/`: one container per rollout (Docker, local for tests).
-- `src/hosted_env/envs/swe.py`: Xiaomi MiMo SWE task type, ported from the internal EXP-014 harness.
+- `src/hosted_env/envs/swe/`: Xiaomi MiMo SWE task type, ported from the internal EXP-014 harness (`env.py` SweEnv,
+  `cleanup.py`, `protect.py`, `scripts.py`, `reports.py` the second check, `baseline.py` expected tests).
+- `src/hosted_env/envs/images.py`: pinning task images by digest.
 - `src/hosted_env/client.py`: reference miner.
 - Tests: `uv run pytest`.
 - The original prototypes lived in internal experiment EXP-015.

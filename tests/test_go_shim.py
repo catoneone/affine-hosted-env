@@ -1,4 +1,4 @@
-"""GO_REPORT_SHIM (envs/swe.py): the `go` put first on PATH for a report_kind='gotest' task. Driven with a fake
+"""GO_REPORT_SHIM (envs/swe/reports.py): the `go` put first on PATH for a report_kind='gotest' task. Driven with a fake
 real go, so it runs without a Go toolchain."""
 import json
 import os

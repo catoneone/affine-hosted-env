@@ -1,4 +1,4 @@
-"""hosted_env.baseline: expected tests from an empty rollout graded in collect mode (LocalSandbox, no docker).
+"""hosted_env.envs.swe.baseline: expected tests from an empty rollout graded in collect mode (LocalSandbox, no docker).
 The task's scripts run this interpreter's own pytest, so the tests need nothing installed system-wide."""
 import json
 import os
@@ -6,7 +6,7 @@ import sys
 
 from conftest import _run
 
-from hosted_env.baseline import junit_cases, pytest_selection, select, static_test_ids
+from hosted_env.envs.swe.baseline import junit_cases, pytest_selection, select, static_test_ids
 from hosted_env.envs import SweEnv
 from hosted_env.envs.swe import report_verdict
 from hosted_env.providers.sandbox import LocalSandbox
@@ -93,7 +93,7 @@ def _task(tmp_path, base_extra='', calc_test=None, select='-k "add or zero or mu
 
 
 def test_derive_then_grade_with_the_expected_tests(tmp_path):
-    from hosted_env.baseline import derive
+    from hosted_env.envs.swe.baseline import derive
     env, path, factory = _task(tmp_path)
     rec = derive(env, factory, 'bt', runs=2)
     assert rec['report_kind'] == 'junit'
@@ -127,7 +127,7 @@ def test_repo_addopts_are_kept(tmp_path):
     """Review of PR #18: the grader must not clear the repo's own pytest addopts (EXP-018 002371 crashed at
     start-up without them). Here the base pytest.ini loads a plugin that provides the fixture the tests use:
     with `-o addopts=` injected, test_add errors at base and after the fix alike, so the fix would score 0."""
-    from hosted_env.baseline import derive
+    from hosted_env.envs.swe.baseline import derive
     plug = ("printf 'import pytest\\n@pytest.fixture\\ndef answer():\\n    return 5\\n' > plug.py && "
             "printf '[pytest]\\naddopts = -p plug\\n' > pytest.ini")
     test = 'from calc import add\ndef test_add(answer): assert add(2, 3) == answer\n'
@@ -149,7 +149,7 @@ def test_repo_addopts_are_kept(tmp_path):
 
 
 def test_gotest_cases_top_level_and_unbuilt_packages():
-    from hosted_env.baseline import gotest_cases
+    from hosted_env.envs.swe.baseline import gotest_cases
     ev = [{'Action': 'run', 'Package': 'm/a', 'Test': 'TestA'},
           {'Action': 'fail', 'Package': 'm/a', 'Test': 'TestA/sub'},       # subtests are not ids
           {'Action': 'fail', 'Package': 'm/a', 'Test': 'TestA'},
@@ -165,7 +165,7 @@ def test_gotest_cases_top_level_and_unbuilt_packages():
 
 
 def test_go_run_patterns_and_selection():
-    from hosted_env.baseline import go_run_patterns, go_select, static_go_test_ids
+    from hosted_env.envs.swe.baseline import go_run_patterns, go_select, static_go_test_ids
     script = ("set -e\ncd /testbed\ngo test -v -count=1 \\\n  -run 'TestFoo|TestBar/case_1' ./pkg/x  # comment\n"
               'go test ./pkg/y -run="^(TestBaz|TestQ)$"\n')
     pats = go_run_patterns([script])
@@ -185,7 +185,7 @@ def test_go_run_patterns_and_selection():
 def test_go_test_commands_attribute_run_to_their_packages():
     """Each go test's -run applies to its own packages only: package x must not be given package y's pattern
     (that would expect tests the script never runs there and score an honest fix 0)."""
-    from hosted_env.baseline import go_patterns_for_dir, go_test_commands
+    from hosted_env.envs.swe.baseline import go_patterns_for_dir, go_test_commands
     script = ('cd /testbed\n'
               'go test -v -count=1 -timeout 600s ./pkg/x -run \'TestX1|TestX2/sub\'\n'
               'go test ./pkg/y/... -run=TestY\n'
@@ -208,7 +208,7 @@ def test_go_test_commands_attribute_run_to_their_packages():
 
 
 def test_go_test_commands_follow_the_scripts_own_directory():
-    from hosted_env.baseline import go_patterns_for_dir, go_test_commands
+    from hosted_env.envs.swe.baseline import go_patterns_for_dir, go_test_commands
     cmds = go_test_commands([('ci/run.sh', 'cd "$(dirname "$0")" && go test . -run TestC\n'),
                              ('', 'cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.." && go test ./x -run TestX\n')],
                             '/testbed')
@@ -220,7 +220,7 @@ def test_go_test_commands_see_through_command_prefixes():
     """exec / timeout / VAR=value / if ! / time in front of go test (EXP-018 pilot 001712 runs
     `exec go test ./usercase-test-coderl/...`); before, such a command was not seen at all, so an unbuilt package
     got no static ids. Across the 705 MiMo tasks that run go test this finds commands in 700 instead of 521."""
-    from hosted_env.baseline import go_patterns_for_dir, go_test_commands
+    from hosted_env.envs.swe.baseline import go_patterns_for_dir, go_test_commands
     script = ('cd /workspace/repo\n'
               'exec go test -mod=mod -v -count=1 ./usercase-test-coderl/...\n'
               'timeout 600 go test -run TestA ./a\n'
@@ -298,7 +298,7 @@ def test_derive_go_then_grade_with_the_expected_tests(tmp_path, monkeypatch):
     """Go: x::TestAdd fails at base (F2P) and x::TestOld passes (P2P); package y does not build at base, so its
     expected test comes from the test file, selected by y's own -run (TestMul, not TestOther and not x's
     pattern). The derived lists then drive the grader's second check through the go shim."""
-    from hosted_env.baseline import derive
+    from hosted_env.envs.swe.baseline import derive
     env, path, factory = _go_task(tmp_path, monkeypatch)
     rec = derive(env, factory, 'gt', runs=2)
     assert rec['report_kind'] == 'gotest', rec
@@ -328,7 +328,7 @@ def test_derive_go_then_grade_with_the_expected_tests(tmp_path, monkeypatch):
 
 
 def test_amend_js_reporter():
-    from hosted_env.baseline import amend_js_reporter as a
+    from hosted_env.envs.swe.baseline import amend_js_reporter as a
     j = '--json --outputFile="${MIMO_REPORT:-/dev/null}"'
     assert a('cd /testbed\nnpx jest src/a.test.js --ci\n') == (f'cd /testbed\nnpx jest src/a.test.js --ci {j}\n', 'jest')
     assert a('yarn jest -t "adds two" 2>&1 | tail -50\n')[0] == f'yarn jest -t "adds two" {j} 2>&1 | tail -50\n'
@@ -362,7 +362,7 @@ def _patch_adding(tmp_path, files: dict) -> str:
 
 
 def test_amend_test_patch_rebuilds_a_new_script(tmp_path):
-    from hosted_env.baseline import amend_test_patch
+    from hosted_env.envs.swe.baseline import amend_test_patch
     script = 'set -e\ncd /testbed\nnpx jest src/a.test.js --ci 2>&1 | tail -30\n'
     tp = _patch_adding(tmp_path, {'src/a.test.js': 'test("x", () => {})\n', 'mimo_test_command.sh': script})
     out = amend_test_patch(tp, 'bash /testbed/mimo_test_command.sh')
@@ -381,7 +381,7 @@ def test_amend_test_patch_rebuilds_a_new_script(tmp_path):
 
 
 def test_amend_test_patch_refusals(tmp_path):
-    from hosted_env.baseline import amend_test_patch
+    from hosted_env.envs.swe.baseline import amend_test_patch
     one = _patch_adding(tmp_path, {'mimo_test_command.sh': 'npx jest a.test.js\n'})
     # runs in two places (patch script + test command), or two runs in the script: not amended
     assert amend_test_patch(one, 'npx jest b.test.js') is None
@@ -417,7 +417,7 @@ def test_derive_js_amends_the_harness_then_grades(tmp_path, monkeypatch):
     """jest: the one `npx jest` run is amended to write --json to $MIMO_REPORT; at base "sum adds" fails (F2P)
     and "sum keeps" passes (P2P); the amended test patch comes back with them, and grading the amended task
     with the expected tests scores the fix 1 and the unfixed repo 0."""
-    from hosted_env.baseline import derive
+    from hosted_env.envs.swe.baseline import derive
     bindir = tmp_path / 'node'
     bindir.mkdir()
     (bindir / 'npx').write_text(FAKE_NPX)

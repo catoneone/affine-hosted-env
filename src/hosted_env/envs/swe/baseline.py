@@ -30,8 +30,10 @@ import re
 import shlex
 import time
 
-from .envs.swe import (_ASSIGN_RE, _KEYWORDS, _SCRIPT_DIR_RE, _WRAPPERS, GRADER_VERSION, MIMO_BUNDLE,
-                       _junit_results, _repo_rel, _shell_commands, test_patch_scripts)
+from .env import GRADER_VERSION
+from .reports import _junit_results
+from .scripts import (_ASSIGN_RE, _KEYWORDS, _SCRIPT_DIR_RE, _WRAPPERS, MIMO_BUNDLE, _repo_rel, _shell_commands,
+                      test_patch_scripts)
 
 BASELINE_VERSION = 'baseline-v1'
 _PYTEST_RE = re.compile(r'(^|[\s/;&|(])(py\.test|pytest)(\s|$)')

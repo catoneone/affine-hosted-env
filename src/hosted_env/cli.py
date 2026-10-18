@@ -162,7 +162,7 @@ def cmd_roster_sync(a):
 
 
 def cmd_pin_images(a):
-    from .images import pin_tasks
+    from .envs.images import pin_tasks
     src = Path(a.tasks)
     lines, stats = pin_tasks(src.read_text().splitlines())
     dst = Path(a.out) if a.out else src
@@ -171,10 +171,10 @@ def cmd_pin_images(a):
 
 
 def cmd_baseline(a):
-    """Expected tests per task from baseline runs (hosted_env.baseline): one JSON record per task to --out, and
+    """Expected tests per task from baseline runs (hosted_env.envs.swe.baseline): one JSON record per task to --out, and
     with --tasks-out a copy of the task file with fail_to_pass / pass_to_pass / report_kind filled in."""
     import tomllib
-    from .baseline import derive
+    from .envs.swe.baseline import derive
     from .config import _envs
     from .envs import make_env
     cfgp = Path(a.config).resolve()
