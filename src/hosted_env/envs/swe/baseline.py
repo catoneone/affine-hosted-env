@@ -30,6 +30,7 @@ import re
 import shlex
 import time
 
+from ...infra.receipt import task_hash
 from .env import GRADER_VERSION
 from .reports import _junit_results
 from .scripts import (_ASSIGN_RE, _KEYWORDS, _SCRIPT_DIR_RE, _WRAPPERS, MIMO_BUNDLE, _repo_rel, _shell_commands,
@@ -714,3 +715,61 @@ def derive(env, factory, task: str, runs: int = 2) -> dict:
         meta['warning'] = 'no failing test at base: an empty patch would pass every expected test'
     return {'id': task, 'report_kind': 'junit' if (f2p or p2p) else '', 'fail_to_pass': f2p,
             'pass_to_pass': p2p, 'baseline': meta}
+
+
+# ---------------------------------------------------------------- the task index: derived fields and provenance
+# What `hosted-env baseline --tasks-out` adds to a task row. The receipt's task_hash covers the row as served,
+# derived fields included, so a verifier holding the same index gets the same hash.
+DERIVED_FIELDS = ('fail_to_pass', 'pass_to_pass', 'report_kind', 'amended_from')
+# the deterministic amendment amend_test_patch makes (reporter flags on the one jest / vitest / mocha run); a
+# change to what it produces is a new rule name, so an index says which one it applied
+AMEND_RULE = 'js-report-flags-v1'
+
+
+def source_row(row: dict) -> dict:
+    """The row without what the baseline derived: for a row the baseline never amended, the source task."""
+    return {k: v for k, v in row.items() if k not in DERIVED_FIELDS}
+
+
+def merge_baseline(row: dict, rec: dict) -> dict:
+    """The task row with a baseline record merged in: its expected tests and, for a JS task whose grading script
+    was amended to write a report, the amended test_patch / test_command -- the expected tests hold only for the
+    amended harness, so it replaces the original. An amended row records amended_from: the task_hash of the
+    source row it came from and AMEND_RULE, so anyone holding the source row can check (check_amendment) that
+    the amendment only added reporter flags. A record without expected tests leaves the row as it was."""
+    if not (rec.get('report_kind') and rec.get('fail_to_pass')):
+        return row
+    out = {**row, 'report_kind': rec['report_kind'], 'fail_to_pass': rec['fail_to_pass'],
+           'pass_to_pass': rec['pass_to_pass']}
+    amended = {k: rec[k] for k in ('test_patch', 'test_command') if rec.get(k) and rec[k] != row.get(k)}
+    if amended:
+        out.update(amended)
+        out['amended_from'] = {'task_hash': task_hash(source_row(row)), 'rule': AMEND_RULE,
+                               'fields': sorted(amended)}
+    return out
+
+
+def check_amendment(source: dict, served: dict) -> str | None:
+    """None when served is the source task row amended exactly as AMEND_RULE does it (plus the derived expected
+    tests); otherwise what differs. The amendment is deterministic, so this re-runs it on the source row and
+    compares byte for byte: every field outside DERIVED_FIELDS and the amended ones must be unchanged."""
+    prov = served.get('amended_from')
+    if not isinstance(prov, dict):
+        return 'served row is not amended'
+    if prov.get('rule') != AMEND_RULE:
+        return f'unknown amendment rule {prov.get("rule")!r}'
+    if prov.get('task_hash') != task_hash(source_row(source)):
+        return 'amended_from.task_hash is not the source row'
+    redo = amend_test_patch(source.get('test_patch', ''), source.get('test_command', ''))
+    if redo is None:
+        return 'the source row has no amendable run'
+    fields = [k for k in ('test_patch', 'test_command') if k in redo]
+    if prov.get('fields') != fields:
+        return f'amended fields {prov.get("fields")!r}, the rule amends {fields!r}'
+    if served.get('report_kind') != redo['report_kind']:
+        return 'report_kind is not the amended run\'s'
+    for k in sorted(set(source_row(source)) | set(source_row(served))):
+        want = redo[k] if k in fields else source.get(k)
+        if served.get(k) != want:
+            return f'{k} differs from the amended source'
+    return None
