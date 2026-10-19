@@ -86,6 +86,12 @@ class SweEnv(DockerTaskEnv):
     the test infrastructure reset (`protected_paths`), and a non-login shell (no profile or rc file is read)."""
 
     kind = 'mimo_swe'
+    # A verifier's own canary edit (`hosted-env regrade --canary-edit module:function`): called as
+    # edit(path, source, test_id) for each expected test the canary would edit, it returns the file's source with
+    # that test edited to fail -- and nothing else changed -- or None to leave the test out. It replaces the
+    # built-in edits (forgery.canary_edit_python / canary_edit_go) in every canary run, so a forge written against
+    # this repository's public edits meets one it has not seen. None: the built-in edits.
+    canary_edit = None
 
     def _load(self) -> dict[str, dict]:
         """Only tasks with a second check are offered (require_expected_tests, default on). On a task graded by the
@@ -583,13 +589,15 @@ fi
                     texts[rel] = None
             return texts[rel]
         targets: dict[tuple, dict] = {}
+        own = self.canary_edit                              # a verifier's own edit (`hosted-env regrade --canary-edit`)
         for tid in ids:
             cands: list[tuple[str, tuple, object, object]] = []   # (file, key, edit function, own source)
             if kind == 'junit' and (t := pytest_target(tid)):
                 rel, classes, func = t
                 for p in dict.fromkeys([rel] + [p for p in tpaths if p.endswith('/' + rel)]):  # rootdir-relative ids
                     cands.append((p, (p, tuple(classes), func),
-                                  lambda src, c=classes, f=func: canary_edit_python(src, c, f),
+                                  (lambda src, p=p, i=tid: own(p, src, i)) if own else
+                                  (lambda src, c=classes, f=func: canary_edit_python(src, c, f)),
                                   lambda src, c=classes, f=func: python_def_source(src, c, f)))
             elif kind == 'gotest' and (t := go_target(tid)):
                 pkg, func = t
@@ -598,17 +606,19 @@ fi
                     r = sb.execute(f"git grep --untracked -l -E '^func {func}\\(' -- '*_test.go'", cwd=repo,
                                    timeout=120, login=False)
                     where = [p for p in r['output'].splitlines() if r['returncode'] == 0 and go_file_matches(pkg, p)]
-                cands = [(p, (p, (), func), lambda src, f=func: canary_edit_go(src, f),
+                cands = [(p, (p, (), func),
+                          (lambda src, p=p, i=tid: own(p, src, i)) if own else
+                          (lambda src, f=func: canary_edit_go(src, f)),
                           lambda src, f=func: go_func_source(src, f)) for p in where]
-            hits = [(p, key, edit, own) for p, key, edit, own in cands
+            hits = [(p, key, edit, srcf) for p, key, edit, srcf in cands
                     if key in targets or ((src := text(p)) and edit(src) is not None)]
             if len(hits) > 1:                              # a root file can be any package: prefer a matching dir
                 hits = [h for h in hits if '/' in h[0]]
             if len(hits) != 1:
                 continue                                   # not found, or ambiguous: never a false fail
-            p, key, edit, own = hits[0]
+            p, key, edit, srcf = hits[0]
             targets.setdefault(key, {'file': p, 'ids': [], 'edit': edit, 'func': key[-1],
-                                     'source': own(text(p))})['ids'].append(tid)
+                                     'source': srcf(text(p))})['ids'].append(tid)
         return targets, {t['file']: texts[t['file']] for t in targets.values()}
 
     def _plant_canary(self, sb, repo: str, gi: dict, test_paths,
