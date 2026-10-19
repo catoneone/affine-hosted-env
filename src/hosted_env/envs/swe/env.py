@@ -11,6 +11,7 @@ aligned with mimoagent opensource_code.py).
 """
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -22,8 +23,8 @@ import time
 from ...infra.providers.sandbox.base import SandboxCommandError, SandboxLimitError
 from ..base import DockerTaskEnv, EnvSession, GradeError, SetupError
 from .cleanup import anti_hack_cleanup, future_commits, git_strip
-from .forgery import (CANARY_KINDS, canary_edit_go, canary_edit_python, go_file_matches, go_func_source, go_target,
-                      patch_audit_hits, pytest_target, python_def_source)
+from .forgery import (CANARY_KINDS, canary_edit_go, canary_edit_python, go_file_matches, go_func_source, go_func_span,
+                      go_target, patch_audit_hits, pytest_target, python_def_source, python_def_span)
 from .protect import (_JS_CONFIG_RE, GRADER_PARSERS, STRUCTURED_MANIFESTS, jsts_config_refs, manifest_reverts,
                       protected_paths, shadow_added)
 from .receipt import MAX_MODEL_PATCH_BYTES
@@ -62,6 +63,39 @@ def _pick(seq):
     return secrets.choice(seq)
 
 
+def _verifier_edit(edit, path: str, source: str, test_id: str, span) -> str | None:
+    """A verifier's canary edit, called and checked: None (leave the test out) or the file's new source, in which
+    the test's own lines (span: source -> (first, last) or None) changed and every line outside them did not.
+    Anything else -- not a str, the test unchanged or gone, other lines changed, a .py file that no longer parses,
+    an exception -- is the verifier's tool failing, so it raises GradeError (`hosted-env regrade` reports an
+    error) instead of grading an honest patch 0 and reading as a forge (reviews of #35). Only called on a file that
+    defines the test."""
+    try:
+        out = edit(path, source, test_id)
+    except Exception as e:  # noqa: BLE001  the verifier's own code
+        raise GradeError(f'canary_edit raised on {test_id}: {type(e).__name__}: {e}'[:300]) from None
+    if out is None:
+        return None
+    if not isinstance(out, str):
+        raise GradeError(f'canary_edit returned {type(out).__name__} for {test_id}, not str or None')
+    if out == source:
+        raise GradeError(f'canary_edit returned {path} unchanged for {test_id} (return None to leave a test out)')
+    if path.endswith('.py'):
+        try:
+            ast.parse(out)
+        except (SyntaxError, ValueError) as e:
+            raise GradeError(f'canary_edit made {path} unparseable for {test_id}: {e}'[:300]) from None
+    (a0, b0), new = span(source), span(out)
+    if new is None:
+        raise GradeError(f'canary_edit left no single definition of {test_id} in {path}')
+    (a1, b1), old_l, new_l = new, source.split('\n'), out.split('\n')
+    if old_l[:a0 - 1] != new_l[:a1 - 1] or old_l[b0:] != new_l[b1:]:
+        raise GradeError(f'canary_edit changed {path} outside {test_id} (only the test may change)')
+    if old_l[a0 - 1:b0] == new_l[a1 - 1:b1]:
+        raise GradeError(f'canary_edit did not change {test_id} in {path}')
+    return out
+
+
 def as_grader(command: str) -> str:
     """Run `command` as GRADER_UID with no supplementary groups, no way to regain privileges, and no profile or rc
     file. HOME stays the image's (its caches and toolchains: Go module cache, nvm, cargo, ...), which _lock_down
@@ -86,6 +120,14 @@ class SweEnv(DockerTaskEnv):
     the test infrastructure reset (`protected_paths`), and a non-login shell (no profile or rc file is read)."""
 
     kind = 'mimo_swe'
+    # A verifier's own canary edit (`hosted-env regrade --canary-edit module:function`): called as
+    # edit(path, source, test_id) once per test FUNCTION the canary would edit (test_id is that function's first
+    # expected id; every expected case of it, e.g. each parametrize id, must then fail), it returns the file's
+    # source with that test edited to fail -- and nothing else changed -- or None to leave the test out. A result
+    # that is no str, unchanged, or an unparseable .py file raises GradeError (_verifier_edit). It replaces the
+    # built-in edits (forgery.canary_edit_python / canary_edit_go) in every canary run, so a forge written against
+    # this repository's public edits meets one it has not seen. None: the built-in edits.
+    canary_edit = None
 
     def _load(self) -> dict[str, dict]:
         """Only tasks with a second check are offered (require_expected_tests, default on). On a task graded by the
@@ -583,13 +625,17 @@ fi
                     texts[rel] = None
             return texts[rel]
         targets: dict[tuple, dict] = {}
+        own = self.canary_edit                              # a verifier's own edit (`hosted-env regrade --canary-edit`)
         for tid in ids:
             cands: list[tuple[str, tuple, object, object]] = []   # (file, key, edit function, own source)
             if kind == 'junit' and (t := pytest_target(tid)):
                 rel, classes, func = t
                 for p in dict.fromkeys([rel] + [p for p in tpaths if p.endswith('/' + rel)]):  # rootdir-relative ids
                     cands.append((p, (p, tuple(classes), func),
-                                  lambda src, c=classes, f=func: canary_edit_python(src, c, f),
+                                  (lambda src, p=p, i=tid, e=own, sp=(lambda s, c=classes, f=func:
+                                                                     python_def_span(s, c, f)):
+                                   _verifier_edit(e, p, src, i, sp) if sp(src) else None) if own else
+                                  (lambda src, c=classes, f=func: canary_edit_python(src, c, f)),
                                   lambda src, c=classes, f=func: python_def_source(src, c, f)))
             elif kind == 'gotest' and (t := go_target(tid)):
                 pkg, func = t
@@ -598,17 +644,20 @@ fi
                     r = sb.execute(f"git grep --untracked -l -E '^func {func}\\(' -- '*_test.go'", cwd=repo,
                                    timeout=120, login=False)
                     where = [p for p in r['output'].splitlines() if r['returncode'] == 0 and go_file_matches(pkg, p)]
-                cands = [(p, (p, (), func), lambda src, f=func: canary_edit_go(src, f),
+                cands = [(p, (p, (), func),
+                          (lambda src, p=p, i=tid, e=own, sp=(lambda s, f=func: go_func_span(s, f)):
+                           _verifier_edit(e, p, src, i, sp) if sp(src) else None) if own else
+                          (lambda src, f=func: canary_edit_go(src, f)),
                           lambda src, f=func: go_func_source(src, f)) for p in where]
-            hits = [(p, key, edit, own) for p, key, edit, own in cands
+            hits = [(p, key, edit, srcf) for p, key, edit, srcf in cands
                     if key in targets or ((src := text(p)) and edit(src) is not None)]
             if len(hits) > 1:                              # a root file can be any package: prefer a matching dir
                 hits = [h for h in hits if '/' in h[0]]
             if len(hits) != 1:
                 continue                                   # not found, or ambiguous: never a false fail
-            p, key, edit, own = hits[0]
+            p, key, edit, srcf = hits[0]
             targets.setdefault(key, {'file': p, 'ids': [], 'edit': edit, 'func': key[-1],
-                                     'source': own(text(p))})['ids'].append(tid)
+                                     'source': srcf(text(p))})['ids'].append(tid)
         return targets, {t['file']: texts[t['file']] for t in targets.values()}
 
     def _plant_canary(self, sb, repo: str, gi: dict, test_paths,

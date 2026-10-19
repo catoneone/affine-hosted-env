@@ -133,14 +133,24 @@ def failing_go(t: str) -> str:
     return f'if {x}, {y} := {a}, {b}; {x} != {y} {{ {t}.Fatalf("{x} %v, {y} %v", {x}, {y}) }}'
 
 
-def go_func_source(src: str, func: str) -> str:
-    """`func <func>(` up to its closing brace at column 0 (gofmt); the whole file when that cannot be cut."""
+def go_func_span(src: str, func: str) -> tuple[int, int] | None:
+    """(first, last) 1-based lines of `func <func>(`: through its closing brace at column 0 (gofmt), or the header
+    line alone when its braces balance there (a one-line func); None when it is not there exactly once."""
     lines = src.split('\n')
     start = [i for i, ln in enumerate(lines) if re.match(rf'func\s+{re.escape(func)}\s*\(', ln)]
     if len(start) != 1:
-        return src
-    end = next((j for j in range(start[0] + 1, len(lines)) if lines[j].startswith('}')), None)
-    return '\n'.join(lines[start[0]:end + 1]) if end is not None else src
+        return None
+    s = start[0]
+    if lines[s].count('{') and lines[s].count('{') == lines[s].count('}'):
+        return s + 1, s + 1
+    end = next((j for j in range(s + 1, len(lines)) if lines[j].startswith('}')), None)
+    return (s + 1, end + 1) if end is not None else None
+
+
+def go_func_source(src: str, func: str) -> str:
+    """`func <func>(` up to its closing brace (go_func_span); the whole file when that cannot be cut."""
+    span = go_func_span(src, func)
+    return '\n'.join(src.split('\n')[span[0] - 1:span[1]]) if span else src
 
 
 def pytest_target(test_id: str) -> tuple[str, list[str], str] | None:
@@ -191,16 +201,21 @@ def _python_def(src: str, classes: list[str], func: str) -> tuple[ast.Module, as
     return tree, defs[0]
 
 
+def python_def_span(src: str, classes: list[str], func: str) -> tuple[int, int] | None:
+    """(first, last) 1-based lines of the one def named func, decorators included; None when it is not there."""
+    found = _python_def(src, classes, func)
+    if not found:
+        return None
+    fn = found[1]
+    return min([d.lineno for d in fn.decorator_list] + [fn.lineno]), fn.end_lineno
+
+
 def python_def_source(src: str, classes: list[str], func: str) -> str:
     """The def's source with its decorators (what other tests' bodies are checked against: a test may call the
     edited one, or depend on it through a decorator such as pytest-dependency's); the whole file when the def
     cannot be cut."""
-    found = _python_def(src, classes, func)
-    if not found:
-        return src
-    fn = found[1]
-    start = min([d.lineno for d in fn.decorator_list] + [fn.lineno])
-    return '\n'.join(src.split('\n')[start - 1:fn.end_lineno])
+    span = python_def_span(src, classes, func)
+    return '\n'.join(src.split('\n')[span[0] - 1:span[1]]) if span else src
 
 
 def edit_python(src: str, classes: list[str], func: str, stmt: str) -> str | None:

@@ -135,6 +135,11 @@ def cmd_regrade(a):
                                              sandbox_opts=dict(ecfg.get('sandbox_opts') or {})))
     if any(c['sandbox_limits'] != limits for c in claims) and not a.any_limits:
         refuse('sandbox_limits_mismatch', receipt=claims[0]['sandbox_limits'], yours=limits)
+    if a.canary_edit:
+        try:
+            env.canary_edit = load_canary_edit(a.canary_edit)
+        except Exception as e:  # noqa: BLE001  the verifier's own file: any error at import is a refusal
+            refuse('bad_canary_edit', detail=f'{type(e).__name__}: {e}'[:200])
     results = []
     for c, art in zip(claims, arts, strict=True):
         n = c['nonce']
@@ -153,8 +158,31 @@ def cmd_regrade(a):
         print(json.dumps(rec), flush=True)
     bad = [r['nonce'] for r in results if not r['match']]
     print(json.dumps({'ok': not bad, 'regraded': len(results), 'mismatched_nonces': bad, 'grader': GRADER_VERSION,
-                      'sandbox_limits': limits}))
+                      'sandbox_limits': limits, 'canary_edit': a.canary_edit or 'built-in'}))
     sys.exit(2 if bad else 0)
+
+
+def load_canary_edit(ref: str):
+    """'module.path:function' or '/path/to/file.py:function' -> that callable (the verifier's own code)."""
+    import importlib
+    import importlib.util
+    import sys
+    mod, sep, name = ref.rpartition(':')
+    if not sep or not mod or not name:
+        raise ValueError(f'expected module:function or file.py:function, not {ref!r}')
+    if mod.endswith('.py') or '/' in mod:
+        spec = importlib.util.spec_from_file_location('hosted_env_canary_edit', mod)
+        if spec is None or spec.loader is None:
+            raise ImportError(f'cannot load {mod}')
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = m                      # dataclasses and the like look their module up there
+        spec.loader.exec_module(m)
+    else:
+        m = importlib.import_module(mod)
+    fn = getattr(m, name)
+    if not callable(fn):
+        raise ValueError(f'{ref} is not callable')
+    return fn
 
 
 def register(sub) -> None:
@@ -179,6 +207,12 @@ def register(sub) -> None:
     rg.add_argument('--any-limits', action='store_true', help='re-grade even when your sandbox limits differ from '
                                                               'the receipts\' (a limit kill scores 0, so results can '
                                                               'differ)')
+    rg.add_argument('--canary-edit', metavar='MODULE:FUNCTION',
+                    help='your own canary edit instead of the built-in one (module path or file.py, then :function); '
+                         'called once per test function as edit(path, source, test_id) -> the source with that test '
+                         '(every expected case of it) edited to fail, or None to leave it; any other result is an '
+                         'error, not a grade. Keep it unpublished: a forge written against the public edits meets one '
+                         'it has not seen')
     rg.set_defaults(fn=cmd_regrade)
     bl = sub.add_parser('baseline', help='Derive each task\'s expected tests (fail_to_pass / pass_to_pass) by grading '
                                          'an empty rollout with the real grader (pytest tasks for now)')
