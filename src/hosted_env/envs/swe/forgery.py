@@ -1,4 +1,4 @@
-"""Forgery checks on top of the second check (grader isolated-v4).
+"""Forgery checks on top of the second check (grader isolated-v5).
 
 The hidden tests run in the same process as the code under test, so that code can always produce the test
 framework's output -- print Go's `--- PASS: TestX` lines, write the JUnit / jest report, exit 0 before the tests
@@ -8,20 +8,35 @@ trustworthy; they make the cheap forgeries fail and leave a verifier the same ru
 - patch_audit: the graded patch may not add test-framework output to the code it keeps (the literal forms a forge
   prints or writes), unless the base repository already has that text (a repo that is itself a test reporter), and
   may not name our report plumbing at all.
-- canary: a rollout that passes is graded once more in a fresh container with every expected test edited to fail
-  at its first statement. A real run reports each of them failed; a forge that reports "passed" for the tests it
-  finds, or exits before they run, does not. To beat it a forge has to spot the edits at run time.
-  Known costs: the re-run uses the same limits and timeout, and any way it ends other than "every edited test
-  failed" scores 0 (a forge that spots the canary could otherwise just make that run fail some other way), so an
-  honest pass whose re-run hits the timeout or a flaky infrastructure limit loses it. Tests that cannot be edited
-  (xfail files, a def found twice, a Go brace not on the signature line) are not checked; jest / vitest / mocha
-  have no canary yet.
+- canary (grader isolated-v5): a rollout that passes is graded twice more, each time in a fresh container.
+  1. Every expected test edited to fail at its first statement. A real run reports each of them failed; a forge
+     that reports "passed" for the tests it finds, or exits before they run, does not.
+  2. Consistency: ONE expected test function, picked at random on the grading host, edited the same way; it must
+     fail and every other expected test must pass as in the first run. A forge that spots a re-run and runs
+     honestly there (Affine review 2026-10-19) fails the tests it could not fix, so it has to tell WHICH test was
+     edited, not only that something was.
+  Nothing marks an edit: the inserted statement is an ordinary assertion with random values (no fixed text), and
+  every run of a canary task, the first included, rewrites the same test files in the same order, so file times
+  and write order do not tell the runs apart. What is left is detectable in principle: the statement is false
+  whatever the code under test does, and the hidden tests are public data, so a forge that carries a task's
+  original test files can find the edit. The canary makes generic forges fail; it does not make the report
+  trustworthy -- a verifier should re-grade with an edit of its own (`hosted-env regrade`).
+  Known costs: the re-runs use the same limits and timeout, and any way one ends other than its expected result
+  scores 0 (a forge that spots a re-run could otherwise just make it fail some other way), so an honest pass whose
+  re-run hits the timeout or a flaky infrastructure limit loses it, and in the consistency run a test that depends
+  on another test's body having run (order-dependent tests) fails too. Tests that cannot be edited (xfail files, a
+  def found twice, a Go brace not on the signature line) are not checked; jest / vitest / mocha have no canary
+  yet and are not offered by default (require_canary).
 """
 from __future__ import annotations
 
 import ast
 import json
 import re
+import secrets
+
+_RNG = secrets.SystemRandom()
+_WORDS = ('alpha', 'beta', 'config', 'default', 'empty', 'key', 'name', 'none', 'path', 'user', 'value', 'item')
 
 AUDIT_RULES = 'patch-audit-v1'
 CANARY_KINDS = ('junit', 'gotest')       # report kinds whose test ids map back to a function in a source file
@@ -72,6 +87,34 @@ def patch_audit_hits(patch: str, reverted: set[str] | frozenset = frozenset()) -
 
 
 # ---------------------------------------------------------------- canary
+def _two_values() -> tuple[object, object]:
+    """Two different values of one kind, as a test compares a result with what it wants."""
+    if _RNG.random() < 0.5:
+        a = _RNG.randrange(0, 1000)
+        return a, a + _RNG.randrange(1, 50)
+    a, b = _RNG.sample(_WORDS, 2)
+    return a, b
+
+
+def failing_python() -> str:
+    """A statement that always raises AssertionError, written like an ordinary pytest assertion with random
+    values: no fixed text marks it (Affine review 2026-10-19: v4's literal 'canary <hex>' was greppable)."""
+    a, b = _two_values()
+    shape = _RNG.randrange(3)
+    if shape == 0:
+        return f'assert {a!r} == {b!r}'
+    if shape == 1:
+        return f'assert [{a!r}] == [{b!r}]'
+    return f'assert {{{a!r}: 1}} == {{{b!r}: 1}}'
+
+
+def failing_go(t: str) -> str:
+    """The Go counterpart for receiver t, on one line: `if got, want := a, b; got != want { t.Fatalf(...) }`."""
+    a, b = _two_values()
+    a, b = (json.dumps(a), json.dumps(b))
+    return f'if got, want := {a}, {b}; got != want {{ {t}.Fatalf("got %v, want %v", got, want) }}'
+
+
 def pytest_target(test_id: str) -> tuple[str, list[str], str] | None:
     """'tests/test_a.py::TestK::test_m[1]' -> ('tests/test_a.py', ['TestK'], 'test_m'); None when it is not a
     file::...::function id."""
@@ -119,10 +162,16 @@ def edit_python(src: str, classes: list[str], func: str, stmt: str) -> str | Non
     before = raw[:first.col_offset]
     if before.strip():                   # the body shares a line with the signature: `...): assert f()`
         lines[i] = (before + (stmt + '; ').encode() + raw[first.col_offset:]).decode('utf-8')
-        return '\n'.join(lines)
-    if not before:
+    elif not before:
         return None
-    return '\n'.join([*lines[:i], before.decode() + stmt, *lines[i:]])
+    else:
+        lines[i:i] = [before.decode() + stmt]
+    out = '\n'.join(lines)
+    try:
+        ast.parse(out)
+    except (SyntaxError, ValueError):
+        return None                      # an unparseable file loses every test in it: skip, never a false fail
+    return out
 
 
 # the brace on the signature line, as gofmt writes it; a test written otherwise is not edited (not checked, never a
@@ -130,17 +179,17 @@ def edit_python(src: str, classes: list[str], func: str, stmt: str) -> str | Non
 _GO_FUNC = r'^func\s+{name}\s*\(\s*(\w+)\s+\*\s*testing\.T\s*\)\s*\{{'
 
 
-def edit_go(src: str, func: str, message: str) -> str | None:
-    """src with `<t>.Fatal(message)` as the first statement of `func <func>(<t> *testing.T) {`: on the next line
-    when the brace ends the line, else right after the brace (`{ t.Fatal(...); if ... }`). None unless that header
-    is found exactly once and names the *testing.T (not `_`)."""
+def edit_go(src: str, func: str, statement) -> str | None:
+    """src with statement(<t>) as the first statement of `func <func>(<t> *testing.T) {`: on the next line when
+    the brace ends the line, else right after the brace (`{ <stmt>; if ... }`). None unless that header is found
+    exactly once and names the *testing.T (not `_`)."""
     lines = src.split('\n')
     pat = re.compile(_GO_FUNC.format(name=re.escape(func)))
     hits = [(i, m) for i, ln in enumerate(lines) if (m := pat.match(ln))]
     if len(hits) != 1 or hits[0][1].group(1) == '_':
         return None
     i, m = hits[0]
-    call = f'{m.group(1)}.Fatal({json.dumps(message)})'
+    call = statement(m.group(1))
     rest = lines[i][m.end():]
     if not rest.strip() or rest.strip().startswith('//'):
         return '\n'.join([*lines[:i + 1], '\t' + call, *lines[i + 1:]])
