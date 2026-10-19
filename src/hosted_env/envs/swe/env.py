@@ -69,7 +69,8 @@ class _NoSandbox:
 
 class SweEnv(DockerTaskEnv):
     """Config options: cleanup (anti-hack cleanup, on by default), git_leak ('strip' default / 'error'),
-    require_expected_tests (on by default; false only for local development and the baseline tool).
+    require_expected_tests (on by default; false only for local development and the baseline tool), require_canary
+    (on by default: only report kinds the canary covers are offered).
 
     Grading never trusts the rollout container: the model's changes are captured as a git patch, that container is
     destroyed, and the hidden tests run in a fresh container from the same image with only the patch applied,
@@ -83,15 +84,19 @@ class SweEnv(DockerTaskEnv):
         os.Exit(0), a JS module that calls process.exit(0) when the tests import it -- and no revert rule can stop
         that, since it edits the very code the fix must edit (EXP-018 cheat matrix; Affine review 2026-10-18: the
         per-test-id check gates going live). So a task needs fail_to_pass ids from `hosted-env baseline` and a
-        report kind the grader parses; the rest stay out of the pool until the baseline covers them."""
+        report kind the grader parses; the rest stay out of the pool until the baseline covers them.
+        require_canary (default on) narrows that to the report kinds the canary re-run covers (CANARY_KINDS): the
+        code under test writes the report too, and a jest / vitest / mocha task has only the literal-string patch
+        audit against that (Affine review 2026-10-19), so it stays out of the pool until it has a canary."""
         if self._rows is None:
             rows = super()._load()
             if self.cfg.get('require_expected_tests', True):
-                kept = {k: r for k, r in rows.items() if r.get('fail_to_pass') and r.get('report_kind') in _REPORT_PARSERS}
+                kinds = CANARY_KINDS if self.cfg.get('require_canary', True) else tuple(_REPORT_PARSERS)
+                kept = {k: r for k, r in rows.items() if r.get('fail_to_pass') and r.get('report_kind') in kinds}
                 if rows and not kept:
                     raise RuntimeError(f'env {self.env_id}: none of the {len(rows)} tasks has expected tests '
-                                       '(fail_to_pass + report_kind); run `hosted-env baseline --tasks-out`, or set '
-                                       'require_expected_tests = false for local development')
+                                       f'(fail_to_pass + a report_kind in {sorted(kinds)}); run `hosted-env baseline '
+                                       '--tasks-out`, or set require_expected_tests = false for local development')
                 self._rows = kept
         return self._rows
 

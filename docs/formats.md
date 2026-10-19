@@ -112,16 +112,19 @@ reported it, or null).
 ## Task rows
 
 The receipt's `task_hash` covers every field of the served row, including what `hosted-env baseline` derived:
-`fail_to_pass`, `pass_to_pass`, `report_kind`, and for a JS task whose grading script was amended to write a
-report, the amended `test_patch` / `test_command` plus
+`fail_to_pass`, `pass_to_pass`, `report_kind`, `source_task_hash` (the `task_hash` of the source row, before the
+baseline added anything), and for a JS task whose grading script was amended to write a report, the amended
+`test_patch` / `test_command` plus
 
 ```json
 "amended_from": {"task_hash": "<task_hash of the source row>", "rule": "js-report-flags-v1", "fields": ["test_patch"]}
 ```
 
-The amendment is deterministic: `hosted_env.envs.swe.baseline.check_amendment(source_row, served_row)` re-runs it
-on the source row and returns `None` only when the served row is exactly that (reporter flags on the one jest /
-vitest / mocha run, everything else unchanged).
+`hosted_env.envs.swe.baseline.check_source(source_row, served_row)` returns `None` only when the served row is the
+source row with just those fields added: `source_task_hash` names the source row and every other field is
+unchanged. For an amended row it also re-runs the deterministic amendment on the source row
+(`check_amendment(source_row, served_row)`) and requires exactly that change (reporter flags on the one jest /
+vitest / mocha run). These are fields of the task index, not of the receipt: the receipt format is unchanged.
 
 ## Verifying
 
