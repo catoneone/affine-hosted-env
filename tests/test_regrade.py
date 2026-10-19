@@ -95,13 +95,16 @@ def test_a_verifier_edit_catches_a_forge_the_public_edits_miss(tmp_path, monkeyp
 
 
 def test_go_verifier_edit_is_used_in_both_canary_runs(tmp_path, monkeypatch):
-    """Review of #35: the Go path of the hook. The fake go fails a test whose file holds `if got, want := ...`."""
+    """Review of #35: the Go path of the hook. The fake go fails a test whose file holds `if got, want := ...`.
+    Review 2: package x has a second hidden test file without TestAdd, and the edit has no guard of its own (it
+    would return that file unchanged): it is only offered the file that defines the test."""
     import json as _json
 
     from test_baseline import _go_task
 
     from hosted_env.envs import SweEnv
-    env, path, factory = _go_task(tmp_path, monkeypatch)
+    env, path, factory = _go_task(tmp_path, monkeypatch, {'x/helper_test.go': 'package x\n\nfunc helper() int {\n'
+                                                                              '\treturn 1\n}\n'})
     row = _json.loads(path.read_text())
     row.update(report_kind='gotest', fail_to_pass=['example.com/m/x::TestAdd', 'example.com/m/y::TestMul'],
                pass_to_pass=['example.com/m/x::TestOld'])
@@ -109,11 +112,9 @@ def test_go_verifier_edit_is_used_in_both_canary_runs(tmp_path, monkeypatch):
     calls = []
 
     def edit(p, source, test_id):
-        calls.append(test_id)
-        func = test_id.rsplit('::', 1)[1]
-        head = f'func {func}(t *testing.T) {{'
-        return (source.replace(head, head + ' if got, want := 1, 2; got != want { t.Fatal() };', 1)
-                if head in source else None)
+        calls.append((p, test_id))
+        head = f'func {test_id.rsplit("::", 1)[1]}(t *testing.T) {{'
+        return source.replace(head, head + ' if got, want := 1, 2; got != want { t.Fatal() };', 1)
     e = SweEnv('swe', dict(env.cfg))
     e.canary_edit = edit
     s = e.open(e.public_spec('gt'), factory)
@@ -124,7 +125,8 @@ def test_go_verifier_edit_is_used_in_both_canary_runs(tmp_path, monkeypatch):
     g = s.grade(e.grade_inputs('gt'))
     s.close()
     assert g['reward'] == 1.0 and g['canary'] == 'ok: 3 edited test(s) failed; consistency ok: 1 of 3 edited', g
-    assert {i.rsplit('::', 1)[1] for i in calls} == {'TestAdd', 'TestMul', 'TestOld'}
+    assert {(p, i.rsplit('::', 1)[1]) for p, i in calls} == {('x/calc_test.go', 'TestAdd'),
+                                                            ('y/mul_test.go', 'TestMul'), ('x/old_test.go', 'TestOld')}
 
 
 def test_a_broken_verifier_edit_is_an_error_not_a_silent_0(tmp_path):
@@ -135,7 +137,10 @@ def test_a_broken_verifier_edit_is_an_error_not_a_silent_0(tmp_path):
     def boom(path, source, test_id):
         raise RuntimeError('bug')
     for edit, why in ((lambda p, s, i: s, 'unchanged'), (lambda p, s, i: 42, 'returned int'),
-                      (lambda p, s, i: s + '\ndef (:', 'unparseable'), (boom, 'raised')):
+                      (lambda p, s, i: s + '\ndef (:', 'unparseable'), (boom, 'raised'),
+                      (lambda p, s, i: s + '# x\n', 'outside'),                       # review 2 of #35
+                      (lambda p, s, i: s.replace('def test_zero', 'def test_zer0'), 'outside|no single'),
+                      (lambda p, s, i: s.replace('def test_add', 'def test_add2'), 'no single')):
         env.canary_edit = edit
         with pytest.raises(GradeError, match=why):
             env.regrade(task, patch, start, factory)
@@ -154,8 +159,9 @@ def test_load_canary_edit_takes_a_module_or_a_file(tmp_path):
         with pytest.raises((ImportError, OSError, AttributeError, ValueError)):
             load_canary_edit(bad)
     dc = tmp_path / 'dc.py'                                         # registered in sys.modules: dataclasses work
-    dc.write_text('from dataclasses import dataclass\n@dataclass\nclass C:\n    x: int = 1\n'
-                  'def edit(path, source, test_id):\n    return None if C().x else source\n')
+    dc.write_text('from __future__ import annotations\nimport typing\nfrom dataclasses import dataclass\n'
+                  '@dataclass\nclass C:\n    x: int = 1\n'
+                  'def edit(path, source, test_id):\n    return None if typing.get_type_hints(C) else source\n')
     assert load_canary_edit(f'{dc}:edit')('p', 's', 't') is None
 
 

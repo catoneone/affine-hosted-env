@@ -174,6 +174,9 @@ The built-in canary edits are public, so a forge can be written against them (th
 `path/to/file.py:function`) re-grades with your own edit instead, in both canary runs: it is called as
 `edit(path, source, test_id)` once per test function the canary would edit (`test_id` is its first expected id)
 and returns the file's source with that test -- every expected case of it -- edited to fail and nothing else
-changed, or `None` to leave the test out. Any other result (not a str, the source unchanged, a `.py` file that no
-longer parses, an exception) is reported as that rollout's `error`, never graded. An edit you do not publish is the
+changed, or `None` to leave the test out. It is only offered a file that defines the test, and its result must
+change the test's own lines (the def with its decorators; a Go func through its closing brace) and nothing outside
+them. Any other result (not a str, the test unchanged or gone, other lines changed, a `.py` file that no longer
+parses, an exception) is reported as that rollout's `error`, never graded. A semantic no-op inside the test still
+grades an honest patch 0, so dry-run your edit on a receipt you know is honest before relying on it. An edit you do not publish is the
 one a forge has not seen; the summary line names the edit used (`canary_edit`).

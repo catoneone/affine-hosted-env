@@ -266,7 +266,7 @@ exit 0
 '''
 
 
-def _go_task(tmp_path, monkeypatch):
+def _go_task(tmp_path, monkeypatch, extra_tests: dict | None = None):
     bindir = tmp_path / 'toolchain'
     bindir.mkdir()
     (bindir / 'go').write_text(FAKE_GO_TOOLCHAIN)
@@ -290,6 +290,8 @@ def _go_task(tmp_path, monkeypatch):
                                              "go test -v ./x -run 'TestAdd|TestOld'; a=$?\n"
                                              "go test ./y -run '^TestMul$'; b=$?\n"
                                              '[ $a -eq 0 ] && [ $b -eq 0 ]\n')
+    for rel, text in (extra_tests or {}).items():
+        (tp / rel).write_text(text)
     test_patch = _run('git init -q && git add -A && git diff --cached --no-color', tp).stdout
     path = tmp_path / 'tasks.jsonl'
     path.write_text(json.dumps({'id': 'gt', 'image': str(tpl), 'cwd': '/testbed', 'lang': 'go',
