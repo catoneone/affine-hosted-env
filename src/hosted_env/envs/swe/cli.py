@@ -138,7 +138,7 @@ def cmd_regrade(a):
     if a.canary_edit:
         try:
             env.canary_edit = load_canary_edit(a.canary_edit)
-        except (ImportError, OSError, AttributeError, ValueError, SyntaxError) as e:
+        except Exception as e:  # noqa: BLE001  the verifier's own file: any error at import is a refusal
             refuse('bad_canary_edit', detail=f'{type(e).__name__}: {e}'[:200])
     results = []
     for c, art in zip(claims, arts, strict=True):
@@ -166,6 +166,7 @@ def load_canary_edit(ref: str):
     """'module.path:function' or '/path/to/file.py:function' -> that callable (the verifier's own code)."""
     import importlib
     import importlib.util
+    import sys
     mod, sep, name = ref.rpartition(':')
     if not sep or not mod or not name:
         raise ValueError(f'expected module:function or file.py:function, not {ref!r}')
@@ -174,6 +175,7 @@ def load_canary_edit(ref: str):
         if spec is None or spec.loader is None:
             raise ImportError(f'cannot load {mod}')
         m = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = m                      # dataclasses and the like look their module up there
         spec.loader.exec_module(m)
     else:
         m = importlib.import_module(mod)
@@ -207,9 +209,10 @@ def register(sub) -> None:
                                                               'differ)')
     rg.add_argument('--canary-edit', metavar='MODULE:FUNCTION',
                     help='your own canary edit instead of the built-in one (module path or file.py, then :function); '
-                         'called as edit(path, source, test_id) -> the source with that test edited to fail, or None '
-                         'to leave it. Keep it unpublished: a forge written against the public edits meets one it has '
-                         'not seen')
+                         'called once per test function as edit(path, source, test_id) -> the source with that test '
+                         '(every expected case of it) edited to fail, or None to leave it; any other result is an '
+                         'error, not a grade. Keep it unpublished: a forge written against the public edits meets one '
+                         'it has not seen')
     rg.set_defaults(fn=cmd_regrade)
     bl = sub.add_parser('baseline', help='Derive each task\'s expected tests (fail_to_pass / pass_to_pass) by grading '
                                          'an empty rollout with the real grader (pytest tasks for now)')

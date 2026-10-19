@@ -94,6 +94,56 @@ def test_a_verifier_edit_catches_a_forge_the_public_edits_miss(tmp_path, monkeyp
     assert g['reward'] == 1.0 and g['canary'].startswith('ok: 2 edited test(s) failed; consistency ok'), g
 
 
+def test_go_verifier_edit_is_used_in_both_canary_runs(tmp_path, monkeypatch):
+    """Review of #35: the Go path of the hook. The fake go fails a test whose file holds `if got, want := ...`."""
+    import json as _json
+
+    from test_baseline import _go_task
+
+    from hosted_env.envs import SweEnv
+    env, path, factory = _go_task(tmp_path, monkeypatch)
+    row = _json.loads(path.read_text())
+    row.update(report_kind='gotest', fail_to_pass=['example.com/m/x::TestAdd', 'example.com/m/y::TestMul'],
+               pass_to_pass=['example.com/m/x::TestOld'])
+    path.write_text(_json.dumps(row) + '\n')
+    calls = []
+
+    def edit(p, source, test_id):
+        calls.append(test_id)
+        func = test_id.rsplit('::', 1)[1]
+        head = f'func {func}(t *testing.T) {{'
+        return (source.replace(head, head + ' if got, want := 1, 2; got != want { t.Fatal() };', 1)
+                if head in source else None)
+    e = SweEnv('swe', dict(env.cfg))
+    e.canary_edit = edit
+    s = e.open(e.public_spec('gt'), factory)
+    s.setup()
+    for c in ('sed -i.bak "s/a - b/a + b/" x/calc.go && rm x/calc.go.bak',
+              'printf "package y\\nfunc Mul(a, b int) int { return a * b }\\n" > y/mul.go'):
+        assert s.sb.execute(c)['returncode'] == 0, c
+    g = s.grade(e.grade_inputs('gt'))
+    s.close()
+    assert g['reward'] == 1.0 and g['canary'] == 'ok: 3 edited test(s) failed; consistency ok: 1 of 3 edited', g
+    assert {i.rsplit('::', 1)[1] for i in calls} == {'TestAdd', 'TestMul', 'TestOld'}
+
+
+def test_a_broken_verifier_edit_is_an_error_not_a_silent_0(tmp_path):
+    """Review of #35: a verifier edit that returns the source unchanged, a non-str, an unparseable file, or raises
+    must not grade an honest patch 0 (which reads as a forge): it is a GradeError the regrade reports."""
+    env, task, factory, patch, start = _captured(tmp_path, lambda sb: sb.execute(FIX, cwd='/testbed'))
+
+    def boom(path, source, test_id):
+        raise RuntimeError('bug')
+    for edit, why in ((lambda p, s, i: s, 'unchanged'), (lambda p, s, i: 42, 'returned int'),
+                      (lambda p, s, i: s + '\ndef (:', 'unparseable'), (boom, 'raised')):
+        env.canary_edit = edit
+        with pytest.raises(GradeError, match=why):
+            env.regrade(task, patch, start, factory)
+    env.canary_edit = lambda p, s, i: None                                   # leaving every test out: no canary
+    g = env.regrade(task, patch, start, factory)
+    assert g['reward'] == 1.0 and g['canary'].startswith('skipped')
+
+
 def test_load_canary_edit_takes_a_module_or_a_file(tmp_path):
     from hosted_env.envs.swe.cli import load_canary_edit
     f = tmp_path / 'e.py'
@@ -103,6 +153,10 @@ def test_load_canary_edit_takes_a_module_or_a_file(tmp_path):
     for bad in (str(f), f'{f}:missing', f'{f}:NOT', f'{tmp_path}/nope.py:edit', 'no.such.module:x', ':edit'):
         with pytest.raises((ImportError, OSError, AttributeError, ValueError)):
             load_canary_edit(bad)
+    dc = tmp_path / 'dc.py'                                         # registered in sys.modules: dataclasses work
+    dc.write_text('from dataclasses import dataclass\n@dataclass\nclass C:\n    x: int = 1\n'
+                  'def edit(path, source, test_id):\n    return None if C().x else source\n')
+    assert load_canary_edit(f'{dc}:edit')('p', 's', 't') is None
 
 
 def _cli(tmp_path, stack, att, tasks, sandbox='local', extra=()):  # noqa: F811
@@ -119,7 +173,7 @@ def _cli(tmp_path, stack, att, tasks, sandbox='local', extra=()):  # noqa: F811
     return e.value.code
 
 
-def test_regrade_cli_end_to_end(stack, tmp_path, capsys):  # noqa: F811
+def test_regrade_cli_end_to_end(stack, tmp_path, capsys, monkeypatch):  # noqa: F811
     """A real group from the gateway: every graded rollout re-grades to its receipt's reward; a verifier whose task
     row differs from the one served is refused before anything runs."""
     from conftest import FIX as ROLLOUT_FIX
@@ -139,10 +193,21 @@ def test_regrade_cli_end_to_end(stack, tmp_path, capsys):  # noqa: F811
     assert lines[-1]['ok'] is True and lines[-1]['regraded'] == 8
     assert lines[-1]['canary_edit'] == 'built-in'
     f = tmp_path / 'my_edit.py'                                       # the verifier's own edit, from a file
-    f.write_text(VERIFIER_EDIT)
-    assert _cli(tmp_path, stack, att, tasks, extra=('--canary-edit', f'{f}:edit')) == 0
-    assert json.loads(capsys.readouterr().out.splitlines()[-1])['canary_edit'] == f'{f}:edit'
+    f.write_text(VERIFIER_EDIT + '\n\ndef logged(path, source, test_id):\n    return edit(path, source, test_id)\n')
+    from hosted_env.envs.swe.env import SweEnv
+    seen, real = [], SweEnv.regrade
+    monkeypatch.setattr(SweEnv, 'regrade', lambda self, *a, **kw: seen.append(self.canary_edit) or real(self, *a, **kw))
+    assert _cli(tmp_path, stack, att, tasks, extra=('--canary-edit', f'{f}:logged')) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])['canary_edit'] == f'{f}:logged'
+    assert len(seen) == 8 and all(getattr(e, '__name__', '') == 'logged' for e in seen)   # this stack's task has
+    seen.clear()                                                        # no expected tests, so no canary runs
+    assert _cli(tmp_path, stack, att, tasks) == 0 and seen and all(e is None for e in seen)
+    capsys.readouterr()
     assert _cli(tmp_path, stack, att, tasks, extra=('--canary-edit', f'{f}:missing')) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])['error'] == 'bad_canary_edit'
+    broken = tmp_path / 'broken_edit.py'
+    broken.write_text('raise RuntimeError("at import")\n')
+    assert _cli(tmp_path, stack, att, tasks, extra=('--canary-edit', f'{broken}:edit')) == 1
     assert json.loads(capsys.readouterr().out.splitlines()[-1])['error'] == 'bad_canary_edit'
     mine = tmp_path / 'my-tasks.jsonl'                                # the verifier's copy says something else
     rows = [json.loads(x) for x in open(tasks) if x.strip()]

@@ -11,6 +11,7 @@ aligned with mimoagent opensource_code.py).
 """
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -62,6 +63,29 @@ def _pick(seq):
     return secrets.choice(seq)
 
 
+def _verifier_edit(edit, path: str, source: str, test_id: str) -> str | None:
+    """A verifier's canary edit, called and checked: None (leave the test out) or the file's new source. Anything
+    else -- not a str, the source unchanged, a .py file that no longer parses, an exception -- is the verifier's
+    tool failing, so it raises GradeError (`hosted-env regrade` reports an error) instead of grading an honest
+    patch 0 and reading as a forge (review of #35)."""
+    try:
+        out = edit(path, source, test_id)
+    except Exception as e:  # noqa: BLE001  the verifier's own code
+        raise GradeError(f'canary_edit raised on {test_id}: {type(e).__name__}: {e}'[:300]) from None
+    if out is None:
+        return None
+    if not isinstance(out, str):
+        raise GradeError(f'canary_edit returned {type(out).__name__} for {test_id}, not str or None')
+    if out == source:
+        raise GradeError(f'canary_edit returned {path} unchanged for {test_id} (return None to leave a test out)')
+    if path.endswith('.py'):
+        try:
+            ast.parse(out)
+        except (SyntaxError, ValueError) as e:
+            raise GradeError(f'canary_edit made {path} unparseable for {test_id}: {e}'[:300]) from None
+    return out
+
+
 def as_grader(command: str) -> str:
     """Run `command` as GRADER_UID with no supplementary groups, no way to regain privileges, and no profile or rc
     file. HOME stays the image's (its caches and toolchains: Go module cache, nvm, cargo, ...), which _lock_down
@@ -87,8 +111,10 @@ class SweEnv(DockerTaskEnv):
 
     kind = 'mimo_swe'
     # A verifier's own canary edit (`hosted-env regrade --canary-edit module:function`): called as
-    # edit(path, source, test_id) for each expected test the canary would edit, it returns the file's source with
-    # that test edited to fail -- and nothing else changed -- or None to leave the test out. It replaces the
+    # edit(path, source, test_id) once per test FUNCTION the canary would edit (test_id is that function's first
+    # expected id; every expected case of it, e.g. each parametrize id, must then fail), it returns the file's
+    # source with that test edited to fail -- and nothing else changed -- or None to leave the test out. A result
+    # that is no str, unchanged, or an unparseable .py file raises GradeError (_verifier_edit). It replaces the
     # built-in edits (forgery.canary_edit_python / canary_edit_go) in every canary run, so a forge written against
     # this repository's public edits meets one it has not seen. None: the built-in edits.
     canary_edit = None
@@ -596,7 +622,7 @@ fi
                 rel, classes, func = t
                 for p in dict.fromkeys([rel] + [p for p in tpaths if p.endswith('/' + rel)]):  # rootdir-relative ids
                     cands.append((p, (p, tuple(classes), func),
-                                  (lambda src, p=p, i=tid: own(p, src, i)) if own else
+                                  (lambda src, p=p, i=tid, e=own: _verifier_edit(e, p, src, i)) if own else
                                   (lambda src, c=classes, f=func: canary_edit_python(src, c, f)),
                                   lambda src, c=classes, f=func: python_def_source(src, c, f)))
             elif kind == 'gotest' and (t := go_target(tid)):
@@ -607,7 +633,7 @@ fi
                                    timeout=120, login=False)
                     where = [p for p in r['output'].splitlines() if r['returncode'] == 0 and go_file_matches(pkg, p)]
                 cands = [(p, (p, (), func),
-                          (lambda src, p=p, i=tid: own(p, src, i)) if own else
+                          (lambda src, p=p, i=tid, e=own: _verifier_edit(e, p, src, i)) if own else
                           (lambda src, f=func: canary_edit_go(src, f)),
                           lambda src, f=func: go_func_source(src, f)) for p in where]
             hits = [(p, key, edit, srcf) for p, key, edit, srcf in cands
