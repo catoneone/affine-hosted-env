@@ -22,8 +22,8 @@ import time
 from ...infra.providers.sandbox.base import SandboxCommandError, SandboxLimitError
 from ..base import DockerTaskEnv, EnvSession, GradeError, SetupError
 from .cleanup import anti_hack_cleanup, future_commits, git_strip
-from .forgery import (CANARY_KINDS, canary_edit_python, edit_go, failing_go, go_file_matches, go_func_source,
-                      go_target, patch_audit_hits, pytest_target, python_def_source)
+from .forgery import (CANARY_KINDS, canary_edit_go, canary_edit_python, go_file_matches, go_func_source, go_target,
+                      patch_audit_hits, pytest_target, python_def_source)
 from .protect import (_JS_CONFIG_RE, GRADER_PARSERS, STRUCTURED_MANIFESTS, jsts_config_refs, manifest_reverts,
                       protected_paths, shadow_added)
 from .receipt import MAX_MODEL_PATCH_BYTES
@@ -598,7 +598,7 @@ fi
                     r = sb.execute(f"git grep --untracked -l -E '^func {func}\\(' -- '*_test.go'", cwd=repo,
                                    timeout=120, login=False)
                     where = [p for p in r['output'].splitlines() if r['returncode'] == 0 and go_file_matches(pkg, p)]
-                cands = [(p, (p, (), func), lambda src, f=func: edit_go(src, f, failing_go),
+                cands = [(p, (p, (), func), lambda src, f=func: canary_edit_go(src, f),
                           lambda src, f=func: go_func_source(src, f)) for p in where]
             hits = [(p, key, edit, own) for p, key, edit, own in cands
                     if key in targets or ((src := text(p)) and edit(src) is not None)]

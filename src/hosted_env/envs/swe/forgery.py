@@ -16,28 +16,31 @@ trustworthy; they make the cheap forgeries fail and leave a verifier the same ru
      it may call it; and an expected id that is no target, e.g. a test a class inherits, is not checked). A forge
      that spots a re-run and runs honestly there (Affine review 2026-10-19) fails the tests it could not fix, so
      it has to tell WHICH test was edited, not only that something was.
-  The edit: for pytest, the test's own first top-level assertion negated as a test would write it (`==` -> `!=`,
-  `in` -> `not in`, `x` -> `not (x)`, assertEqual -> assertNotEqual, ...; negate_python), so the edited test
-  reads like test code; where that is not exact, and for Go, an inserted assertion that compares two different
-  constants (random values, no fixed text). A negated assertion also catches, in re-run 1, a forge that runs
-  honestly there on code it did not fix: where the original assertion fails, its negation holds and the edited
-  test can report pass (it still fails when the code errors before that assertion or a later one fails, so
-  re-run 2 is kept). Every
-  run of a canary task, the first included, rewrites the same test files in the same order, so which files were
-  written and when does not tell the runs apart.
-  What this does NOT give (review of #34): an inserted constant comparison is found by a few lines of static
-  analysis of the test source (an AST scan for `assert <lit> == <lit>` / Go's `if x, y := <lit>, <lit>` beats
-  both re-runs with no knowledge of the task), and a negated assertion is found by diffing the test file against
-  the public original, which a forge can carry. So the canary makes generic, pattern-free forges fail and makes
-  the rest work harder; it does not make the report trustworthy. Only a verifier's own re-grade, with an edit it
-  does not publish, is evidence (`hosted-env regrade`).
+  The edit, least recognisable first (canary_edit_python / canary_edit_go): change the literal the test's first
+  top-level assertion expects (`== 5` -> `== 3`, `'abc'` -> `'abd'`; Go: `if got != 5 {` -> `!= 3`), keeping its
+  polarity and shape; else (pytest) negate that assertion (`==` -> `!=`, `x` -> `not (x)`, assertEqual ->
+  assertNotEqual, ...); else insert an assertion comparing two different constants (random values, no fixed text).
+  An honest pass ran that assertion and it held, so the edited one fails. A changed or negated assertion also
+  catches, in re-run 1, a forge that runs honestly there on code it did not fix: where the original fails, the
+  edited one can hold. Every run of a canary task, the first included, rewrites the same test files in the same
+  order, so which files were written and when does not tell the runs apart.
+  What this does NOT give (reviews of #34). A forge that needs no knowledge of the task beats both re-runs on
+  every target whose edit is a negation or an insertion: it treats a test as edited when its first assertion has
+  negative polarity (`!=`, `not in`, `is not`, `not ...`) or compares two constants, reports those failed and the
+  rest passed (it costs it a false fail on tests that really start with a negative assertion). Only the changed
+  literal resists that scan, and only where the first assertion compares against a literal -- a minority of
+  tests. Any edit is found by diffing the test file against the public original tests, which a forge can carry.
+  So the canary raises the cost of forging and catches forges that do not look at the tests; it does not make
+  the report trustworthy. Only a verifier's own re-grade, with an edit it does not publish, is evidence
+  (`hosted-env regrade`).
   Known costs: the re-runs use the same limits and timeout, and any way one ends other than its expected result
   scores 0 (a forge that spots a re-run could otherwise just make it fail some other way), so an honest pass whose
   re-run hits the timeout or a flaky infrastructure limit loses it; a first assertion that does not hold every
-  time (timing, randomness) can pass negated; and in the consistency run a test that depends on another test's
-  body having run (order-dependent tests) fails too. Tests that cannot be edited (xfail files, a def found twice,
-  a Go brace not on the signature line) are not checked; jest / vitest / mocha have no canary yet and are not
-  offered by default (require_canary).
+  time (timing, randomness), one whose `__ne__` is not the inverse of `__eq__` (negation), or a wildcard such as
+  mock.ANY on the computed side (changed literal) can still pass edited; and in the consistency run a test that
+  depends on another test's body having run (order-dependent tests) fails too. Tests that cannot be edited (xfail
+  files, a def found twice, a Go brace not on the signature line) are not checked; jest / vitest / mocha have no
+  canary yet and are not offered by default (require_canary).
 """
 from __future__ import annotations
 
@@ -188,9 +191,15 @@ def _python_def(src: str, classes: list[str], func: str) -> tuple[ast.Module, as
 
 
 def python_def_source(src: str, classes: list[str], func: str) -> str:
-    """The def's source (what other tests' bodies are checked against); the whole file when it cannot be cut."""
+    """The def's source with its decorators (what other tests' bodies are checked against: a test may call the
+    edited one, or depend on it through a decorator such as pytest-dependency's); the whole file when the def
+    cannot be cut."""
     found = _python_def(src, classes, func)
-    return (ast.get_source_segment(src, found[1]) if found else None) or src
+    if not found:
+        return src
+    fn = found[1]
+    start = min([d.lineno for d in fn.decorator_list] + [fn.lineno])
+    return '\n'.join(src.split('\n')[start - 1:fn.end_lineno])
 
 
 def edit_python(src: str, classes: list[str], func: str, stmt: str) -> str | None:
@@ -340,9 +349,96 @@ def _python_def_in(tree: ast.Module, classes: list[str], func: str) -> ast.AST:
 
 
 def canary_edit_python(src: str, classes: list[str], func: str) -> str | None:
-    """The canary's pytest edit: negate the test's own first assertion (negate_python) when that is exact, else
-    insert an ordinary-looking failing assertion (failing_python) as its first statement."""
-    return negate_python(src, classes, func) or edit_python(src, classes, func, failing_python())
+    """The canary's pytest edit, least recognisable first: change the literal the test's first assertion expects
+    (mutate_python_literal: polarity and shape kept), else negate that assertion (negate_python: polarity flips),
+    else insert a constant comparison as its first statement (failing_python). Review of #34: a task-free scan
+    finds the last two -- a negative-polarity or constant-vs-constant first assertion -- not the first."""
+    return (mutate_python_literal(src, classes, func) or negate_python(src, classes, func)
+            or edit_python(src, classes, func, failing_python()))
+
+
+# literals mutate_python_literal rewrites, as they appear in source: a plain decimal int / float, or a short
+# string with no prefix, escape or quote inside (so the new literal is written in exactly the same style)
+_INT_LIT = re.compile(r'\d+')
+_FLOAT_LIT = re.compile(r'\d+\.\d+')
+_STR_LIT = re.compile(r"""'[^'\\\n]*'|"[^"\\\n]*\"""")
+
+
+def _mutated_literal(text: str) -> tuple[str, object] | None:
+    """(new source text, new value) for a literal written as text, of the same kind and style, never equal."""
+    if _INT_LIT.fullmatch(text):
+        v = int(text)
+        n = v + _RNG.choice([-1, 1]) * _RNG.randrange(1, max(10, v // 2 + 2)) if v else _RNG.randrange(1, 10)
+        n = abs(n) if n < 0 else n                       # stays a plain non-negative literal
+        return (str(n), n) if n != v else None
+    if _FLOAT_LIT.fullmatch(text):
+        whole, frac = text.split('.')
+        new = f'{int(whole) + _RNG.randrange(1, 9)}.{frac}'
+        return new, float(new)
+    if _STR_LIT.fullmatch(text):
+        q, body = text[0], text[1:-1]
+        alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789' if not body.isupper() else 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        if body and _RNG.random() < 0.7:
+            i = _RNG.randrange(len(body))
+            new_body = body[:i] + _RNG.choice([c for c in alphabet if c != body[i]]) + body[i + 1:]
+        else:
+            new_body = body + _RNG.choice(alphabet)
+        return f'{q}{new_body}{q}', new_body
+    return None
+
+
+def _expected_literal(st: ast.AST) -> ast.Constant | None:
+    """The literal a first assertion compares against: `assert x == <lit>` / `<lit> == x`, or
+    self.assertEqual(x, <lit>) / (<lit>, x). An int (not bool), float or str."""
+    def lit(n):
+        return (n if isinstance(n, ast.Constant) and type(n.value) in (int, float, str) else None)
+    if isinstance(st, ast.Assert) and isinstance(st.test, ast.Compare) and len(st.test.ops) == 1 \
+            and isinstance(st.test.ops[0], ast.Eq):
+        a, b = lit(st.test.comparators[0]), lit(st.test.left)
+        return a if a is not None and b is None else b if b is not None and a is None else None
+    if _is_unittest_assert(st) and st.value.func.attr == 'assertEqual' and len(st.value.args) >= 2:
+        a, b = lit(st.value.args[1]), lit(st.value.args[0])
+        return a if a is not None and b is None else b if b is not None and a is None else None
+    return None
+
+
+def mutate_python_literal(src: str, classes: list[str], func: str) -> str | None:
+    """src with the literal the test's first top-level assertion expects changed to another of the same kind and
+    style (`== 5` -> `== 7`, `'abc'` -> `'abd'`). An honest pass ran that assertion and it held, so with a
+    different literal it fails (for values compared the ordinary way; a wildcard such as mock.ANY on the computed
+    side would still pass). The edited test keeps the original's polarity and shape, so only the original file,
+    or knowing the right value, tells it apart. Accepted only if the edited file parses to exactly the original
+    module with that one literal changed; None otherwise."""
+    found = _python_def(src, classes, func)
+    if not found:
+        return None
+    tree, fn = found
+    k = next((j for j, st in enumerate(fn.body) if isinstance(st, ast.Assert) or _is_unittest_assert(st)), None)
+    if k is None or _returns_in(fn.body[:k]):
+        return None
+    c = _expected_literal(fn.body[k])
+    if c is None or c.lineno != c.end_lineno:
+        return None
+    lines = src.split('\n')
+    try:
+        text = _text(lines, c.lineno, c.col_offset, c.end_col_offset)
+    except UnicodeDecodeError:
+        return None
+    got = _mutated_literal(text)
+    if not got:
+        return None
+    new_text, new_value = got
+    _splice(lines, c.lineno, c.col_offset, c.end_col_offset, new_text)
+    out = '\n'.join(lines)
+    try:
+        new_tree = ast.parse(out)
+    except (SyntaxError, ValueError):
+        return None
+    want = copy.deepcopy(tree)
+    for node in ast.walk(_python_def_in(want, classes, func).body[k]):
+        if isinstance(node, ast.Constant) and (node.lineno, node.col_offset) == (c.lineno, c.col_offset):
+            node.value = new_value
+    return out if ast.dump(new_tree) == ast.dump(want) and new_value != c.value else None
 
 
 
@@ -367,6 +463,55 @@ def edit_go(src: str, func: str, statement) -> str | None:
         return '\n'.join([*lines[:i + 1], '\t' + call, *lines[i + 1:]])
     lines[i] = lines[i][:m.end()] + f' {call};' + rest
     return '\n'.join(lines)
+
+
+_GO_CHECK = re.compile(r'\tif (?P<pre>[^\n]*?) != (?P<lit>\d+(?:\.\d+)?|"[^"\\\n]*") \{\s*')
+
+
+def mutate_go_literal(src: str, func: str) -> str | None:
+    """src with the literal of the test's first top-level check `if <expr> != <lit> {` (gofmt: one tab, its body a
+    t.Error*/t.Fatal* call on the next line) changed to another of the same kind. An honest pass ran that check and
+    it was false (the value equals the literal), so with a different literal it is true and the test fails. Ints
+    only get smaller (never below 0), so the new constant fits any type the original did (a uint8 255 must not
+    become 300). Refused when a `return`, `goto` or Skip comes first, or the check is compound. Keeps the test's
+    shape, so only the original file tells it apart."""
+    lines = src.split('\n')
+    pat = re.compile(_GO_FUNC.format(name=re.escape(func)))
+    hits = [(i, m) for i, ln in enumerate(lines) if (m := pat.match(ln))]
+    if len(hits) != 1 or hits[0][1].group(1) == '_' or lines[hits[0][0]][hits[0][1].end():].strip():
+        return None
+    i, t = hits[0][0], hits[0][1].group(1)
+    for j in range(i + 1, len(lines) - 1):
+        ln = lines[j]
+        if ln.startswith('}'):
+            return None                                  # end of the function: no such check
+        if re.search(r'\breturn\b|\bgoto\b|\.Skip(Now|f)?\(', ln):
+            return None                                  # it might not reach a later check
+        m = _GO_CHECK.fullmatch(ln)
+        if not m or '&&' in m['pre'] or '||' in m['pre']:
+            continue
+        if not re.match(rf'\t\t{re.escape(t)}\.(Error|Errorf|Fatal|Fatalf)\(', lines[j + 1]):
+            continue
+        lit = m['lit']
+        if _INT_LIT.fullmatch(lit):
+            v = int(lit)
+            new = str(_RNG.randrange(0, v)) if v > 0 else '1'
+        elif _FLOAT_LIT.fullmatch(lit):
+            whole, frac = lit.split('.')
+            new = f'{int(whole) + _RNG.randrange(1, 9)}.{frac}'
+        else:
+            new = _mutated_literal(lit)[0]
+        if new == lit:
+            return None
+        lines[j] = ln[:m.start('lit')] + new + ln[m.end('lit'):]
+        return '\n'.join(lines)
+    return None
+
+
+def canary_edit_go(src: str, func: str) -> str | None:
+    """The canary's Go edit: change the expected literal of the first top-level check (mutate_go_literal), else
+    insert a constant comparison as the first statement (failing_go), which a task-free scan finds."""
+    return mutate_go_literal(src, func) or edit_go(src, func, failing_go)
 
 
 def go_file_matches(pkg: str, rel: str) -> bool:
