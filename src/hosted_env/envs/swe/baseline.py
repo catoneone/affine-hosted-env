@@ -741,10 +741,11 @@ def merge_baseline(row: dict, rec: dict) -> dict:
     amended row, reporter flags. A record without expected tests leaves the row as it was."""
     if not (rec.get('report_kind') and rec.get('fail_to_pass')):
         return row
-    # a row merged before (the README points `tasks` at tasks.f2p.jsonl, so --tasks-out merges it again) keeps
-    # the hash it already names: an amended row's stripped form still holds the amended harness, not the source's
-    src_hash = (row.get('source_task_hash') or (row.get('amended_from') or {}).get('task_hash')
-                or task_hash(source_row(row)))
+    # a row merged before (the README points `tasks` at tasks.f2p.jsonl, so --tasks-out merges it again): an
+    # amended row's stripped form holds the amended harness, so it keeps the source hash it already names; any
+    # other row's stripped form IS its source, so it is hashed again (and an operator's edit to it is reflected)
+    prior = row.get('amended_from')
+    src_hash = prior['task_hash'] if isinstance(prior, dict) and prior.get('task_hash') else task_hash(source_row(row))
     out = {**row, 'report_kind': rec['report_kind'], 'fail_to_pass': rec['fail_to_pass'],
            'pass_to_pass': rec['pass_to_pass'], 'source_task_hash': src_hash}
     amended = {k: rec[k] for k in ('test_patch', 'test_command') if rec.get(k) and rec[k] != row.get(k)}

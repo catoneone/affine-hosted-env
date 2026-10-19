@@ -125,6 +125,8 @@ when the served row is the source row with just those fields added (expected tes
 naming the source row, every other field unchanged). For an amended row it also re-runs the deterministic amendment on the source row
 (`check_amendment(source_row, served_row)`) and requires exactly that change (reporter flags on the one jest /
 vitest / mocha run). These are fields of the task index, not of the receipt: the receipt format is unchanged.
+Re-merging a derived index re-hashes a non-amended row from its own fields; an amended row keeps the hash in
+`amended_from`, so change the source tasks and derive again rather than hand-editing an amended row.
 
 ## Verifying
 

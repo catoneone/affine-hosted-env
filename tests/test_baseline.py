@@ -517,6 +517,9 @@ def test_amended_rows_record_their_source_and_can_be_checked(tmp_path):
     assert check_source(py, got) is None
     assert merge_baseline(got, {'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': []}
                           )['source_task_hash'] == task_hash(py)              # re-merging keeps the source's hash
+    edited = merge_baseline({**got, 'source_task_hash': '0' * 64, 'test_command': 'pytest -x'},
+                            {'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': []})
+    assert check_source({**py, 'test_command': 'pytest -x'}, edited) is None   # re-hashed from its own fields
     for bad, why in (({**got, 'test_command': 'pytest -x'}, 'test_command'), ({**got, 'extra': 1}, 'extra'),
                      ({**got, 'source_task_hash': '0' * 64}, 'not the source row'),
                      ({k: v for k, v in got.items() if k != 'source_task_hash'}, 'not the source row')):
