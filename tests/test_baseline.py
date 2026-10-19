@@ -501,6 +501,12 @@ def test_amended_rows_record_their_source_and_can_be_checked(tmp_path):
     assert 'not the source row' in check_amendment({**src, 'problem_statement': 'other'}, row)
     assert row['source_task_hash'] == task_hash(src) and check_source(src, row) is None
     assert 'test_patch' in (check_source(src, {**row, 'test_patch': row['test_patch'] + ' '}) or '')
+    # merged again (tasks pointed at tasks.f2p.jsonl): the amendment is not redone, and the row keeps naming the
+    # original source -- its stripped form holds the amended harness (review of #33)
+    assert amend_test_patch(row['test_patch'], row['test_command']) is None
+    again = merge_baseline(row, {k: v for k, v in rec.items() if k != 'test_patch'})
+    assert again == row and check_source(src, again) is None
+    assert 'no expected tests' in check_source(src, {k: v for k, v in row.items() if k != 'fail_to_pass'})
     py = {'id': '000320', 'test_patch': 'diff', 'test_command': 'pytest'}
     got = merge_baseline(py, {'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': ['t::b']})
     assert got == {**py, 'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': ['t::b'],
