@@ -222,9 +222,22 @@ def test_mutate_go_literal_changes_the_first_checks_literal():
     one_line = 'func TestA(t *testing.T) { if got != 5 { t.Fatal() } }\n'
     assert ':=' in canary_edit_go(one_line, 'TestA')                        # else the inserted comparison
     # a compound first check, or one whose body is no failing call, is skipped: the next simple check is used
-    for bad in (src.replace('got != 5 {', 'got != 5 && ok {'), src.replace('\t\tt.Fatalf', '\t\tlog.Printf')):
+    for bad in (src.replace('got != 5 {', 'got != 5 && ok {'), src.replace('\t\tt.Fatalf', '\t\tlog.Printf'),
+                src.replace('if got != 5 {', 'if ok && got != 5 {'),        # ok false: the edit would not fire
+                src.replace('got != 5 {', 'got != 0177 {'),                 # octal (review 3 of #34)
+                src.replace('got != 5 {', 'got != 120.0 {')):               # integral float: may hold an int8
         out = mutate_go_literal(bad, 'TestA')
         assert out.split('\n')[2] == bad.split('\n')[2] and '!= "abc"' not in out, out
+    assert mutate_go_literal(src.replace('got != 5 {', 'got != 2.5 {'), 'TestA').split('\n')[2] != '\tif got != 2.5 {'
+
+
+def test_a_defs_source_includes_its_decorators():
+    """pytest-dependency names the test it depends on in a decorator: that test may fail with the edited one."""
+    from hosted_env.envs.swe.forgery import python_def_source
+    src = ('import pytest\n\n@pytest.mark.dependency(depends=["test_a"])\n@pytest.mark.slow\ndef test_b():\n'
+           '    assert 1\n\ndef test_c():\n    pass\n')
+    assert python_def_source(src, [], 'test_b') == ('@pytest.mark.dependency(depends=["test_a"])\n@pytest.mark.slow\n'
+                                                     'def test_b():\n    assert 1')
 
 
 def test_edit_go_puts_a_fatal_first():

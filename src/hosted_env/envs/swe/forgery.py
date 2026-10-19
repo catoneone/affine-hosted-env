@@ -24,12 +24,13 @@ trustworthy; they make the cheap forgeries fail and leave a verifier the same ru
   catches, in re-run 1, a forge that runs honestly there on code it did not fix: where the original fails, the
   edited one can hold. Every run of a canary task, the first included, rewrites the same test files in the same
   order, so which files were written and when does not tell the runs apart.
-  What this does NOT give (reviews of #34). A forge that needs no knowledge of the task beats both re-runs on
-  every target whose edit is a negation or an insertion: it treats a test as edited when its first assertion has
-  negative polarity (`!=`, `not in`, `is not`, `not ...`) or compares two constants, reports those failed and the
-  rest passed (it costs it a false fail on tests that really start with a negative assertion). Only the changed
-  literal resists that scan, and only where the first assertion compares against a literal -- a minority of
-  tests. Any edit is found by diffing the test file against the public original tests, which a forge can carry.
+  What this does NOT give (reviews of #34). A forge that needs no knowledge of the task treats a test as edited
+  when its first assertion has negative polarity (`!=`, `not in`, `is not`, `not ...`) or compares two
+  constants, reports those failed and the rest passed (it costs it a false fail on tests that really start with
+  a negative assertion). It beats re-run 1 whenever none of the task's expected tests gets a changed literal, and
+  the consistency run whenever the picked target does not; only the changed literal resists that scan, and only
+  where the first assertion compares against a literal -- a minority of tests (not measured on the task pool).
+  Any edit is found by diffing the test file against the public original tests, which a forge can carry.
   So the canary raises the cost of forging and catches forges that do not look at the tests; it does not make
   the report trustworthy. Only a verifier's own re-grade, with an edit it does not publish, is evidence
   (`hosted-env regrade`).
@@ -465,16 +466,18 @@ def edit_go(src: str, func: str, statement) -> str | None:
     return '\n'.join(lines)
 
 
-_GO_CHECK = re.compile(r'\tif (?P<pre>[^\n]*?) != (?P<lit>\d+(?:\.\d+)?|"[^"\\\n]*") \{\s*')
+_GO_CHECK = re.compile(r'\tif (?P<pre>[^\n]*?) != (?P<lit>(?:0|[1-9]\d*)(?:\.\d+)?|"[^"\\\n]*") \{\s*')
+_GO_INT = re.compile(r'0|[1-9]\d*')     # decimal only: Go reads 0177 as octal (review 3 of #34)
 
 
 def mutate_go_literal(src: str, func: str) -> str | None:
     """src with the literal of the test's first top-level check `if <expr> != <lit> {` (gofmt: one tab, its body a
     t.Error*/t.Fatal* call on the next line) changed to another of the same kind. An honest pass ran that check and
     it was false (the value equals the literal), so with a different literal it is true and the test fails. Ints
-    only get smaller (never below 0), so the new constant fits any type the original did (a uint8 255 must not
-    become 300). Refused when a `return`, `goto` or Skip comes first, or the check is compound. Keeps the test's
-    shape, so only the original file tells it apart."""
+    are decimal and only get smaller (never below 0), so the new constant fits any type the original did (a uint8
+    255 must not become 300); a float must have a fractional part (an integral `120.0` can hold an int8 and must
+    not grow), and only its whole part changes. Refused when a `return`, `goto` or Skip comes first, or the check
+    is compound. Keeps the test's shape, so only the original file tells it apart."""
     lines = src.split('\n')
     pat = re.compile(_GO_FUNC.format(name=re.escape(func)))
     hits = [(i, m) for i, ln in enumerate(lines) if (m := pat.match(ln))]
@@ -493,14 +496,16 @@ def mutate_go_literal(src: str, func: str) -> str | None:
         if not re.match(rf'\t\t{re.escape(t)}\.(Error|Errorf|Fatal|Fatalf)\(', lines[j + 1]):
             continue
         lit = m['lit']
-        if _INT_LIT.fullmatch(lit):
+        if _GO_INT.fullmatch(lit):
             v = int(lit)
             new = str(_RNG.randrange(0, v)) if v > 0 else '1'
-        elif _FLOAT_LIT.fullmatch(lit):
+        elif _FLOAT_LIT.fullmatch(lit) and lit.split('.')[1].strip('0'):
             whole, frac = lit.split('.')
             new = f'{int(whole) + _RNG.randrange(1, 9)}.{frac}'
-        else:
+        elif lit.startswith('"'):
             new = _mutated_literal(lit)[0]
+        else:
+            continue                                     # e.g. an integral float: it may be compared with an int
         if new == lit:
             return None
         lines[j] = ln[:m.start('lit')] + new + ln[m.end('lit'):]
