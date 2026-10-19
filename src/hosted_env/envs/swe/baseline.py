@@ -720,7 +720,7 @@ def derive(env, factory, task: str, runs: int = 2) -> dict:
 # ---------------------------------------------------------------- the task index: derived fields and provenance
 # What `hosted-env baseline --tasks-out` adds to a task row. The receipt's task_hash covers the row as served,
 # derived fields included, so a verifier holding the same index gets the same hash.
-DERIVED_FIELDS = ('fail_to_pass', 'pass_to_pass', 'report_kind', 'amended_from')
+DERIVED_FIELDS = ('fail_to_pass', 'pass_to_pass', 'report_kind', 'amended_from', 'source_task_hash')
 # the deterministic amendment amend_test_patch makes (reporter flags on the one jest / vitest / mocha run); a
 # change to what it produces is a new rule name, so an index says which one it applied
 AMEND_RULE = 'js-report-flags-v1'
@@ -734,19 +734,42 @@ def source_row(row: dict) -> dict:
 def merge_baseline(row: dict, rec: dict) -> dict:
     """The task row with a baseline record merged in: its expected tests and, for a JS task whose grading script
     was amended to write a report, the amended test_patch / test_command -- the expected tests hold only for the
-    amended harness, so it replaces the original. An amended row records amended_from: the task_hash of the
-    source row it came from and AMEND_RULE, so anyone holding the source row can check (check_amendment) that
-    the amendment only added reporter flags. A record without expected tests leaves the row as it was."""
+    amended harness, so it replaces the original. Every merged row records source_task_hash, the task_hash of the
+    source row it came from (Affine review 2026-10-19: the receipt hashes the served row, provenance keeps the
+    source's), and an amended row also amended_from: that hash again and AMEND_RULE, so anyone holding the source
+    row can check (check_source / check_amendment) that the baseline only added the expected tests and, for an
+    amended row, reporter flags. A record without expected tests leaves the row as it was."""
     if not (rec.get('report_kind') and rec.get('fail_to_pass')):
         return row
+    # a row merged before (the README points `tasks` at tasks.f2p.jsonl, so --tasks-out merges it again): an
+    # amended row's stripped form holds the amended harness, so it keeps the source hash it already names; any
+    # other row's stripped form IS its source, so it is hashed again (and an operator's edit to it is reflected)
+    prior = row.get('amended_from')
+    src_hash = prior['task_hash'] if isinstance(prior, dict) and prior.get('task_hash') else task_hash(source_row(row))
     out = {**row, 'report_kind': rec['report_kind'], 'fail_to_pass': rec['fail_to_pass'],
-           'pass_to_pass': rec['pass_to_pass']}
+           'pass_to_pass': rec['pass_to_pass'], 'source_task_hash': src_hash}
     amended = {k: rec[k] for k in ('test_patch', 'test_command') if rec.get(k) and rec[k] != row.get(k)}
     if amended:
         out.update(amended)
-        out['amended_from'] = {'task_hash': task_hash(source_row(row)), 'rule': AMEND_RULE,
-                               'fields': sorted(amended)}
+        out['amended_from'] = {'task_hash': src_hash, 'rule': AMEND_RULE, 'fields': sorted(amended)}
     return out
+
+
+def check_source(source: dict, served: dict) -> str | None:
+    """Provenance, not gradability: None when served is the source task row with only what the baseline derives
+    added -- expected tests (report_kind + fail_to_pass), source_task_hash naming the source row, and every other
+    field the source's, or for an amended row exactly what AMEND_RULE makes of it (check_amendment). Otherwise
+    what differs."""
+    if not (served.get('report_kind') and served.get('fail_to_pass')):
+        return 'served row has no expected tests (report_kind + fail_to_pass)'
+    if served.get('source_task_hash') != task_hash(source_row(source)):
+        return 'source_task_hash is not the source row'
+    if 'amended_from' in served:
+        return check_amendment(source, served)
+    for k in sorted(set(source_row(source)) | set(source_row(served))):
+        if served.get(k) != source.get(k):
+            return f'{k} differs from the source'
+    return None
 
 
 def check_amendment(source: dict, served: dict) -> str | None:

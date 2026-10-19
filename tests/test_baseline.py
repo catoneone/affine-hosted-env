@@ -478,7 +478,7 @@ def test_amended_rows_record_their_source_and_can_be_checked(tmp_path):
     """A JS row whose harness the baseline amended says which source row it came from (its task_hash) and by which
     rule; check_amendment re-runs the rule on the source row and accepts only that exact change. A non-amended
     row gets the expected tests and nothing else."""
-    from hosted_env.envs.swe.baseline import AMEND_RULE, amend_test_patch, check_amendment, merge_baseline
+    from hosted_env.envs.swe.baseline import AMEND_RULE, amend_test_patch, check_amendment, check_source, merge_baseline
     from hosted_env.infra.receipt import task_hash
     script = 'set -e\ncd /testbed\nnpx jest src/a.test.js --ci\n'
     tp = _patch_adding(tmp_path, {'src/a.test.js': 'test("x", () => {})\n', 'mimo_test_command.sh': script})
@@ -499,8 +499,29 @@ def test_amended_rows_record_their_source_and_can_be_checked(tmp_path):
                      ({**row, 'report_kind': 'junit'}, 'report_kind')):
         assert why in (check_amendment(src, bad) or '')
     assert 'not the source row' in check_amendment({**src, 'problem_statement': 'other'}, row)
+    assert row['source_task_hash'] == task_hash(src) and check_source(src, row) is None
+    assert 'test_patch' in (check_source(src, {**row, 'test_patch': row['test_patch'] + ' '}) or '')
+    # merged again (tasks pointed at tasks.f2p.jsonl): the amendment is not redone, and the row keeps naming the
+    # original source -- its stripped form holds the amended harness (review of #33)
+    assert amend_test_patch(row['test_patch'], row['test_command']) is None
+    again = merge_baseline(row, {k: v for k, v in rec.items() if k != 'test_patch'})
+    assert again == row and check_source(src, again) is None
+    assert 'no expected tests' in check_source(src, {k: v for k, v in row.items() if k != 'fail_to_pass'})
     py = {'id': '000320', 'test_patch': 'diff', 'test_command': 'pytest'}
     got = merge_baseline(py, {'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': ['t::b']})
-    assert got == {**py, 'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': ['t::b']}
+    assert got == {**py, 'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': ['t::b'],
+                   'source_task_hash': task_hash(py)}
     assert merge_baseline(py, {'report_kind': '', 'fail_to_pass': []}) is py   # nothing derived: unchanged
     assert 'not amended' in check_amendment(py, got)
+    # a non-amended row: the source with only the expected tests added (Affine review 2026-10-19)
+    assert check_source(py, got) is None
+    assert merge_baseline(got, {'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': []}
+                          )['source_task_hash'] == task_hash(py)              # re-merging keeps the source's hash
+    edited = merge_baseline({**got, 'source_task_hash': '0' * 64, 'test_command': 'pytest -x'},
+                            {'report_kind': 'junit', 'fail_to_pass': ['t::a'], 'pass_to_pass': []})
+    assert check_source({**py, 'test_command': 'pytest -x'}, edited) is None   # re-hashed from its own fields
+    for bad, why in (({**got, 'test_command': 'pytest -x'}, 'test_command'), ({**got, 'extra': 1}, 'extra'),
+                     ({**got, 'source_task_hash': '0' * 64}, 'not the source row'),
+                     ({k: v for k, v in got.items() if k != 'source_task_hash'}, 'not the source row')):
+        assert why in (check_source(py, bad) or '')
+    assert 'not the source row' in check_source({**py, 'test_patch': 'other'}, got)

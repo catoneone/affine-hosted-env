@@ -52,8 +52,8 @@ hosted-env keygen keys/gateway.key        # signs session tokens
 hosted-env keygen keys/executor.key       # signs receipts (must be a different key)
 hosted-env pin-images tasks.jsonl         # image name:tag -> name@sha256:...; envs refuse unpinned rows by default
 hosted-env baseline --config examples/server.toml --env mimo_swe --out baseline.jsonl --tasks-out tasks.f2p.jsonl
-                                          # expected tests per task; point `tasks` at tasks.f2p.jsonl -- only tasks
-                                          # that have expected tests are offered by default
+                                          # expected tests per task; point `tasks` at tasks.f2p.jsonl -- by default
+                                          # only tasks with expected tests and a canary (pytest, go test) are offered
 hosted-env server --config examples/server.toml            # default 127.0.0.1:8780
 hosted-env machines --config examples/server.toml          # machine inventory: what runs where, hours, est. cost
 hosted-env roster-sync --out roster.chain.json --every 300  # SN120 registered hotkeys (extra `chain`)

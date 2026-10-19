@@ -91,3 +91,20 @@ def test_env_offers_only_tasks_with_a_second_check_by_default(tmp_path):
     path.write_text(''.join(json.dumps(r) + '\n' for r in rows[1:]))
     with pytest.raises(RuntimeError, match='none of the 4 tasks has expected tests'):
         SweEnv('swe', {'tasks': str(path)}).task_ids()
+
+
+def test_env_offers_only_report_kinds_the_canary_covers_by_default(tmp_path):
+    """jest / vitest / mocha reports are written by the code under test too and have no canary re-run, only the
+    literal-string patch audit (Affine review 2026-10-19), so by default only junit / gotest tasks are offered;
+    require_canary = false puts every parsed report kind back."""
+    from hosted_env.envs import SweEnv
+    base = {'image': f'x/y@{D1}', 'cwd': '/w', 'problem_statement': 'p', 'test_command': 'true', 'test_patch': ''}
+    rows = [{'id': k, **base, 'report_kind': k, 'fail_to_pass': ['x']} for k in ('junit', 'gotest', 'jest')]
+    path = tmp_path / 't.jsonl'
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    assert sorted(SweEnv('swe', {'tasks': str(path)}).task_ids()) == ['gotest', 'junit']
+    assert sorted(SweEnv('swe', {'tasks': str(path), 'require_canary': False}).task_ids()) == ['gotest', 'jest',
+                                                                                              'junit']
+    path.write_text(json.dumps(rows[2]) + '\n')
+    with pytest.raises(RuntimeError, match=r"report_kind in \['gotest', 'junit'\]"):
+        SweEnv('swe', {'tasks': str(path)}).task_ids()
