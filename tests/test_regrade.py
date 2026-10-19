@@ -139,6 +139,7 @@ def test_a_broken_verifier_edit_is_an_error_not_a_silent_0(tmp_path):
     for edit, why in ((lambda p, s, i: s, 'unchanged'), (lambda p, s, i: 42, 'returned int'),
                       (lambda p, s, i: s + '\ndef (:', 'unparseable'), (boom, 'raised'),
                       (lambda p, s, i: s + '# x\n', 'outside'),                       # review 2 of #35
+                      (lambda p, s, i: 'import os\n' + s, 'outside'),                 # review 3: above the test
                       (lambda p, s, i: s.replace('def test_zero', 'def test_zer0'), 'outside|no single'),
                       (lambda p, s, i: s.replace('def test_add', 'def test_add2'), 'no single')):
         env.canary_edit = edit
