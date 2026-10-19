@@ -79,7 +79,7 @@ Every `*_sha256` field is lowercase hex of 64 characters or `''` (not known, e.g
 | `start_tree` | 40 hex or `''` | git tree the model started from |
 | `test_patch_sha256` | hex | of the hidden test patch as served (an amended JS patch for an amended row) |
 | `test_command_sha256` | hex | of the test command |
-| `grader` | str | grading semantics, e.g. `isolated-v4` (patch audit + canary re-run of passes; no field change) |
+| `grader` | str | grading semantics, e.g. `isolated-v5` (patch audit + canary and consistency re-runs of passes; no field change) |
 | `grader_parsers` | str | pinned parsers for structured manifests |
 | `expected_tests_sha256` | hex or `''` | `expected_tests_digest(fail_to_pass, pass_to_pass, report_kind)`; `''` = exit code only |
 | `grader_user` | str | `nobody` or `root` |

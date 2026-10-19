@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import shlex
 import time
@@ -21,7 +22,8 @@ import time
 from ...infra.providers.sandbox.base import SandboxCommandError, SandboxLimitError
 from ..base import DockerTaskEnv, EnvSession, GradeError, SetupError
 from .cleanup import anti_hack_cleanup, future_commits, git_strip
-from .forgery import CANARY_KINDS, edit_go, edit_python, go_file_matches, go_target, patch_audit_hits, pytest_target
+from .forgery import (CANARY_KINDS, canary_edit_go, canary_edit_python, go_file_matches, go_func_source, go_target,
+                      patch_audit_hits, pytest_target, python_def_source)
 from .protect import (_JS_CONFIG_RE, GRADER_PARSERS, STRUCTURED_MANIFESTS, jsts_config_refs, manifest_reverts,
                       protected_paths, shadow_added)
 from .receipt import MAX_MODEL_PATCH_BYTES
@@ -49,8 +51,15 @@ GRADER_UID = 65534                     # nobody: the hidden tests run without ro
 # no_new_privs: setuid-root binaries in the image (sudo, su, ...) cannot hand root back to the code under test
 DROP_PRIVS = f'setpriv --reuid={GRADER_UID} --regid={GRADER_UID} --clear-groups --no-new-privs --'
 GRADER_BASH = 'bash --noprofile --norc -c'   # the drop probes run under exactly what the test command runs under
-GRADER_VERSION = 'isolated-v4'         # v1: tests as root; v2: tests as GRADER_UID; v3: structured manifests, wider
-                                       # revert; v4: patch audit + canary re-run of passes (forgery.py)
+GRADER_VERSION = 'isolated-v5'         # v1: tests as root; v2: tests as GRADER_UID; v3: structured manifests, wider
+                                       # revert; v4: patch audit + canary re-run of passes (forgery.py); v5: no
+                                       # marker in the canary edit, same test files rewritten in every run,
+                                       # consistency re-run (one random test edited, the others must still pass)
+
+
+def _pick(seq):
+    """The consistency re-run's target, chosen on the grading host (never visible in the container)."""
+    return secrets.choice(seq)
 
 
 def as_grader(command: str) -> str:
@@ -484,14 +493,24 @@ fi
         return self._grade_patch(s, gi, patch, res)
 
     def _grade_patch(self, s: EnvSession, gi: dict, patch: bytes, res: dict) -> dict:
-        """The captured patch, graded in a fresh container, and a pass checked again by the canary."""
+        """The captured patch, graded in a fresh container, and a pass checked again by the canary: every expected
+        test edited (each must fail), then one picked at random edited (it must fail, every other must pass)."""
         if res['grader_user'] not in ('root', 'nobody'):    # a typo must not silently pick one (grade and regrade)
             raise GradeError(f'grader_user must be "root" or "nobody", not {res["grader_user"]!r}')
         out = self._grade_fresh(s, gi, patch, res)
-        if (self.cfg.get('canary', True) and out.get('reward') == 1.0 and out.get('second_check') is True
-                and gi.get('report_kind') in CANARY_KINDS and not gi.get('collect_report')):
-            out = self._canary_verdict(out, self._grade_fresh(s, gi, patch, res, canary=True))
-        return out
+        if not (self._canary_on(gi) and out.get('reward') == 1.0 and out.get('second_check') is True):
+            return out
+        out = self._canary_verdict(out, self._grade_fresh(s, gi, patch, res, canary='all'))
+        if out.get('reward') != 1.0 or not str(out.get('canary', '')).startswith('ok'):
+            return out                                      # caught, or no editable test (skipped)
+        if len(set(gi.get('fail_to_pass') or []) | set(gi.get('pass_to_pass') or [])) < 2:
+            return {**out, 'canary': out['canary'] + '; consistency: skipped: one expected test'}
+        return self._consistency_verdict(out, self._grade_fresh(s, gi, patch, res, canary='one'))
+
+    def _canary_on(self, gi: dict) -> bool:
+        """A task the canary covers: on in the config, a report kind whose ids map to functions, expected tests."""
+        return (bool(self.cfg.get('canary', True)) and gi.get('report_kind') in CANARY_KINDS
+                and bool(gi.get('fail_to_pass')) and not gi.get('collect_report'))
 
     def regrade(self, task: str, patch: bytes, start_tree: str, factory) -> dict:
         """Grade a captured patch again, as a verifier does from a receipt (`hosted-env regrade`): the same pipeline
@@ -527,33 +546,51 @@ fi
             why = 'the re-run ended early: ' + str(c.get('grade_detail') or 'no result')
         return {**out, 'reward': 0.0, 'canary': 'failed', 'grade_detail': 'canary: ' + why}
 
-    def _plant_canary(self, sb, repo: str, gi: dict, test_paths) -> tuple[list[str], str]:
-        """Edit every expected test (fail_to_pass and pass_to_pass, as the hidden tests have them after the test
-        patch) that maps to exactly one function, so it fails at its first statement. Returns the ids edited, or []
-        and why. All of them, not a sample: a forge that reports "passed" only for the tests it could not fix
-        would slip past a sampled one."""
-        kind, msg = gi.get('report_kind'), f'canary {secrets.token_hex(4)}'
+    @staticmethod
+    def _consistency_verdict(out: dict, c: dict) -> dict:
+        """Keep a pass only if the consistency re-run -- one target function picked at random and edited -- reported
+        the edited test(s) failed and every other target that must still pass (_plant_canary) passed, as in the
+        first run. A forge that spots a re-run and then runs honestly fails the tests it could not fix; any other
+        ending scores 0 too (the targets are the same as the canary re-run's, so "nothing editable" here is not an
+        honest outcome)."""
+        st, edited = c.get('canary_status'), set(c.get('canary_edited') or [])
+        if isinstance(st, dict) and st and edited:
+            bad = [(t, v) for t, v in st.items() if v != ('fail' if t in edited else 'pass')]
+            if not bad:
+                return {**out, 'canary': out['canary'] + f'; consistency ok: {len(edited)} of {len(st)} edited'}
+            tid, got = bad[0]
+            why = (f'{tid} reported {got or "missing"}, edited to fail' if tid in edited else
+                   f'{tid} reported {got or "missing"} while another test was edited (it passed in the first run)')
+        else:
+            why = 'the re-run ended early: ' + str(c.get('grade_detail') or c.get('canary_skipped') or 'no result')
+        return {**out, 'reward': 0.0, 'canary': 'failed', 'grade_detail': 'canary: consistency: ' + why}
+
+    def _canary_targets(self, sb, repo: str, gi: dict, test_paths) -> tuple[dict, dict[str, str]]:
+        """The expected tests (fail_to_pass and pass_to_pass, as the hidden tests have them after the test patch)
+        the canary can edit: {(file, classes, func): {'file', 'ids', 'edit'}} for each function that exactly one
+        file defines editably, and {file: its text} for the files holding one. Depends only on the hidden tests and
+        the start tree, so every run of a task finds the same targets."""
+        kind = gi.get('report_kind')
         ids = list(dict.fromkeys([*(gi.get('fail_to_pass') or []), *(gi.get('pass_to_pass') or [])]))
         tpaths = [p.decode('utf-8', 'surrogateescape') for p in (test_paths or [])]
-        files: dict[str, str] = {}                         # rel -> edited source so far
-        done: dict[tuple, bool] = {}                       # (file, classes, func) -> edited
+        texts: dict[str, str | None] = {}
 
         def text(rel: str) -> str | None:
-            if rel in files:
-                return files[rel]
-            try:
-                return self._read_blob(sb, repo, None, rel).decode('utf-8')
-            except UnicodeDecodeError:
-                return None
-        planted = []
+            if rel not in texts:
+                try:
+                    texts[rel] = self._read_blob(sb, repo, None, rel).decode('utf-8')
+                except UnicodeDecodeError:
+                    texts[rel] = None
+            return texts[rel]
+        targets: dict[tuple, dict] = {}
         for tid in ids:
-            cands: list[tuple[str, tuple, object]] = []    # (file, key, edit function)
+            cands: list[tuple[str, tuple, object, object]] = []   # (file, key, edit function, own source)
             if kind == 'junit' and (t := pytest_target(tid)):
                 rel, classes, func = t
                 for p in dict.fromkeys([rel] + [p for p in tpaths if p.endswith('/' + rel)]):  # rootdir-relative ids
                     cands.append((p, (p, tuple(classes), func),
-                                  lambda src, c=classes, f=func: edit_python(src, c, f,
-                                                                             f'raise AssertionError({msg!r})')))
+                                  lambda src, c=classes, f=func: canary_edit_python(src, c, f),
+                                  lambda src, c=classes, f=func: python_def_source(src, c, f)))
             elif kind == 'gotest' and (t := go_target(tid)):
                 pkg, func = t
                 where = [p for p in tpaths if go_file_matches(pkg, p)]
@@ -561,35 +598,59 @@ fi
                     r = sb.execute(f"git grep --untracked -l -E '^func {func}\\(' -- '*_test.go'", cwd=repo,
                                    timeout=120, login=False)
                     where = [p for p in r['output'].splitlines() if r['returncode'] == 0 and go_file_matches(pkg, p)]
-                cands = [(p, (p, (), func), lambda src, f=func: edit_go(src, f, msg)) for p in where]
-            hits = []
-            for p, key, edit in cands:
-                if key in done:
-                    hits.append((p, key, None))
-                elif (src := text(p)) and (new := edit(src)):
-                    hits.append((p, key, new))
+                cands = [(p, (p, (), func), lambda src, f=func: canary_edit_go(src, f),
+                          lambda src, f=func: go_func_source(src, f)) for p in where]
+            hits = [(p, key, edit, own) for p, key, edit, own in cands
+                    if key in targets or ((src := text(p)) and edit(src) is not None)]
             if len(hits) > 1:                              # a root file can be any package: prefer a matching dir
                 hits = [h for h in hits if '/' in h[0]]
             if len(hits) != 1:
                 continue                                   # not found, or ambiguous: never a false fail
-            p, key, new = hits[0]
-            if new is not None:
-                files[p], done[key] = new, True
-            planted.append(tid)
-        if not planted:
-            return [], 'no expected test the canary can edit'
-        for rel, new in files.items():
-            tmp = f'/tmp/c-{secrets.token_hex(6)}.b64'
-            sb.copy_text_to(base64.b64encode(new.encode()).decode(), tmp)
+            p, key, edit, own = hits[0]
+            targets.setdefault(key, {'file': p, 'ids': [], 'edit': edit, 'func': key[-1],
+                                     'source': own(text(p))})['ids'].append(tid)
+        return targets, {t['file']: texts[t['file']] for t in targets.values()}
+
+    def _plant_canary(self, sb, repo: str, gi: dict, test_paths,
+                      mode: str | None) -> tuple[list[str], str, list[str]]:
+        """Rewrite every file holding a canary target, in sorted order, in EVERY run of a canary task -- with the
+        edits of this run's mode, or unchanged in the first run -- so no run differs in which files were written
+        or when. mode 'all' edits every target (a forge that reports "passed" only for the tests it could not fix
+        would slip past a sample), 'one' a single target function picked at random here on the grading host,
+        None nothing. Returns the ids edited, why when none, and for 'one' the ids that must still pass: the other
+        targets whose own source does not name the edited function. An expected id that is no target (a test a
+        class inherits, review of #34) or a test that calls the edited one may fail with it, so neither counts."""
+        targets, files = self._canary_targets(sb, repo, gi, test_paths)
+        if not targets:
+            return [], 'no expected test the canary can edit', []
+        keys = sorted(targets) if mode == 'all' else [_pick(sorted(targets))] if mode == 'one' else []
+        planted: list[str] = []
+        for key in keys:
+            t = targets[key]
+            new = t['edit'](files[t['file']])
+            if new is not None:                            # another edit to the file is in: still editable (checked)
+                files[t['file']] = new
+                planted += t['ids']
+        check: list[str] = []
+        if mode == 'one' and planted:
+            name = re.compile(rf'\b{re.escape(targets[keys[0]]["func"])}\b')
+            check = [i for k, t in sorted(targets.items()) if k != keys[0] and not name.search(t['source'])
+                     for i in t['ids'] if i not in planted]
+        for rel in sorted(files):
+            tmp = f'/tmp/t-{secrets.token_hex(6)}.b64'
+            sb.copy_text_to(base64.b64encode(files[rel].encode()).decode(), tmp)
             r = sb.execute(f'base64 -d < {tmp} > {shlex.quote(rel)}; rc=$?; rm -f {tmp}; exit $rc', cwd=repo,
                            timeout=120, login=False)
             if r['returncode'] != 0:
-                raise GradeError(f'cannot write the canary into {rel}: {r["output"][-200:]}')
-        return planted, ''
+                raise GradeError(f'cannot rewrite the test file {rel}: {r["output"][-200:]}')
+        if mode and not planted:
+            return [], 'no expected test the canary can edit', []
+        return planted, '', check
 
-    def _grade_fresh(self, s: EnvSession, gi: dict, patch: bytes, res: dict, canary: bool = False) -> dict:
-        """Grade the patch in a new container from the image. canary: plant the canary after the test patch and
-        report its status (canary_id / canary_status, or canary_skipped) instead of the second check."""
+    def _grade_fresh(self, s: EnvSession, gi: dict, patch: bytes, res: dict, canary: str | None = None) -> dict:
+        """Grade the patch in a new container from the image. canary ('all' / 'one', _plant_canary): edit the
+        hidden tests after the test patch and report their status (canary_edited / canary_status, or
+        canary_skipped) instead of the second check."""
         repo, grader = s.spec['cwd'], res['grader_user']
         sb = s.grader_sb = s.factory(s.spec['image'], repo)
         reverted, untrusted, t0 = [], False, None
@@ -670,10 +731,10 @@ fi
             sb.execute(f'rm -f {TEST_PATCH_REMOTE}', timeout=60, login=False)
             if ap['returncode'] != 0:
                 raise GradeError('apply_test_patch_failed: ' + ap['output'][-500:])
-            planted: list[str] = []
-            if canary:                                      # the hidden tests are in place, not yet locked
-                planted, why = self._plant_canary(sb, repo, gi, test_paths)
-                if not planted:
+            planted, check = [], []
+            if self._canary_on(gi):       # the hidden tests are in place, not yet locked; every run rewrites them
+                planted, why, check = self._plant_canary(sb, repo, gi, test_paths, canary)
+                if canary and not planted:
                     return {**res, 'canary_skipped': why}
             test_cmd = gi['test_command']
             expected = list(gi.get('fail_to_pass') or []) + list(gi.get('pass_to_pass') or [])
@@ -713,9 +774,11 @@ fi
             if collect:
                 out['report'] = self._read_abs(sb, rpath).decode('utf-8', 'replace') if want_report else ''
                 return out
-            if canary:                                      # only the edited tests' status counts here
+            if canary:  # 'all': the edited tests' status; 'one': those plus the targets that must still pass
                 results = parse_report(report_kind, self._read_abs(sb, rpath)) if want_report else None
-                return {**out, 'canary_status': {t: id_status(results, t) if results else None for t in planted}}
+                ids = planted if canary == 'all' else list(dict.fromkeys(planted + check))
+                return {**out, 'canary_edited': planted,
+                        'canary_status': {t: id_status(results, t) if results else None for t in ids}}
             if expected and report_kind in _REPORT_PARSERS:        # second check: the exact tests must be present & pass
                 ok, why = report_verdict(report_kind, self._read_abs(sb, rpath),
                                          gi.get('fail_to_pass') or [], gi.get('pass_to_pass') or [])
